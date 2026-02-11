@@ -9,7 +9,7 @@ require (
 	github.com/ti-mo/conntrack v0.5.2
 	github.com/ti-mo/netfilter v0.5.3
 	github.com/urfave/cli v1.22.17
-	github.com/xtaci/kcp-go/v5 v5.6.66
+	github.com/xtaci/kcp-go/v5 v5.6.70
 	github.com/xtaci/qpp v1.1.25
 	github.com/xtaci/smux v1.5.55
 	github.com/xtaci/tcpraw v1.2.32
