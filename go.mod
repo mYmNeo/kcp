@@ -13,7 +13,7 @@ require (
 	github.com/xtaci/qpp v1.1.25
 	github.com/xtaci/smux v1.5.55
 	github.com/xtaci/tcpraw v1.2.32
-	golang.org/x/crypto v0.47.0
+	golang.org/x/crypto v0.48.0
 )
 
 require (
@@ -30,7 +30,7 @@ require (
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
 
