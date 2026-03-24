@@ -56,10 +56,7 @@ type BaseConfig struct {
 	SnmpLog      string `json:"snmplog"`
 	SnmpPeriod   int    `json:"snmpperiod"`
 	Quiet        bool   `json:"quiet"`
-	TCP          bool   `json:"tcp"`
 	Pprof        bool   `json:"pprof"`
-	QPP          bool   `json:"qpp"`
-	QPPCount     int    `json:"qpp-count"`
 	CloseWait    int    `json:"closewait"`
 }
 

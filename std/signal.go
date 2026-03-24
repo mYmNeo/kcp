@@ -40,7 +40,6 @@ const (
 )
 
 func init() {
-	RegisterExitHandler(postProcess)
 	go sigHandler()
 }
 

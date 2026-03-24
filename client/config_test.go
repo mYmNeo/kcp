@@ -18,7 +18,7 @@ func TestParseJSONConfigSuccessClient(t *testing.T) {
 		t.Fatalf("unexpected addresses: %+v", cfg)
 	}
 
-	if cfg.Key != "secret" || cfg.Conn != 2 || !cfg.TCP || cfg.CloseWait != 9 {
+	if cfg.Key != "secret" || cfg.Conn != 2 || cfg.CloseWait != 9 {
 		t.Fatalf("unexpected field values: %+v", cfg)
 	}
 }

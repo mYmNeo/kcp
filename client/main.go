@@ -44,7 +44,6 @@ import (
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/kcptun/std"
-	"github.com/xtaci/qpp"
 	"github.com/xtaci/smux"
 )
 
@@ -288,10 +287,7 @@ func main() {
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Quiet = c.Bool("quiet")
-		config.TCP = c.Bool("tcp")
 		config.Pprof = c.Bool("pprof")
-		config.QPP = c.Bool("QPP")
-		config.QPPCount = c.Int("QPPCount")
 		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
@@ -340,8 +336,6 @@ func main() {
 		log.Println("smux version:", config.SmuxVer)
 		log.Println("listening on:", listener.Addr())
 		log.Println("encryption:", config.Crypt)
-		log.Println("QPP:", config.QPP)
-		log.Println("QPP Count:", config.QPPCount)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 		log.Println("remote address:", config.RemoteAddr)
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
@@ -362,7 +356,6 @@ func main() {
 		log.Println("snmplog:", config.SnmpLog)
 		log.Println("snmpperiod:", config.SnmpPeriod)
 		log.Println("quiet:", config.Quiet)
-		log.Println("tcp:", config.TCP)
 		log.Println("pprof:", config.Pprof)
 		if config.DNSConfig != nil {
 			log.Println("dns config:", config.DNSConfig.LocalInterfaceName)
@@ -389,17 +382,6 @@ func main() {
 				checkError(err)
 			}
 			conntrackLookup = cf
-		}
-
-		// Validate QPP parameters so we can warn about unsafe combinations early.
-		if config.QPP {
-			suggestions, err := std.ValidateQPPParams(config.QPPCount, config.Key)
-			if err != nil {
-				log.Fatal(err)
-			}
-			for _, msg := range suggestions {
-				color.Red(msg)
-			}
 		}
 
 		// Ensure scavenger TTL does not exceed the auto-expire window.
@@ -445,12 +427,6 @@ func main() {
 		// short-lived TCP dials do not hammer the same UDP tunnel.
 		rr := uint16(0)
 
-		// Instantiate a shared QPP pad if the feature is enabled.
-		var _Q_ *qpp.QuantumPermutationPad
-		if config.QPP {
-			_Q_ = qpp.NewQPP([]byte(config.Key), uint16(config.QPPCount))
-		}
-
 		// Main accept loop: assign each inbound client to a rotating smux session and
 		// refresh sessions on demand so parallel TCP streams keep flowing smoothly.
 		for {
@@ -471,7 +447,7 @@ func main() {
 			}
 
 			// Serve the accepted client in its own goroutine to keep the accept loop responsive.
-			go handleClient(_Q_, []byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait, conntrackLookup)
+			go handleClient([]byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait, conntrackLookup)
 			rr++
 		}
 	}
@@ -541,7 +517,7 @@ func waitConn(config *Config, block kcp.BlockCrypt) *smux.Session {
 
 // handleClient tunnels a single accepted TCP/UNIX client through an smux
 // stream and optionally wraps the stream in QPP for additional obfuscation.
-func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int, conntrackLookup ConntrackLookup) {
+func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int, conntrackLookup ConntrackLookup) {
 	logln := func(v ...any) {
 		if !quiet {
 			log.Println(v...)
@@ -562,12 +538,6 @@ func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Ses
 	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", streamID)
 
 	var s1, s2 io.ReadWriteCloser = p1, p2
-	// Optionally wrap the smux side with QPP obfuscation.
-	if _Q_ != nil {
-		// Replace the smux side with a QPP-wrapped port.
-		s2 = std.NewQPPPort(p2, _Q_, seed)
-	}
-
 	// if conntrack is enabled, we need to send socks5 handshake before sending data
 	if conntrackLookup != nil {
 		from := p1.RemoteAddr().(*net.TCPAddr)

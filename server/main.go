@@ -37,13 +37,10 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/fatih/color"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/kcptun/std"
-	"github.com/xtaci/qpp"
 	"github.com/xtaci/smux"
-	"github.com/xtaci/tcpraw"
 )
 
 var (
@@ -275,9 +272,6 @@ func main() {
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Pprof = c.Bool("pprof")
 		config.Quiet = c.Bool("quiet")
-		config.TCP = c.Bool("tcp")
-		config.QPP = c.Bool("QPP")
-		config.QPPCount = c.Int("QPPCount")
 		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
@@ -307,8 +301,6 @@ func main() {
 		log.Println("listening on:", config.Listen)
 		log.Println("target:", config.Target)
 		log.Println("encryption:", config.Crypt)
-		log.Println("QPP:", config.QPP)
-		log.Println("QPP Count:", config.QPPCount)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
 		log.Println("compression:", !config.NoComp)
@@ -326,17 +318,7 @@ func main() {
 		log.Println("snmpperiod:", config.SnmpPeriod)
 		log.Println("pprof:", config.Pprof)
 		log.Println("quiet:", config.Quiet)
-		log.Println("tcp:", config.TCP)
 
-		if config.QPP {
-			suggestions, err := std.ValidateQPPParams(config.QPPCount, config.Key)
-			if err != nil {
-				log.Fatal(err)
-			}
-			for _, msg := range suggestions {
-				color.Red(msg)
-			}
-		}
 		// Guard against negotiating unsupported smux protocol versions.
 		if config.SmuxVer > maxSmuxVer {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
@@ -361,12 +343,6 @@ func main() {
 			}()
 		}
 
-		// Instantiate a shared QPP pad if the feature is enabled.
-		var _Q_ *qpp.QuantumPermutationPad
-		if config.QPP {
-			_Q_ = qpp.NewQPP([]byte(config.Key), uint16(config.QPPCount))
-		}
-
 		// Spawn an accept loop per listener and track each goroutine via WaitGroup.
 		var wg sync.WaitGroup
 
@@ -380,24 +356,12 @@ func main() {
 		// Create listeners for every port inside the configured range.
 		for port := mp.MinPort; port <= mp.MaxPort; port++ {
 			listenAddr := fmt.Sprintf("%v:%v", mp.Host, port)
-			if config.TCP { // optionally expose a tcpraw listener alongside UDP
-				if conn, err := tcpraw.Listen("tcp", listenAddr); err == nil {
-					log.Printf("Listening on: %v/tcp", listenAddr)
-					lis, err := kcp.ServeConn(block, config.DataShard, config.ParityShard, conn)
-					checkError(err)
-					wg.Add(1)
-					go serveListener(lis, _Q_, &config, &wg)
-				} else {
-					log.Println(err)
-				}
-			}
-
 			// Always stand up the UDP listener; this is the default transport.
 			log.Printf("Listening on: %v/udp", listenAddr)
 			lis, err := kcp.ListenWithOptions(listenAddr, block, config.DataShard, config.ParityShard)
 			checkError(err)
 			wg.Add(1)
-			go serveListener(lis, _Q_, &config, &wg)
+			go serveListener(lis, &config, &wg)
 		}
 
 		wg.Wait()
@@ -408,7 +372,7 @@ func main() {
 
 // serveListener drains incoming KCP conversations from lis and dispatches each
 // one to handleMux while keeping wg accounting balanced.
-func serveListener(lis *kcp.Listener, _Q_ *qpp.QuantumPermutationPad, config *Config, wg *sync.WaitGroup) {
+func serveListener(lis *kcp.Listener, config *Config, wg *sync.WaitGroup) {
 	defer wg.Done()
 	if err := lis.SetDSCP(config.DSCP); err != nil {
 		log.Println("SetDSCP:", err)
@@ -438,16 +402,16 @@ func serveListener(lis *kcp.Listener, _Q_ *qpp.QuantumPermutationPad, config *Co
 		conn.SetRateLimit(uint32(config.RateLimit))
 
 		if config.NoComp {
-			go handleMux(_Q_, conn, config)
+			go handleMux(conn, config)
 		} else {
-			go handleMux(_Q_, std.NewCompStream(conn), config)
+			go handleMux(std.NewCompStream(conn), config)
 		}
 	}
 }
 
 // handleMux drives a single KCP session: it accepts smux streams and forwards
 // each stream to the configured TCP or UNIX target.
-func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
+func handleMux(conn net.Conn, config *Config) {
 	// Determine whether the upstream target is TCP or a UNIX socket path.
 	targetType := config.ProxyMode
 	if _, _, err := net.SplitHostPort(config.Target); err != nil {
@@ -505,14 +469,14 @@ func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
 				return
 			}
 
-			handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
+			handleClient([]byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
 		}(stream)
 	}
 }
 
 // handleClient relays traffic between an smux stream and the upstream target
 // while optionally wrapping the smux side with QPP for obfuscation.
-func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool, closeWait int) {
+func handleClient(seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool, closeWait int) {
 	logln := func(v ...any) {
 		if !quiet {
 			log.Println(v...)
@@ -527,12 +491,6 @@ func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, 
 	defer logln("stream closed", "in:", streamID, "out:", p2.RemoteAddr())
 
 	var s1, s2 io.ReadWriteCloser = p1, p2
-	// Optionally wrap the smux side with QPP obfuscation.
-	if _Q_ != nil {
-		// Replace the smux side with a QPP-wrapped port.
-		s1 = std.NewQPPPort(p1, _Q_, seed)
-	}
-
 	// Begin piping data bidirectionally between the upstream and downstream ends.
 	err1, err2 := std.Pipe(s1, s2, closeWait)
 
