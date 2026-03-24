@@ -9,18 +9,14 @@ require (
 	github.com/ti-mo/conntrack v0.6.0
 	github.com/ti-mo/netfilter v0.5.3
 	github.com/urfave/cli v1.22.17
-	github.com/xtaci/kcp-go/v5 v5.6.70
-	github.com/xtaci/qpp v1.1.25
-	github.com/xtaci/smux v1.5.56
-	github.com/xtaci/tcpraw v1.2.32
+	github.com/xtaci/kcp-go/v5 v5.6.71
+	github.com/xtaci/smux v1.5.57
 	golang.org/x/crypto v0.48.0
 )
 
 require (
-	github.com/coreos/go-iptables v0.8.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/gopacket v1.1.19 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.13.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
@@ -34,4 +30,4 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-go 1.24.0
+go 1.26.0
