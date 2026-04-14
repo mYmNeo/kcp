@@ -75,7 +75,7 @@ func (a Addr) String() string {
 
 var (
 	connectSuccessReply = []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
-	emptyBuffer         = make([]byte, MaxAddrLen+3)
+	socksNoAuthReply    = []byte{5, 0}
 )
 
 type bufferItem struct {
@@ -123,40 +123,41 @@ func SocksHandshake(rw io.ReadWriter) (net.Conn, error) {
 	// Read RFC 1928 for request and reply structure and sizes.
 	bufItem := bufferPool.Get().(*bufferItem)
 	defer bufferPool.Put(bufItem)
+	buf := bufItem.buf
 
-	copy(bufItem.buf, emptyBuffer)
-	// read VER, NMETHODS, METHODS
-	if _, err := io.ReadFull(rw, bufItem.buf[:2]); err != nil {
+	// read VER, NMETHODS
+	if _, err := io.ReadFull(rw, buf[:2]); err != nil {
 		return nil, err
 	}
-	nmethods := bufItem.buf[1]
-	if _, err := io.ReadFull(rw, bufItem.buf[:nmethods]); err != nil {
+	// read METHODS (consume into same buffer, contents don't matter)
+	if _, err := io.ReadFull(rw, buf[:buf[1]]); err != nil {
 		return nil, err
 	}
-	// write VER METHOD
-	if _, err := rw.Write([]byte{5, 0}); err != nil {
+	// write VER METHOD (no-auth)
+	if _, err := rw.Write(socksNoAuthReply); err != nil {
 		return nil, err
 	}
-	// read VER CMD RSV ATYP DST.ADDR DST.PORT
-	if _, err := io.ReadFull(rw, bufItem.buf[:3]); err != nil {
+	// read VER CMD RSV
+	if _, err := io.ReadFull(rw, buf[:3]); err != nil {
 		return nil, err
 	}
-	cmd := bufItem.buf[1]
-	addr, err := readAddr(rw, bufItem.buf)
+	cmd := buf[1]
+	addr, err := readAddr(rw, buf)
 	if err != nil {
 		return nil, err
 	}
+
 	switch cmd {
 	case CmdConnect:
+		addrStr := addr.String()
 		_, _ = rw.Write(connectSuccessReply)
-
-		rc, err := net.Dial("tcp", addr.String())
+		rc, err := net.Dial("tcp", addrStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to target: %v", err)
 		}
-
-		log.Println("Connected", "addr", addr.String())
+		log.Println("Connected", "addr", addrStr)
 		return rc, nil
+
 	case CmdUDPAssociate:
 		if !UDPEnabled {
 			return nil, ErrCommandNotSupported
@@ -171,56 +172,42 @@ func SocksHandshake(rw io.ReadWriter) (net.Conn, error) {
 			return nil, errors.New("local address is not a TCPAddr")
 		}
 
-		bufItem := bufferPool.Get().(*bufferItem)
-		defer bufferPool.Put(bufItem)
-
-		copy(bufItem.buf, emptyBuffer)
-		var listenAddr Addr
+		// Build reply directly: VER(5) REP(0) RSV(0) ATYP ADDR PORT
+		buf[0] = 5 // VER
+		buf[1] = 0 // REP
+		buf[2] = 0 // RSV
+		var replyLen int
 		ip := tcpAddr.IP.To4()
 		if ip != nil {
-			listenAddr = bufItem.buf[:1+net.IPv4len+2]
-			listenAddr[0] = AtypIPv4
-			copy(listenAddr[1:], ip)
+			buf[3] = AtypIPv4
+			copy(buf[4:], ip)
+			replyLen = 3 + 1 + net.IPv4len + 2
 		} else {
 			ip = tcpAddr.IP.To16()
 			if ip == nil {
 				return nil, ErrAddressNotSupported
 			}
-			listenAddr = bufItem.buf[:1+net.IPv6len+2]
-			listenAddr[0] = AtypIPv6
-			copy(listenAddr[1:], ip)
+			buf[3] = AtypIPv6
+			copy(buf[4:], ip)
+			replyLen = 3 + 1 + net.IPv6len + 2
 		}
+		buf[replyLen-2] = byte(tcpAddr.Port >> 8)
+		buf[replyLen-1] = byte(tcpAddr.Port)
 
-		port := tcpAddr.Port
-		listenAddr[len(listenAddr)-2] = byte(port >> 8)
-		listenAddr[len(listenAddr)-1] = byte(port)
-
-		replyBuf := bufferPool.Get().(*bufferItem)
-		defer bufferPool.Put(replyBuf)
-
-		copy(bufItem.buf, emptyBuffer)
-		replyBuf.buf[0] = 5
-		replyBuf.buf[1] = 0
-		replyBuf.buf[2] = 0
-		copy(replyBuf.buf[3:], listenAddr)
-		_, err = rw.Write(replyBuf.buf[:3+len(listenAddr)])
-
-		if err != nil {
+		if _, err = rw.Write(buf[:replyLen]); err != nil {
 			return nil, ErrCommandNotSupported
 		}
-		err = InfoUDPAssociate
+		return nil, InfoUDPAssociate
+
 	default:
 		return nil, ErrCommandNotSupported
 	}
-
-	return nil, err
 }
 
 func SendSocksConnectRequest(rw io.ReadWriter, addr *net.TCPAddr) error {
 	bufItem := bufferPool.Get().(*bufferItem)
 	defer bufferPool.Put(bufItem)
 
-	copy(bufItem.buf, emptyBuffer)
 	// Prepare SOCKS5 CONNECT request
 	bufItem.buf[0] = 5 // SOCKS5 version
 	bufItem.buf[1] = 1 // NMETHODS command
@@ -271,7 +258,6 @@ func ReadSocksConnectResponse(rw io.ReadWriter) error {
 	bufItem := bufferPool.Get().(*bufferItem)
 	defer bufferPool.Put(bufItem)
 
-	copy(bufItem.buf, emptyBuffer)
 	// Read response
 	// 0x5, 0x0, 0x5, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0
 	n, err := io.ReadFull(rw, bufItem.buf[:len(connectSuccessReply)+2])
