@@ -544,6 +544,7 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 
 		logln("conntrack conns state", "src-ip", from.IP.String(), "src-port", from.Port)
 		var to *net.TCPAddr
+		var sock5Err error
 
 		func() {
 			for range [3]int{} {
@@ -560,18 +561,22 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 			}
 			logln("send socks5 connect request", "dst-ip", to.IP.String(), "dst-port", to.Port)
 			// send socks5 handshake
-			err = std.SendSocksConnectRequest(p2, to)
-			if err != nil {
-				logln("socks5 send handshake", "error", err)
+			sock5Err = std.SendSocksConnectRequest(p2, to)
+			if sock5Err != nil {
+				logln("socks5 send handshake", "error", sock5Err)
 				return
 			}
 
-			err = std.ReadSocksConnectResponse(p2)
-			if err != nil {
-				logln("socks5 read handshake", "error", err)
+			sock5Err = std.ReadSocksConnectResponse(p2)
+			if sock5Err != nil {
+				logln("socks5 read handshake", "error", sock5Err)
 				return
 			}
 		}()
+
+		if sock5Err != nil {
+			return
+		}
 	}
 
 	// Begin piping data bidirectionally between the socket and the smux stream.

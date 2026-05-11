@@ -67,7 +67,6 @@ func sigHandler() {
 		switch sig {
 		case syscall.SIGUSR1:
 			log.Printf("KCP SNMP:%+v", kcp.DefaultSnmp.Copy())
-			log.Printf("KCP SNMP:%+v", kcp.DefaultSnmp.Copy())
 			for _, handler := range userHandlers {
 				log.Println("Running user handler", "handler", handler)
 				handler()

@@ -150,11 +150,11 @@ func SocksHandshake(rw io.ReadWriter) (net.Conn, error) {
 	switch cmd {
 	case CmdConnect:
 		addrStr := addr.String()
-		_, _ = rw.Write(connectSuccessReply)
 		rc, err := net.Dial("tcp", addrStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to target: %v", err)
 		}
+		_, _ = rw.Write(connectSuccessReply)
 		log.Println("Connected", "addr", addrStr)
 		return rc, nil
 
