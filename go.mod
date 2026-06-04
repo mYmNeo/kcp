@@ -2,9 +2,9 @@ module github.com/xtaci/kcptun
 
 require (
 	github.com/fatih/color v1.18.0
-	github.com/golang/snappy v1.0.0
 	github.com/jellydator/ttlcache/v3 v3.4.0
 	github.com/mdlayher/netlink v1.9.0
+	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/pkg/errors v0.9.1
 	github.com/ti-mo/conntrack v0.6.0
 	github.com/ti-mo/netfilter v0.5.3

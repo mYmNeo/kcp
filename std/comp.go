@@ -26,15 +26,15 @@ import (
 	"net"
 	"time"
 
-	"github.com/golang/snappy"
+	"github.com/pierrec/lz4/v4"
 	"github.com/pkg/errors"
 )
 
 // CompStream is a net.Conn wrapper that compresses data using snappy
 type CompStream struct {
 	conn net.Conn
-	w    *snappy.Writer
-	r    *snappy.Reader
+	w    *lz4.Writer
+	r    *lz4.Reader
 }
 
 func (c *CompStream) Read(p []byte) (n int, err error) {
@@ -80,7 +80,7 @@ func (c *CompStream) SetWriteDeadline(t time.Time) error {
 func NewCompStream(conn net.Conn) *CompStream {
 	return &CompStream{
 		conn: conn,
-		w:    snappy.NewBufferedWriter(conn),
-		r:    snappy.NewReader(conn),
+		w:    lz4.NewWriter(conn),
+		r:    lz4.NewReader(conn),
 	}
 }
