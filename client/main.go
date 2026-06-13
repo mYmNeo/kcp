@@ -572,6 +572,7 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 				logln("socks5 read handshake", "error", sock5Err)
 				return
 			}
+			log.Println("sock5 connected", "dst-ip", to.IP.String())
 		}()
 
 		if sock5Err != nil {

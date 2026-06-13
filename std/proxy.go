@@ -272,7 +272,5 @@ func ReadSocksConnectResponse(rw io.ReadWriter) error {
 	if !bytes.Equal(bufItem.buf[2:n], connectSuccessReply) {
 		return errors.New("socks5 connect request failed")
 	}
-
-	log.Println("sock5 connected")
 	return nil
 }
