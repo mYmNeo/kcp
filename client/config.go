@@ -37,6 +37,7 @@ type Config struct {
 	ScavengeTTL    int            `json:"scavengettl"`
 	UseConntrack   bool           `json:"conntrack"`
 	ProxyMode      int            `json:"proxy-mode"`
+	ShmMap         string         `json:"shmmap"`
 	DNSConfig      *dns.DNSConfig `json:"dns"`
 }
 

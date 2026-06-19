@@ -205,6 +205,10 @@ func SocksHandshake(rw io.ReadWriter) (net.Conn, error) {
 }
 
 func SendSocksConnectRequest(rw io.ReadWriter, addr *net.TCPAddr) error {
+	return SendSocksConnectRequestHost(rw, addr.IP.String(), addr.Port)
+}
+
+func SendSocksConnectRequestHost(rw io.ReadWriter, host string, port int) error {
 	bufItem := bufferPool.Get().(*bufferItem)
 	defer bufferPool.Put(bufItem)
 
@@ -223,35 +227,37 @@ func SendSocksConnectRequest(rw io.ReadWriter, addr *net.TCPAddr) error {
 	bufItem.buf[2] = 0          // Reserved byte
 
 	var reqLen int
-	// Add address
-	ip := addr.IP.To4()
-	if ip != nil {
-		bufItem.buf[3] = AtypIPv4
-		copy(bufItem.buf[4:], ip)
-		reqLen = 4 + net.IPv4len
+	if ip := net.ParseIP(host); ip != nil {
+		v4 := ip.To4()
+		if v4 != nil {
+			bufItem.buf[3] = AtypIPv4
+			copy(bufItem.buf[4:], v4)
+			reqLen = 4 + net.IPv4len
+		} else {
+			v6 := ip.To16()
+			if v6 == nil {
+				return ErrAddressNotSupported
+			}
+			bufItem.buf[3] = AtypIPv6
+			copy(bufItem.buf[4:], v6)
+			reqLen = 4 + net.IPv6len
+		}
 	} else {
-		ip = addr.IP.To16()
-		if ip == nil {
+		if len(host) == 0 || len(host) > 255 {
 			return ErrAddressNotSupported
 		}
-		bufItem.buf[3] = AtypIPv6
-		copy(bufItem.buf[4:], ip)
-		reqLen = 4 + net.IPv6len
+		bufItem.buf[3] = AtypDomainName
+		bufItem.buf[4] = byte(len(host))
+		copy(bufItem.buf[5:], host)
+		reqLen = 5 + len(host)
 	}
 
-	// Add port
-	port := addr.Port
 	bufItem.buf[reqLen] = byte(port >> 8)
 	bufItem.buf[reqLen+1] = byte(port)
 	reqLen += 2
 
-	// Send connect request
 	_, err = rw.Write(bufItem.buf[:reqLen])
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func ReadSocksConnectResponse(rw io.ReadWriter) error {

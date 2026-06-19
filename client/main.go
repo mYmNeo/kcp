@@ -23,9 +23,7 @@
 package main
 
 import (
-	"bufio"
 	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -33,8 +31,6 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
-	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -44,6 +40,7 @@ import (
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/kcptun/std"
+	"github.com/xtaci/kcptun/std/shmmap"
 	"github.com/xtaci/smux"
 )
 
@@ -360,28 +357,17 @@ func main() {
 		if config.DNSConfig != nil {
 			log.Println("dns config:", config.DNSConfig.LocalInterfaceName)
 		}
+		if config.ShmMap != "" {
+			log.Println("shmmap:", config.ShmMap)
+		}
 
-		var conntrackLookup ConntrackLookup
-		if config.UseConntrack {
-			localCIDR, err := GetRouteTable(config.DNSConfig.LocalInterfaceName)
+		var ipDomainStore *shmmap.Store
+		if config.ShmMap != "" {
+			store, err := shmmap.OpenReadOnly(config.ShmMap)
 			if err != nil {
 				checkError(err)
 			}
-
-			_, ipNet, _ := net.ParseCIDR(localCIDR)
-
-			cf, err := NewConntrackFlow([]ConnTupleKeyFilter{
-				func(key ConnTupleKey) bool {
-					return key.Proto != syscall.IPPROTO_TCP || key.Port == 53
-				},
-				func(key ConnTupleKey) bool {
-					return !ipNet.Contains(net.ParseIP(key.Addr))
-				},
-			})
-			if err != nil {
-				checkError(err)
-			}
-			conntrackLookup = cf
+			ipDomainStore = store
 		}
 
 		// Ensure scavenger TTL does not exceed the auto-expire window.
@@ -447,7 +433,7 @@ func main() {
 			}
 
 			// Serve the accepted client in its own goroutine to keep the accept loop responsive.
-			go handleClient([]byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait, conntrackLookup)
+			go handleClient([]byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait, config.UseConntrack, ipDomainStore)
 			rr++
 		}
 	}
@@ -517,7 +503,7 @@ func waitConn(config *Config, block kcp.BlockCrypt) *smux.Session {
 
 // handleClient tunnels a single accepted TCP/UNIX client through an smux
 // stream and optionally wraps the stream in QPP for additional obfuscation.
-func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int, conntrackLookup ConntrackLookup) {
+func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int, useTransparent bool, ipDomainStore *shmmap.Store) {
 	logln := func(v ...any) {
 		if !quiet {
 			log.Println(v...)
@@ -538,44 +524,13 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", streamID)
 
 	var s1, s2 io.ReadWriteCloser = p1, p2
-	// if conntrack is enabled, we need to send socks5 handshake before sending data
-	if conntrackLookup != nil {
-		from := p1.RemoteAddr().(*net.TCPAddr)
-
-		logln("conntrack conns state", "src-ip", from.IP.String(), "src-port", from.Port)
-		var to *net.TCPAddr
-		var sock5Err error
-
-		func() {
-			for range [3]int{} {
-				to, err = conntrackLookup.GetConnsState(from)
-				if err == nil {
-					break
-				}
-				time.Sleep(time.Millisecond * 100)
-			}
-
-			if to == nil {
-				logln("Fallback to direct connection", "error", err)
-				return
-			}
-			logln("send socks5 connect request", "dst-ip", to.IP.String(), "dst-port", to.Port)
-			// send socks5 handshake
-			sock5Err = std.SendSocksConnectRequest(p2, to)
-			if sock5Err != nil {
-				logln("socks5 send handshake", "error", sock5Err)
-				return
-			}
-
-			sock5Err = std.ReadSocksConnectResponse(p2)
-			if sock5Err != nil {
-				logln("socks5 read handshake", "error", sock5Err)
-				return
-			}
-			log.Println("sock5 connected", "dst-ip", to.IP.String())
-		}()
-
-		if sock5Err != nil {
+	if useTransparent {
+		tcpConn, ok := p1.(*net.TCPConn)
+		if !ok {
+			logln("transparent proxy requires TCP connection")
+			return
+		}
+		if err := setupTransparentProxy(tcpConn, p2, ipDomainStore, logln); err != nil {
 			return
 		}
 	}
@@ -590,6 +545,81 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 	if err2 != nil && !errors.Is(err2, io.EOF) {
 		logln("pipe:", err2, "in:", p1.RemoteAddr(), "out:", streamID)
 	}
+}
+
+// setupTransparentProxy resolves the original destination and performs the
+// SOCKS5 handshake when iptables redirected the connection. Direct connections
+// without a NAT redirect fall back to normal piping.
+func setupTransparentProxy(tcpConn *net.TCPConn, stream io.ReadWriter, ipDomainStore *shmmap.Store, logln func(...any)) error {
+	to, err := resolveTransparentDst(tcpConn, logln)
+	if err != nil {
+		logln("transparent proxy original dst lookup failed", "error", err)
+		return err
+	}
+	if to == nil {
+		return nil
+	}
+
+	from := tcpConn.RemoteAddr().(*net.TCPAddr)
+	logln("transparent proxy original dst", "src-ip", from.IP.String(), "src-port", from.Port, "dst-ip", to.IP.String(), "dst-port", to.Port)
+
+	host := to.IP.String()
+	if domain, ok := lookupIPDomain(ipDomainStore, to.IP); ok {
+		host = domain
+		logln("dns domain lookup", "dst-ip", to.IP.String(), "domain", domain)
+	}
+
+	log.Println("send socks5 connect request", "host", host, "dst-port", to.Port)
+	if err := std.SendSocksConnectRequestHost(stream, host, to.Port); err != nil {
+		logln("socks5 send handshake", "error", err)
+		return err
+	}
+	if err := std.ReadSocksConnectResponse(stream); err != nil {
+		logln("socks5 read handshake", "error", err)
+		return err
+	}
+	logln("sock5 connected", "host", host)
+	return nil
+}
+
+// resolveTransparentDst returns the pre-NAT destination for redirected traffic.
+// A nil destination with no error means the connection should pipe directly.
+func resolveTransparentDst(tcpConn *net.TCPConn, logln func(...any)) (*net.TCPAddr, error) {
+	from := tcpConn.RemoteAddr().(*net.TCPAddr)
+
+	to, err := GetOriginalDst(tcpConn)
+	if err != nil {
+		if shouldPassthroughOnOriginalDstFailure(from.IP) {
+			logln("transparent proxy: loopback source, direct passthrough", "src-ip", from.IP.String(), "src-port", from.Port, "error", err)
+			return nil, nil
+		}
+		return nil, err
+	}
+	if originalDstMatchesLocal(tcpConn, to) {
+		logln("transparent proxy: direct connection, passthrough", "src-ip", from.IP.String(), "src-port", from.Port)
+		return nil, nil
+	}
+	return to, nil
+}
+
+func originalDstMatchesLocal(conn *net.TCPConn, orig *net.TCPAddr) bool {
+	local := conn.LocalAddr().(*net.TCPAddr)
+	return orig.Port == local.Port && orig.IP.Equal(local.IP)
+}
+
+func lookupIPDomain(store *shmmap.Store, ip net.IP) (string, bool) {
+	if store == nil {
+		return "", false
+	}
+	return store.Lookup(ip)
+}
+
+// shouldPassthroughOnOriginalDstFailure reports whether a failed SO_ORIGINAL_DST
+// lookup should fall back to direct piping. Loopback sources are allowed to
+// passthrough for direct local connections; redirected loopback traffic should
+// succeed via GetOriginalDst and take the SOCKS5 path instead.
+func shouldPassthroughOnOriginalDstFailure(from net.IP) bool {
+	return from.IsLoopback()
 }
 
 // checkError logs the supplied fatal error and terminates the process.
@@ -636,43 +666,4 @@ func scavenger(ch chan timedSession, config *Config) {
 			sessionList = newList
 		}
 	}
-}
-
-func GetRouteTable(ifName string) (string, error) {
-	// Get system routing rules
-	routeFile, err := os.Open("/proc/net/route")
-	if err != nil {
-		return "", fmt.Errorf("failed to open route file: %v", err)
-	}
-	defer routeFile.Close()
-
-	scanner := bufio.NewScanner(routeFile)
-	// Skip header line
-	scanner.Scan()
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
-		if len(fields) >= 3 {
-			iface := fields[0]
-			destHex := fields[1]
-			maskHex := fields[7]
-
-			if iface != ifName {
-				continue
-			}
-
-			// Convert hex to IP address
-			dest, _ := hex.DecodeString(destHex)
-			mask, _ := hex.DecodeString(maskHex)
-			cidr := net.IPNet{
-				IP:   net.IPv4(dest[3], dest[2], dest[1], dest[0]),
-				Mask: net.IPv4Mask(mask[3], mask[2], mask[1], mask[0]),
-			}
-
-			return cidr.String(), nil
-		}
-	}
-
-	return "", nil
 }
