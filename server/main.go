@@ -32,6 +32,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -43,10 +44,8 @@ import (
 	"github.com/xtaci/smux"
 )
 
-var (
-	// SALT is used as the PBKDF2 salt while deriving the shared session key.
-	SALT = "kcp-go"
-)
+// SALT is used as the PBKDF2 salt while deriving the shared session key.
+var SALT = "kcp-go"
 
 const (
 	// maxSmuxVer guards against negotiating unsupported smux protocol versions.
@@ -287,7 +286,7 @@ func main() {
 
 		// Redirect logs when the user supplied a dedicated log file.
 		if config.Log != "" {
-			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
 			checkError(err)
 			defer f.Close()
 			log.SetOutput(f)
@@ -323,6 +322,16 @@ func main() {
 		if config.SmuxVer > maxSmuxVer {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
 		}
+
+		// Precompute smux configuration once; it is identical for every session.
+		smuxConfig, err := std.BuildSmuxConfig(
+			config.SmuxVer, config.SmuxBuf, config.StreamBuf,
+			config.FrameSize, config.KeepAlive,
+		)
+		if err != nil {
+			log.Fatal("BuildSmuxConfig:", err)
+		}
+		config.SmuxConfig = smuxConfig
 
 		// Derive the shared session key from the pre-shared secret.
 		log.Println("initiating key derivation")
@@ -409,8 +418,6 @@ func serveListener(lis *kcp.Listener, config *Config, wg *sync.WaitGroup) {
 	}
 }
 
-// handleMux drives a single KCP session: it accepts smux streams and forwards
-// each stream to the configured TCP or UNIX target.
 func handleMux(conn net.Conn, config *Config) {
 	// Determine whether the upstream target is TCP or a UNIX socket path.
 	targetType := config.ProxyMode
@@ -419,21 +426,8 @@ func handleMux(conn net.Conn, config *Config) {
 	}
 	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
 
-	smuxConfig, err := std.BuildSmuxConfig(
-		config.SmuxVer,
-		config.SmuxBuf,
-		config.StreamBuf,
-		config.FrameSize,
-		config.KeepAlive,
-	)
-	if err != nil {
-		log.Println(err)
-		conn.Close()
-		return
-	}
-
-	// Create the smux server session.
-	mux, err := smux.Server(conn, smuxConfig)
+	// Create the smux server session using the precomputed configuration.
+	mux, err := smux.Server(conn, config.SmuxConfig)
 	if err != nil {
 		log.Println(err)
 		return
@@ -486,7 +480,7 @@ func handleClient(seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool, closeWa
 	defer p1.Close()
 	defer p2.Close()
 
-	streamID := fmt.Sprintf("%v(%d)", p1.RemoteAddr(), p1.ID())
+	streamID := p1.RemoteAddr().String() + "(" + strconv.FormatUint(uint64(p1.ID()), 10) + ")"
 	logln("stream opened", "in:", streamID, "out:", p2.RemoteAddr())
 	defer logln("stream closed", "in:", streamID, "out:", p2.RemoteAddr())
 

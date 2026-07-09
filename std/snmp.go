@@ -39,33 +39,51 @@ func SnmpLogger(path string, interval int) {
 	}
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
+
+	logdir, logfile := filepath.Split(path)
+	var f *os.File
+	var currentPath string
+
 	for range ticker.C {
-		if err := writeSnmpRecord(path); err != nil {
+		formattedPath := logdir + time.Now().Format(logfile)
+		if formattedPath != currentPath {
+			if f != nil {
+				f.Close()
+			}
+			var err error
+			f, err = os.OpenFile(formattedPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
+			if err != nil {
+				log.Println("snmp logger:", err)
+				f = nil
+				currentPath = ""
+				continue
+			}
+			currentPath = formattedPath
+		}
+		if f == nil {
+			continue
+		}
+		if err := writeSnmpRecord(f); err != nil {
 			log.Println("snmp logger:", err)
-			// Continue logging even if one write fails
 		}
 	}
 }
 
-// writeSnmpRecord writes a single SNMP record to the log file.
-// Extracting this logic improves readability and enables proper error handling.
-func writeSnmpRecord(path string) error {
-	// split path into dirname and filename
-	logdir, logfile := filepath.Split(path)
-	// only format logfile
-	f, err := os.OpenFile(logdir+time.Now().Format(logfile), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(f)
-	// write header in empty file
+// writeSnmpRecord writes a single SNMP record to f.
+func writeSnmpRecord(f *os.File) error {
+	// Check if the file is empty to write the header.
 	if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
+		w := csv.NewWriter(f)
 		if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
 			return err
 		}
+		w.Flush()
+		if err := w.Error(); err != nil {
+			return err
+		}
 	}
+
+	w := csv.NewWriter(f)
 	if err := w.Write(append([]string{strconv.FormatInt(time.Now().Unix(), 10)}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
 		return err
 	}

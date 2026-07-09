@@ -30,7 +30,9 @@ import (
 	"github.com/pkg/errors"
 )
 
-// CompStream is a net.Conn wrapper that compresses data using snappy
+// CompStream is a net.Conn wrapper that transparently compresses data using LZ4.
+// LZ4's internal 4MB buffer is pooled by the lz4 library itself, so no
+// additional pooling is needed at this layer.
 type CompStream struct {
 	conn net.Conn
 	w    *lz4.Writer
@@ -42,18 +44,24 @@ func (c *CompStream) Read(p []byte) (n int, err error) {
 }
 
 func (c *CompStream) Write(p []byte) (n int, err error) {
-	if _, err := c.w.Write(p); err != nil {
-		return 0, errors.WithStack(err)
+	n, err = c.w.Write(p)
+	// Flush small writes to keep interactive traffic responsive (e.g. SSH keystrokes).
+	// Large writes (bulk io.Copy with 32KB buffer) batch into full LZ4 blocks
+	// for better compression ratio.
+	if len(p) < 1024 {
+		if flushErr := c.w.Flush(); flushErr != nil && err == nil {
+			err = flushErr
+		}
 	}
-
-	if err := c.w.Flush(); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return len(p), err
+	return n, errors.WithStack(err)
 }
 
 func (c *CompStream) Close() error {
-	return c.conn.Close()
+	err := c.w.Close()
+	if closeErr := c.conn.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (c *CompStream) LocalAddr() net.Addr {
@@ -76,7 +84,7 @@ func (c *CompStream) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-// NewCompStream creates a new stream that compresses data using snappy
+// NewCompStream creates a new stream that transparently compresses data using LZ4.
 func NewCompStream(conn net.Conn) *CompStream {
 	return &CompStream{
 		conn: conn,

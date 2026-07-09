@@ -24,14 +24,16 @@ package main
 
 import (
 	"github.com/xtaci/kcptun/std"
+	"github.com/xtaci/smux"
 )
 
 // Config defines the server-side settings supplied via flags or JSON.
 type Config struct {
-	std.BaseConfig        // Embed shared configuration
-	Listen         string `json:"listen"`
-	Target         string `json:"target"`
-	ProxyMode      int    `json:"proxy-mode"`
+	std.BaseConfig              // Embed shared configuration
+	Listen         string       `json:"listen"`
+	Target         string       `json:"target"`
+	ProxyMode      int          `json:"proxy-mode"`
+	SmuxConfig     *smux.Config `json:"-"` // precomputed smux configuration
 }
 
 func parseJSONConfig(config *Config, path string) error {

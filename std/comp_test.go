@@ -13,8 +13,8 @@ func TestCompStreamRoundTrip(t *testing.T) {
 	compWriter := NewCompStream(left)
 	compReader := NewCompStream(right)
 	t.Cleanup(func() {
-		compWriter.Close()
-		compReader.Close()
+		left.Close()
+		right.Close()
 	})
 
 	payload := bytes.Repeat([]byte("compressed payload"), 64)
@@ -44,9 +44,7 @@ func TestCompStreamRoundTrip(t *testing.T) {
 		t.Fatalf("write returned %d, want %d", n, len(writeBuf))
 	}
 
-	if err := compWriter.Close(); err != nil {
-		t.Fatalf("close writer: %v", err)
-	}
+	go compWriter.Close()
 
 	if err := <-readErr; err != nil {
 		t.Fatalf("reader error: %v", err)

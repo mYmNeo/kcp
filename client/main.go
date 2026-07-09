@@ -24,13 +24,13 @@ package main
 
 import (
 	"crypto/sha1"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -44,9 +44,7 @@ import (
 	"github.com/xtaci/smux"
 )
 
-var (
-	SALT = "kcp-go"
-)
+var SALT = "kcp-go"
 
 const (
 	// maxSmuxVer guards against negotiating unsupported smux protocol versions.
@@ -303,7 +301,7 @@ func main() {
 
 		// Redirect logs when the user supplied a dedicated log file.
 		if config.Log != "" {
-			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
 			checkError(err)
 			defer f.Close()
 			log.SetOutput(f)
@@ -380,6 +378,16 @@ func main() {
 		if config.SmuxVer > maxSmuxVer {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
 		}
+
+		// Precompute smux configuration once; it is identical for every session.
+		smuxConfig, err := std.BuildSmuxConfig(
+			config.SmuxVer, config.SmuxBuf, config.StreamBuf,
+			config.FrameSize, config.KeepAlive,
+		)
+		if err != nil {
+			log.Fatal("BuildSmuxConfig:", err)
+		}
+		config.SmuxConfig = smuxConfig
 
 		// Derive the shared encryption key and prepare the block cipher.
 		log.Println("initiating key derivation")
@@ -465,23 +473,12 @@ func createConn(config *Config, block kcp.BlockCrypt) (*smux.Session, error) {
 		log.Println("SetWriteBuffer:", err)
 	}
 	log.Println("smux version:", config.SmuxVer, "on connection:", kcpconn.LocalAddr(), "->", kcpconn.RemoteAddr())
-	smuxConfig, err := std.BuildSmuxConfig(
-		config.SmuxVer,
-		config.SmuxBuf,
-		config.StreamBuf,
-		config.FrameSize,
-		config.KeepAlive,
-	)
-	if err != nil {
-		kcpconn.Close()
-		return nil, errors.Wrap(err, "BuildSmuxConfig()")
-	}
 
 	var session *smux.Session
 	if config.NoComp {
-		session, err = smux.Client(kcpconn, smuxConfig)
+		session, err = smux.Client(kcpconn, config.SmuxConfig)
 	} else {
-		session, err = smux.Client(std.NewCompStream(kcpconn), smuxConfig)
+		session, err = smux.Client(std.NewCompStream(kcpconn), config.SmuxConfig)
 	}
 	if err != nil {
 		return nil, errors.Wrap(err, "createConn()")
@@ -519,7 +516,7 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 	}
 	defer p2.Close()
 
-	streamID := fmt.Sprintf("%v(%d)", p2.RemoteAddr(), p2.ID())
+	streamID := p2.RemoteAddr().String() + "(" + strconv.FormatUint(uint64(p2.ID()), 10) + ")"
 	logln("stream opened", "in:", p1.RemoteAddr(), "out:", streamID)
 	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", streamID)
 
@@ -648,7 +645,8 @@ func scavenger(ch chan timedSession, config *Config) {
 		case item := <-ch:
 			sessionList = append(sessionList, timedSession{
 				item.session,
-				item.expiryDate.Add(time.Duration(config.ScavengeTTL) * time.Second)})
+				item.expiryDate.Add(time.Duration(config.ScavengeTTL) * time.Second),
+			})
 		case <-ticker.C:
 			// Reuse slice capacity to avoid allocation
 			newList := sessionList[:0]
