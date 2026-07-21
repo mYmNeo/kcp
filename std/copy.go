@@ -23,6 +23,7 @@
 package std
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"time"
@@ -71,22 +72,36 @@ func Pipe(alice, bob io.ReadWriteCloser, closeWait int) (errA, errB error) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// errSig is closed when either direction errors, cutting short the peer's
+	// closeWait drain delay so teardown is not blocked on a broken connection.
+	errSig := make(chan struct{})
+	var errOnce sync.Once
+	signalError := func() { errOnce.Do(func() { close(errSig) }) }
+
 	streamCopy := func(dst io.ReadWriteCloser, src io.ReadWriteCloser, err *error) {
 		defer wg.Done()
 
 		// write error directly to the *pointer
 		_, *err = Copy(dst, src)
-
-		if closeWait > 0 {
-			time.Sleep(time.Duration(closeWait) * time.Second)
+		if *err != nil && !errors.Is(*err, io.EOF) {
+			signalError()
 		}
 
-		// half-close: signal the peer that we are done writing
-		// use CloseWrite if available, otherwise fall back to Close
+		if closeWait > 0 {
+			t := time.NewTimer(time.Duration(closeWait) * time.Second)
+			select {
+			case <-t.C:
+			case <-errSig:
+			}
+			t.Stop()
+		}
+
+		// half-close: signal the peer that we are done writing. Only connections
+		// that support CloseWrite can be half-closed; for others we leave the
+		// connection open so the reverse direction can still drain, and rely on
+		// the final Close below to fully close it.
 		if cw, ok := dst.(closeWriter); ok {
 			cw.CloseWrite()
-		} else {
-			dst.Close()
 		}
 	}
 

@@ -25,7 +25,9 @@ package main
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"fmt"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 
 	kcp "github.com/xtaci/kcp-go/v5"
@@ -57,7 +59,8 @@ func dial(config *Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
 		return nil, err
 	}
 
-	remoteAddr := fmt.Sprintf("%v:%v", multiPort.Host, uint64(multiPort.MinPort)+randport%uint64(multiPort.MaxPort-multiPort.MinPort+1))
+	port := uint64(multiPort.MinPort) + randport%uint64(multiPort.MaxPort-multiPort.MinPort+1)
+	remoteAddr := net.JoinHostPort(strings.Trim(multiPort.Host, "[]"), strconv.FormatUint(port, 10))
 
 	// Otherwise fall back to the standard UDP dialing path.
 	return kcp.DialWithOptions(remoteAddr, block, config.DataShard, config.ParityShard)

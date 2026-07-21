@@ -23,7 +23,7 @@
 package main
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -90,19 +90,9 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "crypt",
-			Value: "aes",
-			Usage: "aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
+			Value: "aes-128-gcm",
+			Usage: "sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20",
 		},
-		cli.BoolFlag{
-			Name:  "QPP",
-			Usage: "enable Quantum Permutation Pads(QPP)",
-		},
-		cli.IntFlag{
-			Name:  "QPPCount",
-			Value: 61,
-			Usage: "the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes.",
-		},
-
 		cli.StringFlag{
 			Name:  "mode",
 			Value: "fast",
@@ -204,7 +194,7 @@ func main() {
 		},
 		cli.IntFlag{
 			Name:  "closewait",
-			Value: 30,
+			Value: 5,
 			Usage: "the seconds to wait before tearing down a connection",
 		},
 		cli.StringFlag{
@@ -229,10 +219,6 @@ func main() {
 		cli.BoolFlag{
 			Name:  "quiet",
 			Usage: "to suppress the 'stream open/close' messages",
-		},
-		cli.BoolFlag{
-			Name:  "tcp",
-			Usage: "to emulate a TCP connection(linux)",
 		},
 		cli.StringFlag{
 			Name:  "c",
@@ -279,6 +265,10 @@ func main() {
 			checkError(err)
 		}
 
+		if config.Key == "it's a secrect" {
+			log.Fatal("refusing to run with the default pre-shared key; set -key or KCPTUN_KEY to a high-entropy secret")
+		}
+
 		if config.RateLimit < 0 {
 			log.Printf("ratelimit %d is negative, falling back to 0", config.RateLimit)
 			config.RateLimit = 0
@@ -286,7 +276,7 @@ func main() {
 
 		// Redirect logs when the user supplied a dedicated log file.
 		if config.Log != "" {
-			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
+			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 			checkError(err)
 			defer f.Close()
 			log.SetOutput(f)
@@ -335,9 +325,10 @@ func main() {
 
 		// Derive the shared session key from the pre-shared secret.
 		log.Println("initiating key derivation")
-		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
+		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 600000, 32, sha256.New)
 		log.Println("key derivation done")
-		block, effectiveCrypt := std.SelectBlockCrypt(config.Crypt, pass)
+		block, effectiveCrypt, err := std.SelectBlockCrypt(config.Crypt, pass)
+		checkError(err)
 		config.Crypt = effectiveCrypt
 
 		// Start the SNMP logger if the feature is enabled.
@@ -399,9 +390,16 @@ func serveListener(lis *kcp.Listener, config *Config, wg *sync.WaitGroup) {
 		conn, err := lis.AcceptKCP()
 		if err != nil {
 			log.Printf("%+v", err)
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+				return
+			}
+			// Back off briefly to avoid a busy-loop on persistent non-fatal errors.
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		log.Println("remote address:", conn.RemoteAddr())
+		if !config.Quiet {
+			log.Println("remote address:", conn.RemoteAddr())
+		}
 		conn.SetStreamMode(true)
 		conn.SetWriteDelay(false)
 		conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
@@ -421,15 +419,22 @@ func serveListener(lis *kcp.Listener, config *Config, wg *sync.WaitGroup) {
 func handleMux(conn net.Conn, config *Config) {
 	// Determine whether the upstream target is TCP or a UNIX socket path.
 	targetType := config.ProxyMode
-	if _, _, err := net.SplitHostPort(config.Target); err != nil {
-		targetType = TGT_UNIX
+	if targetType == 0 {
+		if _, _, err := net.SplitHostPort(config.Target); err != nil {
+			targetType = TGT_UNIX
+		} else {
+			targetType = TGT_TCP
+		}
 	}
-	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
+	if !config.Quiet {
+		log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
+	}
 
 	// Create the smux server session using the precomputed configuration.
 	mux, err := smux.Server(conn, config.SmuxConfig)
 	if err != nil {
 		log.Println(err)
+		conn.Close()
 		return
 	}
 	defer mux.Close()
@@ -455,6 +460,8 @@ func handleMux(conn net.Conn, config *Config) {
 				p2, err = net.DialTimeout("unix", config.Target, dialTimeout)
 			case TGT_SOCKS5:
 				p2, err = std.SocksHandshake(p1)
+			default:
+				err = fmt.Errorf("unsupported proxy mode: %d", targetType)
 			}
 
 			if err != nil {
@@ -463,23 +470,18 @@ func handleMux(conn net.Conn, config *Config) {
 				return
 			}
 
-			handleClient([]byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
+			handleClient(p1, p2, config.Quiet, config.CloseWait)
 		}(stream)
 	}
 }
 
-// handleClient relays traffic between an smux stream and the upstream target
-// while optionally wrapping the smux side with QPP for obfuscation.
-func handleClient(seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool, closeWait int) {
+// handleClient relays traffic between an smux stream and the upstream target.
+func handleClient(p1 *smux.Stream, p2 net.Conn, quiet bool, closeWait int) {
 	logln := func(v ...any) {
 		if !quiet {
 			log.Println(v...)
 		}
 	}
-
-	defer p1.Close()
-	defer p2.Close()
-
 	streamID := p1.RemoteAddr().String() + "(" + strconv.FormatUint(uint64(p1.ID()), 10) + ")"
 	logln("stream opened", "in:", streamID, "out:", p2.RemoteAddr())
 	defer logln("stream closed", "in:", streamID, "out:", p2.RemoteAddr())

@@ -27,12 +27,12 @@ import (
 	"time"
 
 	"github.com/pierrec/lz4/v4"
-	"github.com/pkg/errors"
 )
 
 // CompStream is a net.Conn wrapper that transparently compresses data using LZ4.
-// LZ4's internal 4MB buffer is pooled by the lz4 library itself, so no
-// additional pooling is needed at this layer.
+// The LZ4 writer uses a 64KB block size to avoid buffering up to 4MB on bulk
+// writes while keeping per-block overhead small. The lz4 library pools its
+// internal buffers, so no additional pooling is needed at this layer.
 type CompStream struct {
 	conn net.Conn
 	w    *lz4.Writer
@@ -53,7 +53,7 @@ func (c *CompStream) Write(p []byte) (n int, err error) {
 			err = flushErr
 		}
 	}
-	return n, errors.WithStack(err)
+	return n, err
 }
 
 func (c *CompStream) Close() error {
@@ -86,9 +86,23 @@ func (c *CompStream) SetWriteDeadline(t time.Time) error {
 
 // NewCompStream creates a new stream that transparently compresses data using LZ4.
 func NewCompStream(conn net.Conn) *CompStream {
+	w := lz4.NewWriter(conn)
+	w.Apply(lz4.BlockSizeOption(lz4.Block64Kb))
 	return &CompStream{
 		conn: conn,
-		w:    lz4.NewWriter(conn),
+		w:    w,
 		r:    lz4.NewReader(conn),
 	}
+}
+
+// CloseWrite closes the write side of the underlying connection if it supports
+// half-close. Otherwise it is a no-op, matching net.Conn semantics.
+func (c *CompStream) CloseWrite() error {
+	if err := c.w.Flush(); err != nil {
+		return err
+	}
+	if cw, ok := c.conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }

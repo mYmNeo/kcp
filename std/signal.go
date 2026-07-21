@@ -30,13 +30,8 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
 	kcp "github.com/xtaci/kcp-go/v5"
-)
-
-const (
-	EXIT_WAIT = 5 // max seconds to wait before exit
 )
 
 func init() {
@@ -72,19 +67,13 @@ func sigHandler() {
 				handler()
 			}
 		case syscall.SIGTERM, syscall.SIGINT:
-			for _, handler := range exitHandlers {
-				log.Println("Running exit handler")
-				handler()
-			}
-			signal.Stop(ch)
-			syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-
-			// wait for max EXIT_WAIT seconds before exit
 			exitOnce.Do(func() {
-				go func() {
-					time.Sleep(EXIT_WAIT * time.Second)
-					os.Exit(0)
-				}()
+				for _, handler := range exitHandlers {
+					log.Println("Running exit handler")
+					handler()
+				}
+				signal.Stop(ch)
+				os.Exit(0)
 			})
 		}
 	}

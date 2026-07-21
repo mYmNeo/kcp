@@ -23,7 +23,7 @@
 package main
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"io"
 	"log"
 	"net"
@@ -31,6 +31,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -85,22 +86,13 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "crypt",
-			Value: "aes",
-			Usage: "aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
+			Value: "aes-128-gcm",
+			Usage: "sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20",
 		},
 		cli.StringFlag{
 			Name:  "mode",
 			Value: "fast",
 			Usage: "profiles: fast3, fast2, fast, normal, manual",
-		},
-		cli.BoolFlag{
-			Name:  "QPP",
-			Usage: "enable Quantum Permutation Pads(QPP)",
-		},
-		cli.IntFlag{
-			Name:  "QPPCount",
-			Value: 61,
-			Usage: "the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes.",
 		},
 		cli.IntFlag{
 			Name:  "conn",
@@ -235,10 +227,6 @@ func main() {
 			Name:  "quiet",
 			Usage: "to suppress the 'stream open/close' messages",
 		},
-		cli.BoolFlag{
-			Name:  "tcp",
-			Usage: "to emulate a TCP connection(linux)",
-		},
 		cli.StringFlag{
 			Name:  "c",
 			Value: "", // when set, the referenced JSON file must exist on disk
@@ -290,6 +278,10 @@ func main() {
 			checkError(err)
 		}
 
+		if config.Key == "it's a secrect" {
+			log.Fatal("refusing to run with the default pre-shared key; set -key or KCPTUN_KEY to a high-entropy secret")
+		}
+
 		if config.Conn <= 0 {
 			log.Fatal("conn must be greater than 0")
 		}
@@ -301,7 +293,7 @@ func main() {
 
 		// Redirect logs when the user supplied a dedicated log file.
 		if config.Log != "" {
-			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
+			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 			checkError(err)
 			defer f.Close()
 			log.SetOutput(f)
@@ -366,6 +358,7 @@ func main() {
 				checkError(err)
 			}
 			ipDomainStore = store
+			defer store.Close()
 		}
 
 		// Ensure scavenger TTL does not exceed the auto-expire window.
@@ -391,9 +384,10 @@ func main() {
 
 		// Derive the shared encryption key and prepare the block cipher.
 		log.Println("initiating key derivation")
-		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
+		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 600000, 32, sha256.New)
 		log.Println("key derivation done")
-		block, effectiveCrypt := std.SelectBlockCrypt(config.Crypt, pass)
+		block, effectiveCrypt, err := std.SelectBlockCrypt(config.Crypt, pass)
+		checkError(err)
 		config.Crypt = effectiveCrypt
 
 		// Continuously export SNMP counters when requested.
@@ -414,35 +408,94 @@ func main() {
 			go scavenger(chScavenger, &config)
 		}
 
+		// Validate the remote address up front so a malformed --remoteaddr fails
+		// fast instead of spinning forever inside waitConn's reconnect loop.
+		if _, err := std.ParseMultiPort(config.RemoteAddr); err != nil {
+			checkError(err)
+		}
+
 		// Accept TCP/UNIX clients and multiplex them across the UDP tunnels.
 		numconn := uint16(config.Conn)
+		if numconn == 0 {
+			numconn = 1
+		}
 		muxes := make([]timedSession, numconn)
+		refreshInflight := make([]bool, numconn)
+		var muxMu sync.Mutex
+
+		// ensureSession refreshes slot idx in the background so the accept loop is
+		// never blocked by reconnection latency. At most one refresh runs per slot.
+		ensureSession := func(idx uint16) {
+			muxMu.Lock()
+			if refreshInflight[idx] {
+				muxMu.Unlock()
+				return
+			}
+			refreshInflight[idx] = true
+			muxMu.Unlock()
+
+			go func() {
+				session := waitConn(&config, block)
+				muxMu.Lock()
+				muxes[idx].session = session
+				muxes[idx].expiryDate = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+				refreshInflight[idx] = false
+				ts := muxes[idx]
+				muxMu.Unlock()
+				if config.AutoExpire > 0 {
+					select {
+					case chScavenger <- ts:
+					default:
+					}
+				}
+			}()
+		}
+
 		// rr tracks which pre-established session should carry the next client so
 		// short-lived TCP dials do not hammer the same UDP tunnel.
 		rr := uint16(0)
 
-		// Main accept loop: assign each inbound client to a rotating smux session and
-		// refresh sessions on demand so parallel TCP streams keep flowing smoothly.
+		// Kick off the first session in the background; until it is ready, clients
+		// are rejected rather than blocking the accept loop.
+		ensureSession(0)
+
+		// Main accept loop: assign each inbound client to a live smux session and
+		// refresh dead sessions in the background so the loop never stalls.
 		for {
 			p1, err := listener.Accept()
 			if err != nil {
 				log.Fatalf("%+v", err)
 			}
-			idx := rr % numconn
 
-			// Refresh the selected session if it is missing, closed, or past its TTL.
-			if muxes[idx].session == nil || muxes[idx].session.IsClosed() ||
-				(config.AutoExpire > 0 && time.Now().After(muxes[idx].expiryDate)) {
-				muxes[idx].session = waitConn(&config, block)
-				muxes[idx].expiryDate = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
-				if config.AutoExpire > 0 { // only track TTL when auto-expiration is enabled
-					chScavenger <- muxes[idx]
+			// Find a live session round-robin, triggering background refreshes for dead slots.
+			var sess *smux.Session
+			for i := uint16(0); i < numconn; i++ {
+				idx := (rr + i) % numconn
+				muxMu.Lock()
+				s := muxes[idx].session
+				dead := s == nil || s.IsClosed() ||
+					(config.AutoExpire > 0 && time.Now().After(muxes[idx].expiryDate))
+				muxMu.Unlock()
+				if dead {
+					ensureSession(idx)
+					continue
 				}
+				sess = s
+				rr = idx + 1
+				break
 			}
 
-			// Serve the accepted client in its own goroutine to keep the accept loop responsive.
-			go handleClient([]byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait, config.UseConntrack, ipDomainStore)
-			rr++
+			if sess == nil {
+				// No live session yet; drop this client to keep the accept loop
+				// responsive rather than blocking on a reconnect.
+				if !config.Quiet {
+					log.Println("no live session available, closing client:", p1.RemoteAddr())
+				}
+				p1.Close()
+				continue
+			}
+
+			go handleClient(sess, p1, config.Quiet, config.CloseWait, config.UseConntrack, ipDomainStore)
 		}
 	}
 	myApp.Run(os.Args)
@@ -481,6 +534,7 @@ func createConn(config *Config, block kcp.BlockCrypt) (*smux.Session, error) {
 		session, err = smux.Client(std.NewCompStream(kcpconn), config.SmuxConfig)
 	}
 	if err != nil {
+		kcpconn.Close()
 		return nil, errors.Wrap(err, "createConn()")
 	}
 	return session, nil
@@ -499,22 +553,21 @@ func waitConn(config *Config, block kcp.BlockCrypt) *smux.Session {
 }
 
 // handleClient tunnels a single accepted TCP/UNIX client through an smux
-// stream and optionally wraps the stream in QPP for additional obfuscation.
-func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int, useTransparent bool, ipDomainStore *shmmap.Store) {
+// stream.
+func handleClient(session *smux.Session, p1 net.Conn, quiet bool, closeWait int, useTransparent bool, ipDomainStore *shmmap.Store) {
 	logln := func(v ...any) {
 		if !quiet {
 			log.Println(v...)
 		}
 	}
 
-	// Transport layer: accept the inbound socket and clean it up on exit.
-	defer p1.Close()
+	// Transport layer: accept the inbound socket.
 	p2, err := session.OpenStream()
 	if err != nil {
 		logln(err)
+		p1.Close()
 		return
 	}
-	defer p2.Close()
 
 	streamID := p2.RemoteAddr().String() + "(" + strconv.FormatUint(uint64(p2.ID()), 10) + ")"
 	logln("stream opened", "in:", p1.RemoteAddr(), "out:", streamID)
@@ -525,9 +578,13 @@ func handleClient(seed []byte, session *smux.Session, p1 net.Conn, quiet bool, c
 		tcpConn, ok := p1.(*net.TCPConn)
 		if !ok {
 			logln("transparent proxy requires TCP connection")
+			p1.Close()
+			p2.Close()
 			return
 		}
 		if err := setupTransparentProxy(tcpConn, p2, ipDomainStore, logln); err != nil {
+			p1.Close()
+			p2.Close()
 			return
 		}
 	}
@@ -566,7 +623,13 @@ func setupTransparentProxy(tcpConn *net.TCPConn, stream io.ReadWriter, ipDomainS
 		logln("dns domain lookup", "dst-ip", to.IP.String(), "domain", domain)
 	}
 
-	log.Println("send socks5 connect request", "host", host, "dst-port", to.Port)
+	logln("send socks5 connect request", "host", host, "dst-port", to.Port)
+	// Bound the SOCKS5 handshake so an unresponsive server cannot pin this
+	// goroutine, stream, and connection indefinitely.
+	if conn, ok := stream.(net.Conn); ok {
+		_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		defer conn.SetReadDeadline(time.Time{})
+	}
 	if err := std.SendSocksConnectRequestHost(stream, host, to.Port); err != nil {
 		logln("socks5 send handshake", "error", err)
 		return err
@@ -627,7 +690,7 @@ func checkError(err error) {
 	}
 }
 
-// timedSession annotates a smux session with its expiration deadline.
+// timedSession annotates an smux session with its expiration deadline.
 type timedSession struct {
 	session    *smux.Session
 	expiryDate time.Time

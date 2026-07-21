@@ -208,10 +208,8 @@ GLOBAL OPTIONS:
    --localaddr value, -l value      local listen address (default: ":12948")
    --remoteaddr value, -r value     kcp server address, eg: "IP:29900" a for single port, "IP:minport-maxport" for port range (default: "vps:29900")
    --key value                      pre-shared secret between client and server (default: "it's a secrect") [$KCPTUN_KEY]
-   --crypt value                    aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null (default: "aes")
+   --crypt value                    sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20 (default: "aes-128-gcm")
    --mode value                     profiles: fast3, fast2, fast, normal, manual (default: "fast")
-   --QPP                            enable Quantum Permutation Pads(QPP)
-   --QPPCount value                 the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes. (default: 61)
    --conn value                     set num of UDP connections to server (default: 1)
    --autoexpire value               set auto expiration time(in seconds) for a single UDP connection, 0 to disable (default: 0)
    --scavengettl value              set how long an expired connection can live (in seconds) (default: 600)
@@ -234,7 +232,6 @@ GLOBAL OPTIONS:
    --snmpperiod value               snmp collect period, in seconds (default: 60)
    --log value                      specify a log file to output, default goes to stderr
    --quiet                          to suppress the 'stream open/close' messages
-   --tcp                            to emulate a TCP connection(linux)
    -c value                         config from json file, which will override the command from shell
    --pprof                          start profiling server on :6060
    --help, -h                       show help
@@ -257,9 +254,7 @@ GLOBAL OPTIONS:
    --listen value, -l value         kcp server listen address, eg: "IP:29900" for a single port, "IP:minport-maxport" for port range (default: ":29900")
    --target value, -t value         target server address, or path/to/unix_socket (default: "127.0.0.1:12948")
    --key value                      pre-shared secret between client and server (default: "it's a secrect") [$KCPTUN_KEY]
-   --crypt value                    aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null (default: "aes")
-   --QPP                            enable Quantum Permutation Pads(QPP)
-   --QPPCount value                 the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes. (default: 61)
+   --crypt value                    sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20 (default: "aes-128-gcm")
    --mode value                     profiles: fast3, fast2, fast, normal, manual (default: "fast")
    --mtu value                      set maximum transmission unit for UDP packets (default: 1350)
    --ratelimit value                set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing. (default: 0)
@@ -275,13 +270,12 @@ GLOBAL OPTIONS:
    --framesize value                smux max frame size (default: 8192)
    --streambuf value                per stream receive buffer in bytes, smux v2+ (default: 2097152)
    --keepalive value                seconds between heartbeats (default: 10)
-   --closewait value                the seconds to wait before tearing down a connection (default: 30)
+   --closewait value                the seconds to wait before tearing down a connection (default: 5)
    --snmplog value                  collect snmp to file, aware of timeformat in golang, like: ./snmp-20060102.log
    --snmpperiod value               snmp collect period, in seconds (default: 60)
    --pprof                          start profiling server on :6060
    --log value                      specify a log file to output, default goes to stderr
    --quiet                          to suppress the 'stream open/close' messages
-   --tcp                            to emulate a TCP connection(linux)
    -c value                         config from json file, which will override the command from shell
    --help, -h                       show help
    --version, -v                    print the version
@@ -433,27 +427,13 @@ aes-128-cfb     847216.79k   850770.86k   853712.05k   859912.39k   854565.80k
 
 The encryption performance in kcptun is as fast as in openssl library(if not faster).
 
-### Quantum Resistance
-Quantum Resistance, also known as quantum-secure, post-quantum, or quantum-safe cryptography, refers to cryptographic algorithms that can withstand potential code-breaking attempts by quantum computers.
-Starting with version v20240701, kcptun adopts [QPP](https://github.com/xtaci/qpp) based on [Kuang's Quantum Permutation Pad](https://epjquantumtechnology.springeropen.com/articles/10.1140/epjqt/s40507-022-00145-y) for quantum-resistant communication.
+### Encryption
 
-![da824f7919f70dd1dfa3be9d2302e4e0](https://github.com/xtaci/kcptun/assets/2346725/7894f5e3-6134-4582-a9fe-e78494d2e417)
+kcptun uses authenticated encryption via AES-128-GCM by default. The shared key is derived using PBKDF2-HMAC-SHA256 with 600,000 iterations.
 
-To enable QPP in kcptun, set the following parameters:
-```
-   --QPP                Enable Quantum Permutation Pads (QPP)
-   --QPPCount value     The prime number of pads to use for QPP. More pads provide greater encryption security. Each pad requires 256 bytes. (default: 61)
-```
-You can also specify
-```json
-     "qpp":true,
-     "qpp-count":61,
-```
-in your client and server-side JSON configuration files. These two parameters must be identical on both sides.
+Available ciphers: sm4, tea, aes-128, aes-128-gcm (recommended), aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20.
 
-1. To achieve **effective quantum resistance**, specify at least **211** bytes in the `-key` parameter and ensure `-QPPCount` is at least **7**.
-2. Ensure that `-QPPCount` is **COPRIME (互素)** to **8** (or simply set it to a **PRIME** number) such as: 
-```101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199... ```
+> **Note:** All ciphers except `aes-128-gcm` are unauthenticated (stream modes) and do not provide message integrity. A warning is logged at startup when a non-AEAD cipher is selected. Strongly prefer `aes-128-gcm`.
 
 ### Memory Control
 
@@ -466,17 +446,11 @@ The pool mechanism maintains a *high watermark* for slice objects. These *in-fli
 The `-smuxbuf` parameter also affects maximum memory consumption and maintains a delicate balance between *concurrency* and *resource usage*. You can increase this value (default 4MB) to boost concurrency if you have many clients to serve and a powerful server. Conversely, you can decrease this value to serve only 1-2 clients if you're running the program on an embedded SoC system with limited memory. (Note that the `-smuxbuf` value is not directly proportional to concurrency; testing is required.)
 
 ### Compression
+kcptun uses LZ4 compression (64KB block size) for transparent stream compression across the tunnel:
 
-kcptun has builtin snappy algorithms for compressing streams:
+> LZ4 is a lossless data compression algorithm focused on compression and decompression speed. It belongs to the LZ77 family of byte-oriented compression schemes. LZ4 delivers extremely fast compression and decompression — faster than Snappy or zlib — with reasonable compression ratios for typical network payloads.
 
-> Snappy is a compression/decompression library. It does not aim for maximum
-> compression, or compatibility with any other compression library; instead,
-> it aims for very high speeds and reasonable compression. For instance,
-> compared to the fastest mode of zlib, Snappy is an order of magnitude faster
-> for most inputs, but the resulting compressed files are anywhere from 20% to
-> 100% bigger.
-
-> Reference: http://google.github.io/snappy/
+> Reference: https://github.com/lz4/lz4
 
 Compression can save bandwidth for **PLAINTEXT** data and is particularly useful for specific scenarios such as cross-datacenter replication. Compressing redologs in database management systems or Kafka-like message queues before transferring data streams across continents can significantly improve speed.
 

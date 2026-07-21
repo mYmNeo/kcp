@@ -37,11 +37,8 @@ type cryptMethod struct {
 // cryptMethods is a lookup table for supported encryption methods.
 // Using a map simplifies the code and makes adding new ciphers easier.
 var cryptMethods = map[string]cryptMethod{
-	"null":        {0, func(key []byte) (kcp.BlockCrypt, error) { return nil, nil }},
 	"sm4":         {16, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewSM4BlockCrypt(key) }},
 	"tea":         {16, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewTEABlockCrypt(key) }},
-	"xor":         {0, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewSimpleXORBlockCrypt(key) }},
-	"none":        {0, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewNoneBlockCrypt(key) }},
 	"aes-128":     {16, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewAESBlockCrypt(key) }},
 	"aes-192":     {24, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewAESBlockCrypt(key) }},
 	"blowfish":    {0, func(key []byte) (kcp.BlockCrypt, error) { return kcp.NewBlowfishBlockCrypt(key) }},
@@ -56,7 +53,7 @@ var cryptMethods = map[string]cryptMethod{
 // SelectBlockCrypt translates a human readable cipher name into the concrete
 // kcp.BlockCrypt implementation. It also reports the effective cipher name after
 // applying fallbacks so callers can log the final choice.
-func SelectBlockCrypt(method string, pass []byte) (kcp.BlockCrypt, string) {
+func SelectBlockCrypt(method string, pass []byte) (kcp.BlockCrypt, string, error) {
 	if m, ok := cryptMethods[method]; ok {
 		key := pass
 		if m.keySize > 0 && len(pass) >= m.keySize {
@@ -64,16 +61,24 @@ func SelectBlockCrypt(method string, pass []byte) (kcp.BlockCrypt, string) {
 		}
 		block, err := m.build(key)
 		if err != nil {
-			log.Printf("crypt: failed to create %s cipher: %v, falling back to aes", method, err)
-			block, _ = kcp.NewAESBlockCrypt(pass)
-			return block, "aes"
+			log.Printf("crypt: failed to create %s cipher: %v, falling back to aes-128-gcm", method, err)
+			block, err = kcp.NewAESGCMCrypt(pass)
+			if err != nil {
+				log.Printf("crypt: failed to create fallback aes-128-gcm cipher: %v", err)
+				return nil, "", err
+			}
+			return block, "aes-128-gcm", nil
 		}
-		return block, method
+		if method != "aes-128-gcm" {
+			log.Printf("crypt: %s provides no message authentication; prefer aes-128-gcm", method)
+		}
+		return block, method, nil
 	}
-	// Default to AES for unknown methods
-	block, err := kcp.NewAESBlockCrypt(pass)
+	// Default to AES-128-GCM (AEAD) for unknown methods.
+	block, err := kcp.NewAESGCMCrypt(pass)
 	if err != nil {
-		log.Printf("crypt: failed to create default aes cipher: %v", err)
+		log.Printf("crypt: failed to create default aes-128-gcm cipher: %v", err)
+		return nil, "", err
 	}
-	return block, "aes"
+	return block, "aes-128-gcm", nil
 }

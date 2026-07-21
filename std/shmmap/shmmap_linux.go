@@ -9,6 +9,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -22,6 +23,9 @@ type Store struct {
 	name string
 	path string
 	data []byte
+	wmu  sync.Mutex     // serializes writers (a seqlock requires a single writer at a time)
+	done chan struct{}  // closed by Close to stop the cleanup goroutine
+	wg   sync.WaitGroup // tracks the cleanup goroutine so Close can wait for it
 }
 
 func shmPath(name string) (string, error) {
@@ -45,7 +49,7 @@ func Open(name string, size uint) (*Store, error) {
 		return nil, err
 	}
 
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT, 0o666)
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("shmmap: open %s: %w", path, err)
 	}
@@ -60,7 +64,7 @@ func Open(name string, size uint) (*Store, error) {
 		return nil, fmt.Errorf("shmmap: mmap: %w", err)
 	}
 
-	s := &Store{name: name, path: path, data: data}
+	s := &Store{name: name, path: path, data: data, done: make(chan struct{})}
 	s.initHeader()
 	return s, nil
 }
@@ -92,7 +96,7 @@ func OpenReadOnly(name string) (*Store, error) {
 		return nil, fmt.Errorf("shmmap: mmap: %w", err)
 	}
 
-	s := &Store{name: name, path: path, data: data}
+	s := &Store{name: name, path: path, data: data, done: make(chan struct{})}
 	if err := s.validateHeader(); err != nil {
 		unix.Munmap(data)
 		return nil, err
@@ -105,9 +109,12 @@ func (s *Store) initHeader() {
 	if string(h.magic[:8]) != magic {
 		copy(h.magic[:], magic)
 		h.version = version
-		h.slotCount = (uint32(len(s.data)) - headerSize) / slotSize
 		h.seq = 0
 	}
+	// Always (re)compute slotCount from the actual mapped size. A pre-existing
+	// file reopened with a different size must not retain a stale count that
+	// would drive slotAt out of bounds.
+	h.slotCount = (uint32(len(s.data)) - headerSize) / slotSize
 }
 
 func (s *Store) validateHeader() error {
@@ -266,6 +273,7 @@ func (s *Store) Put(msg *dns.Msg) {
 		return
 	}
 
+	s.wmu.Lock()
 	s.seqBeginWrite()
 	for _, ip := range ips {
 		sl := s.findSlot(ip, true)
@@ -279,6 +287,7 @@ func (s *Store) Put(msg *dns.Msg) {
 		sl.domain[n] = 0
 	}
 	s.seqEndWrite()
+	s.wmu.Unlock()
 }
 
 // Lookup returns the domain name for an IP address, or empty string if not found.
@@ -315,14 +324,19 @@ func stringFromNull(b []byte) string {
 	return string(b)
 }
 
-// StartCleanup runs a background goroutine that clears expired slots.
+// StartCleanup runs a background goroutine that clears expired slots. The
+// goroutine exits when either ctx is cancelled or Close is called.
 func (s *Store) StartCleanup(ctx context.Context) {
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-s.done:
 				return
 			case <-ticker.C:
 				s.cleanup()
@@ -336,6 +350,7 @@ func (s *Store) cleanup() {
 	h := s.header()
 	count := h.slotCount
 
+	s.wmu.Lock()
 	s.seqBeginWrite()
 	for i := uint32(0); i < count; i++ {
 		sl := s.slotAt(i)
@@ -346,13 +361,19 @@ func (s *Store) cleanup() {
 		}
 	}
 	s.seqEndWrite()
+	s.wmu.Unlock()
 }
 
-// Close unmaps the shared memory region.
+// Close unmaps the shared memory region. It signals the cleanup goroutine to
+// stop and waits for it to exit before unmapping, preventing use-after-unmap.
 func (s *Store) Close() error {
 	if s.data == nil {
 		return nil
 	}
+	if s.done != nil {
+		close(s.done)
+	}
+	s.wg.Wait()
 	err := unix.Munmap(s.data)
 	s.data = nil
 	return err

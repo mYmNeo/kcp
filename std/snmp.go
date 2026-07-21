@@ -51,7 +51,7 @@ func SnmpLogger(path string, interval int) {
 				f.Close()
 			}
 			var err error
-			f, err = os.OpenFile(formattedPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
+			f, err = os.OpenFile(formattedPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 			if err != nil {
 				log.Println("snmp logger:", err)
 				f = nil

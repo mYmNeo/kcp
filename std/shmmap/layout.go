@@ -17,7 +17,7 @@
      family    u8    4 or 6
      qtype     u16   dns.TypeA or dns.TypeAAAA
      expiresAt u64   unix seconds
-     domain    [253] null-terminated FQDN
+     domain    [240] null-terminated FQDN
 */
 
 package shmmap

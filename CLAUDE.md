@@ -71,11 +71,11 @@ kill -USR1 $(pgrep server_linux_amd64)
 
 - **`std/`** — Shared library used by both client and server:
   - `config.go` — `BaseConfig` struct embedded by both client and server Config; predefined KCP mode profiles (normal, fast, fast2, fast3); `ParseJSONConfig` generic loader
-  - `crypt.go` — Cipher registry mapping names (aes, aes-128-gcm, salsa20, blowfish, etc.) to `kcp.BlockCrypt` implementations via PBKDF2 key derivation (4096 iterations, SHA1)
+  - `crypt.go` — Cipher registry mapping names (sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20) to `kcp.BlockCrypt` implementations via PBKDF2-HMAC-SHA256 key derivation (600,000 iterations). Weak/null ciphers (none, null, xor) removed. Defaults to `aes-128-gcm` (AEAD).
   - `copy.go` — Optimized bidirectional I/O forwarding (`Copy`/`Pipe`) using `io.WriterTo`/`io.ReaderFrom` interfaces
   - `proxy.go` — SOCKS5 protocol implementation (RFC 1928) with buffer pooling
   - `multiport.go` — Parses `host:min-max` port range format for multiport dialing
-  - `comp.go` — Snappy compression wrapper
+  - `comp.go` — LZ4 compression wrapper with 64KB block size for low-latency bulk transfer
   - `smuxcfg.go` — SMUX configuration (v1/v2 selection, buffer sizes)
   - `snmp.go` — Periodic SNMP stats logging to file (`--snmplog`/`--snmpperiod`)
   - `signal.go` — Signal handling (Unix only): SIGUSR1 dumps KCP SNMP stats, SIGTERM/SIGINT runs registered exit handlers
@@ -92,7 +92,6 @@ App → Client (TCP :12948) → [KCP/UDP + SMUX over internet] → Server (UDP :
 
 **FEC (Forward Error Correction):** `--datashard N` and `--parityshard M` configure Reed-Solomon erasure codes. N data packets + M parity packets sent together; up to M can be lost without retransmission. Default: 10/3.
 
-**QPP (Quantum Permutation Pads):** Optional stream obfuscation layer (`--QPP`, `--QPPCount N`). Wraps SMUX streams with byte-level permutation using prime-modulo indexing. Requires key length ≥211 bytes for effective security.
 
 ## Key Patterns
 
