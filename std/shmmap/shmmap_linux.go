@@ -3,6 +3,7 @@
 package shmmap
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -23,9 +24,7 @@ type Store struct {
 	name string
 	path string
 	data []byte
-	wmu  sync.Mutex     // serializes writers (a seqlock requires a single writer at a time)
-	done chan struct{}  // closed by Close to stop the cleanup goroutine
-	wg   sync.WaitGroup // tracks the cleanup goroutine so Close can wait for it
+	mu   sync.Mutex
 }
 
 func shmPath(name string) (string, error) {
@@ -64,7 +63,7 @@ func Open(name string, size uint) (*Store, error) {
 		return nil, fmt.Errorf("shmmap: mmap: %w", err)
 	}
 
-	s := &Store{name: name, path: path, data: data, done: make(chan struct{})}
+	s := &Store{name: name, path: path, data: data}
 	s.initHeader()
 	return s, nil
 }
@@ -96,7 +95,7 @@ func OpenReadOnly(name string) (*Store, error) {
 		return nil, fmt.Errorf("shmmap: mmap: %w", err)
 	}
 
-	s := &Store{name: name, path: path, data: data, done: make(chan struct{})}
+	s := &Store{name: name, path: path, data: data}
 	if err := s.validateHeader(); err != nil {
 		unix.Munmap(data)
 		return nil, err
@@ -111,9 +110,9 @@ func (s *Store) initHeader() {
 		h.version = version
 		h.seq = 0
 	}
-	// Always (re)compute slotCount from the actual mapped size. A pre-existing
-	// file reopened with a different size must not retain a stale count that
-	// would drive slotAt out of bounds.
+	// Always recompute slotCount from the actual mapping size —
+	// the shared memory file persists across restarts and may have
+	// been created with a different DNSShmSize.
 	h.slotCount = (uint32(len(s.data)) - headerSize) / slotSize
 }
 
@@ -196,13 +195,13 @@ func ipEqual(slotIP *[16]byte, family uint8, ip net.IP) bool {
 		if v4 == nil {
 			return false
 		}
-		return string(slotIP[:4]) == string(v4)
+		return bytes.Equal(slotIP[:4], v4)
 	}
 	ip16 := ip.To16()
 	if ip16 == nil {
 		return false
 	}
-	return string(slotIP[:16]) == string(ip16)
+	return bytes.Equal(slotIP[:16], ip16)
 }
 
 func (s *Store) findSlot(ip net.IP, forWrite bool) *slot {
@@ -273,7 +272,11 @@ func (s *Store) Put(msg *dns.Msg) {
 		return
 	}
 
-	s.wmu.Lock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data == nil {
+		return
+	}
 	s.seqBeginWrite()
 	for _, ip := range ips {
 		sl := s.findSlot(ip, true)
@@ -287,12 +290,14 @@ func (s *Store) Put(msg *dns.Msg) {
 		sl.domain[n] = 0
 	}
 	s.seqEndWrite()
-	s.wmu.Unlock()
 }
 
 // Lookup returns the domain name for an IP address, or empty string if not found.
 func (s *Store) Lookup(ip net.IP) (string, bool) {
 	if ip == nil {
+		return "", false
+	}
+	if s.data == nil {
 		return "", false
 	}
 	now := uint64(time.Now().Unix())
@@ -324,19 +329,14 @@ func stringFromNull(b []byte) string {
 	return string(b)
 }
 
-// StartCleanup runs a background goroutine that clears expired slots. The
-// goroutine exits when either ctx is cancelled or Close is called.
+// StartCleanup runs a background goroutine that clears expired slots.
 func (s *Store) StartCleanup(ctx context.Context) {
-	s.wg.Add(1)
 	go func() {
-		defer s.wg.Done()
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				return
-			case <-s.done:
 				return
 			case <-ticker.C:
 				s.cleanup()
@@ -347,10 +347,15 @@ func (s *Store) StartCleanup(ctx context.Context) {
 
 func (s *Store) cleanup() {
 	now := uint64(time.Now().Unix())
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data == nil {
+		return
+	}
 	h := s.header()
 	count := h.slotCount
 
-	s.wmu.Lock()
 	s.seqBeginWrite()
 	for i := uint32(0); i < count; i++ {
 		sl := s.slotAt(i)
@@ -361,19 +366,15 @@ func (s *Store) cleanup() {
 		}
 	}
 	s.seqEndWrite()
-	s.wmu.Unlock()
 }
 
-// Close unmaps the shared memory region. It signals the cleanup goroutine to
-// stop and waits for it to exit before unmapping, preventing use-after-unmap.
+// Close unmaps the shared memory region.
 func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.data == nil {
 		return nil
 	}
-	if s.done != nil {
-		close(s.done)
-	}
-	s.wg.Wait()
 	err := unix.Munmap(s.data)
 	s.data = nil
 	return err

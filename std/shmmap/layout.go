@@ -17,7 +17,7 @@
      family    u8    4 or 6
      qtype     u16   dns.TypeA or dns.TypeAAAA
      expiresAt u64   unix seconds
-     domain    [240] null-terminated FQDN
+     domain    [253] null-terminated FQDN
 */
 
 package shmmap
@@ -26,8 +26,8 @@ const (
 	magic       = "DOHSHM01"
 	version     = 1
 	headerSize  = 64
-	slotSize    = 272
-	domainMax   = 240 // fits in 272-byte slot with aligned fields
+	slotSize    = 288
+	domainMax   = 254 // 253+null; slot pads to 288
 	maxProbe    = 32
 	defaultSize = 4 * 1024 * 1024
 )

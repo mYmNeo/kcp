@@ -153,6 +153,42 @@ func TestLongDomain(t *testing.T) {
 	}
 }
 
+// TestReopenSmallerSizeRecomputesSlotCount guards against a stale slotCount
+// left in the header by a previous run with a larger DNSShmSize. The POSIX
+// shm file persists across restarts, and initHeader must resync slotCount
+// from the actual mapping size on every open — otherwise findSlot/Put/cleanup
+// index past the (smaller) buffer and panic with "index out of range".
+func TestReopenSmallerSizeRecomputesSlotCount(t *testing.T) {
+	name := "/doh-shm-test-resize"
+
+	// First open with a LARGER mapping to plant a large slotCount in the header.
+	const bigSlots = 1024
+	big, err := Open(name, uint(headerSize+slotSize*bigSlots))
+	if err != nil {
+		t.Fatal(err)
+	}
+	big.Put(newTestMsg("big.example.com.", dns.TypeA, []string{"10.0.0.5"}))
+	big.Close()
+
+	// Reopen with a much SMALLER mapping. The stale large slotCount must be
+	// recomputed from the small buffer, or cleanup() (which visits every slot)
+	// indexes past the buffer and panics.
+	const smallSlots = 16
+	small, err := Open(name, uint(headerSize+slotSize*smallSlots))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer small.Close()
+	defer unixUnlink(name)
+
+	// Must not panic with "index out of range".
+	small.cleanup()
+
+	if h := small.header(); h.slotCount != smallSlots {
+		t.Fatalf("slotCount = %d, want %d (it must track the actual mapping size)", h.slotCount, smallSlots)
+	}
+}
+
 func newTestMsg(name string, qtype uint16, ips []string) *dns.Msg {
 	msg := new(dns.Msg)
 	msg.Rcode = dns.RcodeSuccess
