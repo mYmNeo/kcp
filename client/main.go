@@ -344,9 +344,6 @@ func main() {
 		log.Println("snmpperiod:", config.SnmpPeriod)
 		log.Println("quiet:", config.Quiet)
 		log.Println("pprof:", config.Pprof)
-		if config.DNSConfig != nil {
-			log.Println("dns config:", config.DNSConfig.LocalInterfaceName)
-		}
 		if config.ShmMap != "" {
 			log.Println("shmmap:", config.ShmMap)
 		}

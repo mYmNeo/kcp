@@ -23,24 +23,22 @@
 package main
 
 import (
-	"github.com/xtaci/kcptun/dns"
 	"github.com/xtaci/kcptun/std"
 	"github.com/xtaci/smux"
 )
 
 // Config models the client-side configuration loaded via flags or JSON.
 type Config struct {
-	std.BaseConfig                // Embed shared configuration
-	LocalAddr      string         `json:"localaddr"`
-	RemoteAddr     string         `json:"remoteaddr"`
-	Conn           int            `json:"conn"`
-	AutoExpire     int            `json:"autoexpire"`
-	ScavengeTTL    int            `json:"scavengettl"`
-	UseConntrack   bool           `json:"conntrack"`
-	ProxyMode      int            `json:"proxy-mode"`
-	ShmMap         string         `json:"shmmap"`
-	DNSConfig      *dns.DNSConfig `json:"dns"`
-	SmuxConfig     *smux.Config   `json:"-"` // precomputed smux configuration
+	std.BaseConfig              // Embed shared configuration
+	LocalAddr      string       `json:"localaddr"`
+	RemoteAddr     string       `json:"remoteaddr"`
+	Conn           int          `json:"conn"`
+	AutoExpire     int          `json:"autoexpire"`
+	ScavengeTTL    int          `json:"scavengettl"`
+	UseConntrack   bool         `json:"conntrack"`
+	ProxyMode      int          `json:"proxy-mode"`
+	ShmMap         string       `json:"shmmap"`
+	SmuxConfig     *smux.Config `json:"-"` // precomputed smux configuration
 }
 
 func parseJSONConfig(config *Config, path string) error {

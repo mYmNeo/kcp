@@ -37,9 +37,7 @@ func sockaddrPort(port uint16) int {
 
 func parseSockaddrInet4(addr *syscall.RawSockaddrInet4) *net.TCPAddr {
 	ip := make([]byte, 4)
-	for i, b := range addr.Addr {
-		ip[i] = b
-	}
+	copy(ip, addr.Addr[:])
 	return &net.TCPAddr{
 		IP:   ip,
 		Port: sockaddrPort(addr.Port),
@@ -48,9 +46,7 @@ func parseSockaddrInet4(addr *syscall.RawSockaddrInet4) *net.TCPAddr {
 
 func parseSockaddrInet6(addr *syscall.RawSockaddrInet6) *net.TCPAddr {
 	ip := make([]byte, 16)
-	for i, b := range addr.Addr {
-		ip[i] = b
-	}
+	copy(ip, addr.Addr[:])
 	return &net.TCPAddr{
 		IP:   ip,
 		Port: sockaddrPort(addr.Port),
