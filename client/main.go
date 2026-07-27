@@ -652,6 +652,7 @@ func resolveTransparentDst(tcpConn *net.TCPConn, logln func(...any)) (*net.TCPAd
 		}
 		return nil, err
 	}
+	logln("transparent proxy: original", "orig-ip", from.IP.String(), "orig-port", from.Port, "dst-ip", to.IP.String(), "dst-port", to.Port)
 	if originalDstMatchesLocal(tcpConn, to) {
 		logln("transparent proxy: direct connection, passthrough", "src-ip", from.IP.String(), "src-port", from.Port)
 		return nil, nil
