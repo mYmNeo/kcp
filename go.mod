@@ -6,8 +6,8 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/pkg/errors v0.9.1
 	github.com/urfave/cli v1.22.17
-	github.com/xtaci/kcp-go/v5 v5.6.72
-	github.com/xtaci/smux v1.5.57
+	github.com/xtaci/kcp-go/v5 v5.0.0
+	github.com/xtaci/smux v0.0.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sys v0.41.0
 )
@@ -27,5 +27,9 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.40.0 // indirect
 )
+
+replace github.com/xtaci/kcp-go/v5 => ./staging/kcp-go/
+
+replace github.com/xtaci/smux => ./staging/smux/
 
 go 1.26.0
