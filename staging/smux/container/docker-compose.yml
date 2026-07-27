@@ -1,0 +1,41 @@
+# smux container integration test
+#
+# Run: docker compose up --build --abort-on-container-exit
+#
+# Uses a length-prefixed echo protocol (no half-close needed).
+# Server starts with healthcheck, client runs throughput test.
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    container_name: server
+    command:
+      - -mode=server
+      - -addr=:9000
+      - -version=2
+    ports:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9000"]
+      interval: 1s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  client:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    container_name: client
+    command:
+      - -mode=client
+      - -addr=server:9000
+      - -version=2
+      - -streams=4
+      - -datasize=16777216
+      - -framesize=32768
+    depends_on:
+      server:
+        condition: service_healthy

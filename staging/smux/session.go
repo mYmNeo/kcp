@@ -23,6 +23,7 @@
 package smux
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -91,7 +92,8 @@ type writeResult struct {
 
 // Session defines a multiplexed connection for streams
 type Session struct {
-	conn io.ReadWriteCloser
+	conn   io.ReadWriteCloser
+	reader *bufio.Reader // buffered reader for recvLoop to coalesce small reads
 
 	config           *Config
 	goAway           int32  // flag id exhausted
@@ -127,7 +129,8 @@ type Session struct {
 	acceptDeadline  atomic.Value // deadline for Accept()
 
 	requestID        uint32            // Monotonic increasing write request ID
-	shaper           chan writeRequest // a shaper for writing
+	shaper           chan writeRequest // channel for CLSDATA write requests
+	shaperCtrl       chan writeRequest // channel for CLSCTRL (keepalive NOP, SYN) — never blocked
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
@@ -137,12 +140,14 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s := new(Session)
 	s.die = make(chan struct{})
 	s.conn = conn
+	s.reader = bufio.NewReaderSize(conn, 65536)
 	s.config = config
 	s.streams = make(map[uint32]*stream)
 	s.chAccepts = make(chan *stream, defaultAcceptBacklog)
 	s.bucket = int32(config.MaxReceiveBuffer)
 	s.bucketNotify = make(chan struct{}, 1)
 	s.shaper = make(chan writeRequest, maxShaperSize)
+	s.shaperCtrl = make(chan writeRequest, minShaperNotifySize)
 	s.chSocketReadError = make(chan struct{})
 	s.chSocketWriteError = make(chan struct{})
 	s.chProtoError = make(chan struct{})
@@ -400,7 +405,7 @@ func (s *Session) recvLoop() {
 
 		// As long as we have tokens, try to read frames.
 		// read header first
-		_, err := io.ReadFull(s.conn, hdr[:])
+		_, err := io.ReadFull(s.reader, hdr[:])
 		if err != nil {
 			s.notifyReadError(err)
 			return
@@ -463,7 +468,7 @@ func (s *Session) recvLoop() {
 
 			// read payload from the underlying connection
 			pNewbuf := defaultAllocator.Get(int(hdr.Length()))
-			written, err := io.ReadFull(s.conn, *pNewbuf)
+			written, err := io.ReadFull(s.reader, *pNewbuf)
 			if err != nil {
 				s.notifyReadError(err)
 
@@ -495,7 +500,7 @@ func (s *Session) recvLoop() {
 				return
 			}
 
-			_, err := io.ReadFull(s.conn, updHdr[:])
+			_, err := io.ReadFull(s.reader, updHdr[:])
 			if err != nil {
 				s.notifyReadError(err)
 				return
@@ -544,14 +549,33 @@ func (s *Session) keepalive() {
 
 // shaperLoop implements a priority queue and bandwidth shaping for write requests.
 // Eg: Control messages are prioritized over data messages, and shaper tries
-// its best to keep fair bandwidth among streams.
 func (s *Session) shaperLoop() {
 	chShaper := s.shaper
 
 	for {
+		// Always drain CLSCTRL (control) frames first — they bypass backpressure.
+		select {
+		case r := <-s.shaperCtrl:
+			s.sq.Push(r)
+			// drain any additional control frames without blocking
+			for len(s.shaperCtrl) > 0 {
+				select {
+				case r := <-s.shaperCtrl:
+					s.sq.Push(r)
+				default:
+				}
+			}
+			s.notifyShaperPending()
+			continue
+		default:
+		}
+
 		select {
 		case <-s.die:
 			return
+		case r := <-s.shaperCtrl:
+			s.sq.Push(r)
+			s.notifyShaperPending()
 		case r := <-chShaper:
 			s.sq.Push(r)
 			// batch drain: collect more requests if available
@@ -566,7 +590,8 @@ func (s *Session) shaperLoop() {
 			s.notifyShaperPending()
 
 			if s.sq.Len() >= maxShaperSize {
-				// stop accepting new requests temporarily if shaper queue is full
+				// stop accepting new CLSDATA requests temporarily if shaper queue is full
+				// CLSCTRL frames still enter via the shaperCtrl channel above
 				chShaper = nil
 			}
 		case <-s.chShaperConsumed:
@@ -597,7 +622,7 @@ func (s *Session) sendLoop() {
 	var buf []byte
 	var n int
 	var err error
-	var vec [][]byte // vector for writeBuffers
+	var vec [][]byte // vector for WriteBuffers interface
 
 	bw, ok := s.conn.(interface {
 		WriteBuffers(v [][]byte) (n int, err error)
@@ -629,12 +654,13 @@ EVENT_LOOP:
 				binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
 				binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
 
-				// support for scatter-gather I/O
 				if len(vec) > 0 {
+					// scatter-gather I/O via WriteBuffers (e.g. KCP)
 					vec[0] = buf[:headerSize]
 					vec[1] = request.frame.data
 					n, err = bw.WriteBuffers(vec)
 				} else {
+					// single Write with pre-allocated buffer
 					copy(buf[headerSize:], request.frame.data)
 					n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
 				}
@@ -681,8 +707,13 @@ func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class C
 		seq:    atomic.AddUint32(&s.requestID, 1),
 		result: resultCh,
 	}
+	// route by class: CLSCTRL uses the priority channel that never blocks on backpressure
+	targetCh := s.shaper
+	if class == CLSCTRL {
+		targetCh = s.shaperCtrl
+	}
 	select {
-	case s.shaper <- req:
+	case targetCh <- req:
 	case <-s.die:
 		resultChanPool.Put(resultCh)
 		return 0, io.ErrClosedPipe
