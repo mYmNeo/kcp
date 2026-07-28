@@ -3,6 +3,7 @@
 package shmmap
 
 import (
+	"bytes"
 	"net"
 	"os"
 	"strings"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+// benchSink defeats dead-code elimination in benchmarks.
+var benchSink string
 
 func TestLayoutSize(t *testing.T) {
 	if unsafe.Sizeof(header{}) != headerSize {
@@ -219,4 +223,74 @@ func unixUnlink(name string) {
 		return
 	}
 	_ = os.Remove(path)
+}
+
+func TestIPView(t *testing.T) {
+	tests := []struct {
+		name   string
+		ip     net.IP
+		family uint8
+		view   []byte // nil means family 0, no view
+	}{
+		{"v4", net.ParseIP("1.2.3.4"), 4, net.ParseIP("1.2.3.4").To4()},
+		{"v4-raw", net.IP{1, 2, 3, 4}, 4, net.IP{1, 2, 3, 4}},
+		{"v4-in-16", net.IPv4(1, 2, 3, 4), 4, net.ParseIP("1.2.3.4").To4()},
+		{"v6", net.ParseIP("2001:db8::1"), 6, net.ParseIP("2001:db8::1").To16()},
+		{"nil", nil, 0, nil},
+		{"invalid-len", net.IP{1, 2, 3}, 0, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			family, view := ipView(tt.ip)
+			if family != tt.family {
+				t.Fatalf("family = %d, want %d", family, tt.family)
+			}
+			if !bytes.Equal(view, tt.view) {
+				t.Fatalf("view = %v, want %v", view, tt.view)
+			}
+		})
+	}
+}
+
+func TestIsIPv4Mapped(t *testing.T) {
+	if !isIPv4Mapped(net.IPv4(1, 2, 3, 4)) {
+		t.Fatal("IPv4(1,2,3,4) should be mapped")
+	}
+	if isIPv4Mapped(net.ParseIP("2001:db8::1").To16()) {
+		t.Fatal("real IPv6 should not be mapped")
+	}
+}
+
+func TestIPEqual_CrossFamily(t *testing.T) {
+	// A real IPv6 address should not equal a slot stored as family 4.
+	var slotIP [16]byte
+	writeIP(&slotIP, net.ParseIP("1.2.3.4")) // stores family 4
+	if ipEqual(&slotIP, 4, net.ParseIP("2001:db8::1")) {
+		t.Fatal("real v6 IP should not equal family=4 slot")
+	}
+	// A 4-byte IPv4 should not equal a slot stored as family 6.
+	writeIP(&slotIP, net.ParseIP("2001:db8::1")) // stores family 6
+	if ipEqual(&slotIP, 6, net.IPv4(1, 2, 3, 4)) {
+		t.Fatal("v4 IP should not equal family=6 slot")
+	}
+}
+
+func BenchmarkLookup(b *testing.B) {
+	name := "/doh-shm-bench-" + b.Name()
+	size := uint(headerSize + slotSize*64)
+	store, err := Open(name, size)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	defer unixUnlink(name)
+
+	msg := newTestMsg("bench.example.com.", dns.TypeA, []string{"10.0.0.1"})
+	store.Put(msg)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		benchSink, _ = store.Lookup(net.IPv4(10, 0, 0, 1))
+	}
 }

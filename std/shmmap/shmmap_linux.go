@@ -159,49 +159,71 @@ func (s *Store) seqSnapshot() uint32 {
 	return seq
 }
 
+// isIPv4Mapped reports whether a 16-byte net.IP is an IPv4-mapped address
+// (prefix ::ffff/96). Mirrors the prefix check inside net.IP.To4().
+func isIPv4Mapped(ip net.IP) bool {
+	return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 &&
+		ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
+		ip[8] == 0 && ip[9] == 0 && ip[10] == 0xff && ip[11] == 0xff
+}
+
+// ipView returns the address family (4, 6, or 0 for invalid) and a
+// zero-copy view into ip, mirroring net.IP.To4() semantics without
+// allocating: a 4-byte IP or a 16-byte IPv4-mapped address yields family
+// 4 with a 4-byte view; a 16-byte non-mapped address yields family 6.
+func ipView(ip net.IP) (family uint8, view []byte) {
+	switch len(ip) {
+	case net.IPv4len:
+		return 4, ip
+	case net.IPv6len:
+		if isIPv4Mapped(ip) {
+			return 4, ip[12:16]
+		}
+		return 6, ip
+	}
+	return 0, nil
+}
+
 func ipHash(ip net.IP) uint32 {
-	v4 := ip.To4()
-	if v4 != nil {
-		return binary.BigEndian.Uint32(v4)
+	family, v := ipView(ip)
+	switch family {
+	case 4:
+		return binary.BigEndian.Uint32(v)
+	case 6:
+		return binary.BigEndian.Uint32(v[0:4]) ^ binary.BigEndian.Uint32(v[4:8]) ^
+			binary.BigEndian.Uint32(v[8:12]) ^ binary.BigEndian.Uint32(v[12:16])
 	}
-	ip = ip.To16()
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip[0:4]) ^ binary.BigEndian.Uint32(ip[4:8]) ^
-		binary.BigEndian.Uint32(ip[8:12]) ^ binary.BigEndian.Uint32(ip[12:16])
+	return 0
 }
 
 func writeIP(dst *[16]byte, ip net.IP) uint8 {
-	v4 := ip.To4()
-	if v4 != nil {
-		copy(dst[:4], v4)
+	family, v := ipView(ip)
+	switch family {
+	case 4:
+		copy(dst[:4], v)
 		for i := 4; i < 16; i++ {
 			dst[i] = 0
 		}
 		return 4
+	case 6:
+		copy(dst[:], v)
+		return 6
 	}
-	ip16 := ip.To16()
-	if ip16 == nil {
-		return 0
-	}
-	copy(dst[:], ip16)
-	return 6
+	return 0
 }
 
 func ipEqual(slotIP *[16]byte, family uint8, ip net.IP) bool {
-	if family == 4 {
-		v4 := ip.To4()
-		if v4 == nil {
-			return false
-		}
-		return bytes.Equal(slotIP[:4], v4)
-	}
-	ip16 := ip.To16()
-	if ip16 == nil {
+	ipFamily, v := ipView(ip)
+	if ipFamily != family {
 		return false
 	}
-	return bytes.Equal(slotIP[:16], ip16)
+	switch family {
+	case 4:
+		return bytes.Equal(slotIP[:4], v)
+	case 6:
+		return bytes.Equal(slotIP[:16], v)
+	}
+	return false
 }
 
 func (s *Store) findSlot(ip net.IP, forWrite bool) *slot {

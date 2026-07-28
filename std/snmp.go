@@ -33,6 +33,44 @@ import (
 	kcp "github.com/xtaci/kcp-go/v5"
 )
 
+// snmpWriter manages a CSV writer for SNMP logging with header tracking.
+type snmpWriter struct {
+	w          *csv.Writer
+	record     []string
+	headerCols []string
+	written    bool
+}
+
+// newSnmpWriter creates a snmpWriter bound to f.
+func newSnmpWriter(f *os.File) *snmpWriter {
+	cols := kcp.DefaultSnmp.Header()
+	rec := make([]string, 1+len(cols))
+	return &snmpWriter{
+		w:          csv.NewWriter(f),
+		record:     rec,
+		headerCols: cols,
+	}
+}
+
+// writeTick writes one SNMP data row, preceded by the header row on first call.
+func (sw *snmpWriter) writeTick() error {
+	if !sw.written {
+		sw.record[0] = "Unix"
+		copy(sw.record[1:], sw.headerCols)
+		if err := sw.w.Write(sw.record); err != nil {
+			return err
+		}
+		sw.written = true
+	}
+	sw.record[0] = strconv.FormatInt(time.Now().Unix(), 10)
+	copy(sw.record[1:], kcp.DefaultSnmp.ToSlice())
+	if err := sw.w.Write(sw.record); err != nil {
+		return err
+	}
+	sw.w.Flush()
+	return sw.w.Error()
+}
+
 func SnmpLogger(path string, interval int) {
 	if path == "" || interval <= 0 {
 		return
@@ -43,6 +81,7 @@ func SnmpLogger(path string, interval int) {
 	logdir, logfile := filepath.Split(path)
 	var f *os.File
 	var currentPath string
+	var sw *snmpWriter
 
 	for range ticker.C {
 		formattedPath := logdir + time.Now().Format(logfile)
@@ -56,37 +95,17 @@ func SnmpLogger(path string, interval int) {
 				log.Println("snmp logger:", err)
 				f = nil
 				currentPath = ""
+				sw = nil
 				continue
 			}
 			currentPath = formattedPath
+			sw = newSnmpWriter(f)
 		}
-		if f == nil {
+		if f == nil || sw == nil {
 			continue
 		}
-		if err := writeSnmpRecord(f); err != nil {
+		if err := sw.writeTick(); err != nil {
 			log.Println("snmp logger:", err)
 		}
 	}
-}
-
-// writeSnmpRecord writes a single SNMP record to f.
-func writeSnmpRecord(f *os.File) error {
-	// Check if the file is empty to write the header.
-	if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
-		w := csv.NewWriter(f)
-		if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
-			return err
-		}
-		w.Flush()
-		if err := w.Error(); err != nil {
-			return err
-		}
-	}
-
-	w := csv.NewWriter(f)
-	if err := w.Write(append([]string{strconv.FormatInt(time.Now().Unix(), 10)}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
-		return err
-	}
-	w.Flush()
-	return w.Error()
 }
