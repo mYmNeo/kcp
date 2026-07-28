@@ -228,3 +228,68 @@ func TestAcklistPreAllocated(t *testing.T) {
 		t.Errorf("acklist cap changed from %d to %d after first push", initialCap, cap(kcp1.acklist))
 	}
 }
+
+// TestParseFastackSkipAcked verifies that parse_fastack skips segments
+// marked as acked=1 (by parse_ack), so their fastack counters are not
+// incremented. Tested segments should only accumulate fastack when they
+// are unacknowledged.
+func TestParseFastackSkipAcked(t *testing.T) {
+	// Save and restore SNMP state.
+	prev := DefaultSnmp.Copy()
+	defer func() {
+		DefaultSnmp.Reset()
+		*DefaultSnmp = *prev
+	}()
+
+	kcp1 := NewKCP(0xAABBCCDD, func(buf []byte, size int) {})
+	kcp1.NoDelay(1, 10, 2, 1)
+	kcp1.WndSize(128, 128)
+
+	// Send 5 segments — they enter snd_queue, then we move them to snd_buf.
+	for range 5 {
+		kcp1.Send([]byte("data"))
+	}
+
+	// Move all segments from snd_queue into snd_buf (simulating what flush Phase 4 does).
+	for {
+		seg, ok := kcp1.snd_queue.Pop()
+		if !ok {
+			break
+		}
+		seg.conv = kcp1.conv
+		seg.cmd = IKCP_CMD_PUSH
+		seg.sn = kcp1.snd_nxt
+		seg.xmit = 1    // mark as transmitted (so fastack can apply)
+		seg.acked = 0   // not acked
+		seg.fastack = 0 // reset
+		kcp1.snd_buf.Push(seg)
+		kcp1.snd_nxt++
+	}
+
+	// Now simulate ACKing segment 0 and 2 via parse_ack. This sets acked=1 on those.
+	kcp1.parse_ack(kcp1.snd_una)     // segment sn=0
+	kcp1.parse_ack(kcp1.snd_una + 2) // segment sn=2
+
+	// Call parse_fastack with sn covering all segments.
+	// Segments with acked=1 (sn 0 and 2) should NOT get fastack incremented.
+	kcp1.parse_fastack(kcp1.snd_una+4, currentMs())
+
+	// Enumerate snd_buf and verify fastack counters.
+	var fastackSum int
+	for seg := range kcp1.snd_buf.ForEach {
+		fastackSum += int(seg.fastack)
+		// All segments with acked=1 must have fastack==0.
+		if seg.acked == 1 && seg.fastack != 0 {
+			t.Errorf("segment sn=%d has acked=1 but fastack=%d (should be 0)", seg.sn, seg.fastack)
+		}
+		// Non-acked segments (except the one matching the trigger SN) may have fastack > 0.
+		if seg.acked == 0 && seg.sn != kcp1.snd_una+4 && seg.fastack == 0 {
+			t.Errorf("segment sn=%d has acked=0 but fastack=0 (should be > 0)", seg.sn)
+		}
+	}
+
+	// We expect fastack on segments 1 and 3 (acked segments 0 and 2 skipped).
+	if fastackSum != 2 {
+		t.Errorf("total fastack sum = %d, expected 2 (segments 1 and 3)", fastackSum)
+	}
+}

@@ -478,17 +478,21 @@ func (s *Session) recvLoop() {
 			}
 
 			// push data to the corresponding stream
+			var streamToWake *stream
 			s.streamLock.Lock()
 			if stream, ok := s.streams[sid]; ok {
 				stream.pushBytes(pNewbuf)
 				// deduct tokens from the bucket
 				atomic.AddInt32(&s.bucket, -int32(written))
-				stream.wakeupReader()
+				streamToWake = stream
 			} else {
 				// data directed to a missing/closed stream, recycle the buffer immediately.
 				defaultAllocator.Put(pNewbuf)
 			}
 			s.streamLock.Unlock()
+			if streamToWake != nil {
+				streamToWake.wakeupReader()
+			}
 
 		case cmdUPD: // a window update signal (v2 only)
 			if s.config.Version != 2 {

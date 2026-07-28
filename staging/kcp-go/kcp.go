@@ -510,6 +510,9 @@ func (kcp *KCP) parse_fastack(sn, ts uint32) int {
 	}
 
 	for seg := range kcp.snd_buf.ForEach {
+		if seg.acked == 1 {
+			continue
+		}
 		if _itimediff(sn, seg.sn) < 0 {
 			break
 		} else if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {

@@ -565,3 +565,120 @@ func TestThroughputV1V2Comparison(t *testing.T) {
 		})
 	}
 }
+
+// TestMultiStreamConcurrentDataDelivery verifies that when recvLoop pushes
+// data to multiple streams concurrently, readers on all streams wake up
+// correctly without data loss or deadlock. This exercises the fix that
+// moves wakeupReader() outside streamLock to reduce lock hold time.
+func TestMultiStreamConcurrentDataDelivery(t *testing.T) {
+	const numStreams = 16
+	const dataPerStream = 1024 * 1024 // 1 MB each
+
+	c1, c2, err := getTCPConnectionPairForTest(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+
+	config := DefaultConfig()
+	config.Version = 2
+	config.MaxReceiveBuffer = numStreams * dataPerStream
+
+	s, err := Server(c2, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	c, err := Client(c1, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Accept streams on the server side.
+	var serverStreams []*Stream
+	var acceptMu sync.Mutex
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for i := 0; i < numStreams; i++ {
+			ss, err := s.AcceptStream()
+			if err != nil {
+				return
+			}
+			acceptMu.Lock()
+			serverStreams = append(serverStreams, ss)
+			acceptMu.Unlock()
+		}
+	}()
+
+	// Open streams on the client side.
+	var clientStreams []*Stream
+	for i := 0; i < numStreams; i++ {
+		cs, err := c.OpenStream()
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		clientStreams = append(clientStreams, cs)
+	}
+	<-acceptDone
+
+	// All streams write data concurrently (client side).
+	var wg sync.WaitGroup
+	wg.Add(numStreams)
+	for i := 0; i < numStreams; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			payload := make([]byte, 64*1024)
+			written := 0
+			for written < dataPerStream {
+				toWrite := len(payload)
+				if written+toWrite > dataPerStream {
+					toWrite = dataPerStream - written
+				}
+				n, err := clientStreams[idx].Write(payload[:toWrite])
+				if err != nil {
+					t.Errorf("write stream %d: %v", idx, err)
+					return
+				}
+				written += n
+			}
+		}(i)
+	}
+
+	// All streams read data concurrently (server side).
+	wg.Add(numStreams)
+	for i := 0; i < numStreams; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			buf := make([]byte, 64*1024)
+			received := 0
+			for received < dataPerStream {
+				n, err := serverStreams[idx].Read(buf)
+				if n > 0 {
+					received += n
+				}
+				if err != nil {
+					if err != io.EOF {
+						t.Errorf("read stream %d: %v", idx, err)
+					}
+					return
+				}
+			}
+			if received != dataPerStream {
+				t.Errorf("stream %d: received %d bytes, expected %d", idx, received, dataPerStream)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Cleanup
+	for _, cs := range clientStreams {
+		cs.Close()
+	}
+	for _, ss := range serverStreams {
+		ss.Close()
+	}
+}
