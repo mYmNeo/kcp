@@ -1,0 +1,16 @@
+services:
+  server:
+    container_name: server
+    build:
+      context: ..
+      dockerfile: container_test/Dockerfile
+    command: ["-mode", "server", "-addr", ":9999"]
+
+  client:
+    container_name: client
+    build:
+      context: ..
+      dockerfile: container_test/Dockerfile
+    command: ["-mode", "client", "-addr", "server:9999"]
+    depends_on:
+      - server

@@ -145,7 +145,6 @@ func (seg *segment) encode(ptr []byte) []byte {
 	binary.LittleEndian.PutUint32(ptr[12:], seg.sn)
 	binary.LittleEndian.PutUint32(ptr[16:], seg.una)
 	binary.LittleEndian.PutUint32(ptr[20:], uint32(len(seg.data)))
-	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
 	return ptr[IKCP_OVERHEAD:]
 }
 
@@ -277,6 +276,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.rcv_queue = NewRingBuffer[segment](IKCP_WND_RCV * 2)
 	kcp.snd_queue = NewRingBuffer[segment](IKCP_WND_SND * 2)
 	kcp.rcv_buf = newSegmentHeap()
+	kcp.acklist = make([]ackItem, 0, kcp.mtu/IKCP_OVERHEAD)
 	return kcp
 }
 
@@ -358,16 +358,15 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	// move available data from rcv_buf -> rcv_queue
+	// peek at the root (minimum sn) first to avoid unnecessary
+	// Pop+Push when the segment isn't ready yet
 	for kcp.rcv_buf.Len() > 0 {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
+		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
 			break
 		}
+		seg := heap.Pop(kcp.rcv_buf).(segment)
+		kcp.rcv_queue.Push(seg)
+		kcp.rcv_nxt++
 	}
 
 	// fast recover
@@ -567,18 +566,16 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 	} else {
 		repeat = true
 	}
-
 	// move available data from rcv_buf -> rcv_queue
+	// peek at the root (minimum sn) first to avoid unnecessary
+	// Pop+Push when the segment isn't ready yet
 	for kcp.rcv_buf.Len() > 0 {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
+		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
 			break
 		}
+		seg := heap.Pop(kcp.rcv_buf).(segment)
+		kcp.rcv_queue.Push(seg)
+		kcp.rcv_nxt++
 	}
 
 	return repeat
@@ -757,6 +754,7 @@ func (kcp *KCP) wnd_unused() uint16 {
 //
 // Returns the suggested interval (ms) until the next flush call.
 func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
+	var outSegs uint64
 	var seg segment
 	seg.conv = kcp.conv
 	seg.cmd = IKCP_CMD_ACK
@@ -785,6 +783,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 	defer func() {
 		flushBuffer()
+		atomic.AddUint64(&DefaultSnmp.OutSegs, outSegs)
 		atomic.StoreUint64(&DefaultSnmp.RingBufferSndQueue, uint64(kcp.snd_queue.Len()))
 		atomic.StoreUint64(&DefaultSnmp.RingBufferRcvQueue, uint64(kcp.rcv_queue.Len()))
 		atomic.StoreUint64(&DefaultSnmp.RingBufferSndBuffer, uint64(kcp.snd_buf.Len()))
@@ -793,11 +792,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	// --- Phase 1: Flush pending ACKs ---
 	if flushType == IKCP_FLUSH_ACKONLY || flushType == IKCP_FLUSH_FULL {
 		for i, ack := range kcp.acklist {
-			makeSpace(IKCP_OVERHEAD)
 			// filter jitters caused by bufferbloat
 			if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
+				makeSpace(IKCP_OVERHEAD)
 				seg.sn, seg.ts = ack.sn, ack.ts
 				ptr = seg.encode(ptr)
+				outSegs++
 				kcp.debugLog(IKCP_LOG_OUT_ACK, "conv", seg.conv, "sn", seg.sn, "una", seg.una, "ts", seg.ts)
 			}
 		}
@@ -833,6 +833,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		seg.cmd = IKCP_CMD_WASK
 		makeSpace(IKCP_OVERHEAD)
 		ptr = seg.encode(ptr)
+		outSegs++
 		kcp.debugLog(IKCP_LOG_OUT_WASK, "conv", seg.conv, "wnd", seg.wnd, "ts", seg.ts)
 	}
 
@@ -841,6 +842,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		seg.cmd = IKCP_CMD_WINS
 		makeSpace(IKCP_OVERHEAD)
 		ptr = seg.encode(ptr)
+		outSegs++
 		kcp.debugLog(IKCP_LOG_OUT_WINS, "conv", seg.conv, "wnd", seg.wnd, "ts", seg.ts)
 	}
 
@@ -925,7 +927,6 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 			}
 
 			if needsend {
-				current = currentMs()
 				segment.xmit++
 				segment.ts = current
 				segment.wnd = seg.wnd
@@ -934,6 +935,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				need := IKCP_OVERHEAD + len(segment.data)
 				makeSpace(need)
 				ptr = segment.encode(ptr)
+				outSegs++
 				copy(ptr, segment.data)
 				ptr = ptr[len(segment.data):]
 
