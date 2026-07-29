@@ -682,3 +682,29 @@ func TestMultiStreamConcurrentDataDelivery(t *testing.T) {
 		ss.Close()
 	}
 }
+
+// BenchmarkShaperHeapPushPop measures the cost of pushing and popping
+// writeRequests through the shaperHeap. This happens on every frame write —
+// the any-boxing elimination should show 0 allocs/op after optimization.
+func BenchmarkShaperHeapPushPop(b *testing.B) {
+	h := &shaperHeap{}
+	reqs := make([]writeRequest, 256)
+	for i := range reqs {
+		reqs[i] = writeRequest{
+			class:  CLSDATA,
+			frame:  Frame{ver: 1, cmd: cmdPSH, sid: uint32(i), data: make([]byte, 1024)},
+			seq:    uint32(i),
+			result: make(chan writeResult, 1),
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, r := range reqs {
+			h.push(r)
+		}
+		for range reqs {
+			h.pop()
+		}
+	}
+}

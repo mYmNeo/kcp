@@ -23,7 +23,6 @@
 package kcp
 
 import (
-	"container/heap"
 	"io"
 	"log/slog"
 	"sync"
@@ -174,7 +173,7 @@ func TestSegmentHeap(t *testing.T) {
 	}
 
 	for _, seg := range segments {
-		heap.Push(h, seg)
+		h.push(seg)
 		t.Logf("pushed segment with seq %d", seg.sn)
 	}
 
@@ -183,7 +182,7 @@ func TestSegmentHeap(t *testing.T) {
 	}
 
 	for i := range segments {
-		seg := heap.Pop(h).(segment)
+		seg, _ := h.pop()
 		if seg.sn != segments[i].sn {
 			t.Errorf("expected seq %d, got %d", segments[i].sn, seg.sn)
 		}

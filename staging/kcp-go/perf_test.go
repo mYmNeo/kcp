@@ -293,3 +293,25 @@ func TestParseFastackSkipAcked(t *testing.T) {
 		t.Errorf("total fastack sum = %d, expected 2 (segments 1 and 3)", fastackSum)
 	}
 }
+
+// BenchmarkSegmentHeapPushPop measures the cost of pushing and popping
+// segments through the rcv_buf heap. This happens on every received data
+// packet — the any-boxing elimination should show 0 allocs/op after optimization.
+func BenchmarkSegmentHeapPushPop(b *testing.B) {
+	h := newSegmentHeap()
+	segs := make([]segment, 256)
+	for i := range segs {
+		segs[i].sn = uint32(i)
+		segs[i].data = []byte("test data payload for benchmark")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for _, s := range segs {
+			h.push(s)
+		}
+		for range segs {
+			h.pop()
+		}
+	}
+}

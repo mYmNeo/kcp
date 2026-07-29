@@ -63,3 +63,13 @@ func (bp *bufferPool) Put(buf []byte) error {
 	bp.xmitBuf.Put(buf[:cap(buf)]) // reset slice length to full capacity
 	return nil
 }
+
+// bufPairPool reduces allocation of [][]byte wrapper slices used in
+// ipv4.Message.Buffers during TX batching. Each entry is a *[1][]byte
+// (8-byte pointer) that fits inline in any — no boxing allocation.
+var bufPairPool = sync.Pool{
+	New: func() any {
+		var a [1][]byte
+		return &a
+	},
+}

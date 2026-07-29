@@ -23,7 +23,6 @@
 package smux
 
 import (
-	"container/heap"
 	"container/list"
 	"sync"
 	"sync/atomic"
@@ -52,15 +51,60 @@ func (h shaperHeap) Less(i, j int) bool {
 }
 
 func (h shaperHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *shaperHeap) Push(x any)   { *h = append(*h, x.(writeRequest)) }
 
-func (h *shaperHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	old[n-1] = writeRequest{} // avoid memory leak
-	*h = old[0 : n-1]
-	return x
+// push adds req to the heap and restores heap order via sift-up.
+func (h *shaperHeap) push(req writeRequest) {
+	*h = append(*h, req)
+	h.up(len(*h) - 1)
+}
+
+// pop removes and returns the minimum element.
+// Returns (writeRequest{}, false) if the heap is empty.
+func (h *shaperHeap) pop() (writeRequest, bool) {
+	if len(*h) == 0 {
+		return writeRequest{}, false
+	}
+	n := len(*h)
+	(*h)[0], (*h)[n-1] = (*h)[n-1], (*h)[0]
+	x := (*h)[n-1]
+	(*h)[n-1] = writeRequest{} // avoid memory leak
+	*h = (*h)[:n-1]
+	if n > 1 {
+		h.down(0)
+	}
+	return x, true
+}
+
+// up performs sift-up (bubble-up) on the heap at index j.
+func (h *shaperHeap) up(j int) {
+	for {
+		parent := (j - 1) / 2
+		if parent == j || !h.Less(j, parent) {
+			break
+		}
+		h.Swap(j, parent)
+		j = parent
+	}
+}
+
+// down performs sift-down (heapify-down) on the heap at index i.
+func (h *shaperHeap) down(i int) {
+	n := len(*h)
+	for {
+		left := 2*i + 1
+		if left >= n {
+			break
+		}
+		smallest := left
+		if right := left + 1; right < n && h.Less(right, left) {
+			smallest = right
+		}
+		if !h.Less(smallest, i) {
+			break
+		}
+		h.Swap(i, smallest)
+		i = smallest
+	}
 }
 
 // shaperQueue manages multiple streams of writeRequests using a round-robin scheduling algorithm.
@@ -107,7 +151,7 @@ func (sq *shaperQueue) Push(req writeRequest) {
 
 	// push the request into the corresponding stream heap.
 	h := sq.streams[sid]
-	heap.Push(h, req)
+	h.push(req)
 	atomic.AddInt64(&sq.count, 1)
 }
 
@@ -132,7 +176,7 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 
 		if h.Len() > 0 {
 			// pop the top request from the heap
-			req := heap.Pop(h).(writeRequest)
+			req, _ := h.pop()
 			atomic.AddInt64(&sq.count, -1)
 
 			// update next pointer for round-robin

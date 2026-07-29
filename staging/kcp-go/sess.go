@@ -680,6 +680,7 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 // Pipeline: KCP output -> chPostProcessing -> [FEC] -> [Encrypt] -> TxQueue -> Network
 func (s *UDPSession) postProcess() {
 	txqueue := make([]ipv4.Message, 0, devBacklog)
+	bufPairs := make([]*[1][]byte, 0, devBacklog)
 	chDie := s.die
 
 	ctx := context.Background()
@@ -744,7 +745,10 @@ func (s *UDPSession) postProcess() {
 			msg.Addr = s.remote
 
 			// original copy, move buf to txqueue directly
-			msg.Buffers = [][]byte{buf}
+			pair := bufPairPool.Get().(*[1][]byte)
+			pair[0] = buf
+			msg.Buffers = pair[:]
+			bufPairs = append(bufPairs, pair)
 			bytesToSend += len(buf)
 			txqueue = append(txqueue, msg)
 
@@ -752,7 +756,10 @@ func (s *UDPSession) postProcess() {
 			for i := 0; i < s.dup; i++ {
 				bts := defaultBufferPool.Get()[:len(buf)]
 				copy(bts, buf)
-				msg.Buffers = [][]byte{bts}
+				pair := bufPairPool.Get().(*[1][]byte)
+				pair[0] = bts
+				msg.Buffers = pair[:]
+				bufPairs = append(bufPairs, pair)
 				bytesToSend += len(bts)
 				txqueue = append(txqueue, msg)
 			}
@@ -761,7 +768,10 @@ func (s *UDPSession) postProcess() {
 			for k := range ecc {
 				bts := defaultBufferPool.Get()[:len(ecc[k])]
 				copy(bts, ecc[k])
-				msg.Buffers = [][]byte{bts}
+				pair := bufPairPool.Get().(*[1][]byte)
+				pair[0] = bts
+				msg.Buffers = pair[:]
+				bufPairs = append(bufPairs, pair)
 				bytesToSend += len(bts)
 				txqueue = append(txqueue, msg)
 			}
@@ -778,9 +788,13 @@ func (s *UDPSession) postProcess() {
 				// recycle
 				for k := range txqueue {
 					defaultBufferPool.Put(txqueue[k].Buffers[0])
+					txqueue[k].Buffers[0] = nil
 					txqueue[k].Buffers = nil
+					bufPairs[k][0] = nil
+					bufPairPool.Put(bufPairs[k])
 				}
 				txqueue = txqueue[:0]
+				bufPairs = bufPairs[:0]
 				bytesToSend = 0
 			}
 

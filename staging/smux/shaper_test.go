@@ -23,7 +23,6 @@
 package smux
 
 import (
-	"container/heap"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -39,14 +38,14 @@ func TestShaper(t *testing.T) {
 	w5 := writeRequest{seq: 5}
 
 	var reqs shaperHeap
-	heap.Push(&reqs, w5)
-	heap.Push(&reqs, w4)
-	heap.Push(&reqs, w3)
-	heap.Push(&reqs, w2)
-	heap.Push(&reqs, w1)
+	reqs.push(w5)
+	reqs.push(w4)
+	reqs.push(w3)
+	reqs.push(w2)
+	reqs.push(w1)
 
-	for len(reqs) > 0 {
-		w := heap.Pop(&reqs).(writeRequest)
+	for reqs.Len() > 0 {
+		w, _ := reqs.pop()
 		t.Log("sid:", w.frame.sid, "seq:", w.seq)
 	}
 }
@@ -61,16 +60,16 @@ func TestShaper2(t *testing.T) {
 	w7 := writeRequest{class: CLSCTRL, seq: 7, frame: Frame{sid: 11}} // ctrl 2
 
 	var reqs shaperHeap
-	heap.Push(&reqs, w6)
-	heap.Push(&reqs, w5)
-	heap.Push(&reqs, w4)
-	heap.Push(&reqs, w3)
-	heap.Push(&reqs, w2)
-	heap.Push(&reqs, w1)
-	heap.Push(&reqs, w7)
+	reqs.push(w6)
+	reqs.push(w5)
+	reqs.push(w4)
+	reqs.push(w3)
+	reqs.push(w2)
+	reqs.push(w1)
+	reqs.push(w7)
 
-	for len(reqs) > 0 {
-		w := heap.Pop(&reqs).(writeRequest)
+	for reqs.Len() > 0 {
+		w, _ := reqs.pop()
 		t.Log("sid:", w.frame.sid, "seq:", w.seq)
 	}
 }
@@ -403,7 +402,6 @@ func TestShaperQueue_MultiStreamRemoval(t *testing.T) {
 func TestShaperHeap_MemoryLeak(t *testing.T) {
 	// Verify the fix for memory leak in Pop
 	h := &shaperHeap{}
-	heap.Init(h)
 
 	// Push a request with a large payload (simulated by checking the struct field)
 	// We can't easily check memory usage of the specific array slot in Go without unsafe or reflection tricks,
@@ -412,13 +410,13 @@ func TestShaperHeap_MemoryLeak(t *testing.T) {
 	// However, we can check if the code runs without panic.
 
 	req := writeRequest{frame: Frame{sid: 1, data: make([]byte, 100)}}
-	heap.Push(h, req)
+	h.push(req)
 
 	if h.Len() != 1 {
 		t.Fatal("Heap len should be 1")
 	}
 
-	popped := heap.Pop(h).(writeRequest)
+	popped, _ := h.pop()
 	if popped.frame.sid != 1 {
 		t.Fatal("Incorrect popped item")
 	}
@@ -434,8 +432,8 @@ func TestShaperIsEmpty(t *testing.T) {
 		t.Fatal("ShaperQueue should be empty")
 	}
 	sq.Push(writeRequest{
-frame: newFrame(1, cmdPSH, 1),
-})
+		frame: newFrame(1, cmdPSH, 1),
+	})
 	if sq.IsEmpty() {
 		t.Fatal("ShaperQueue should not be empty")
 	}

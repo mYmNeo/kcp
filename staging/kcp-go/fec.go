@@ -40,7 +40,6 @@
 package kcp
 
 import (
-	"container/heap"
 	"encoding/binary"
 	"sync/atomic"
 	"time"
@@ -72,11 +71,9 @@ type shardHeap struct {
 }
 
 func newShardHeap() *shardHeap {
-	h := &shardHeap{
+	return &shardHeap{
 		marks: make(map[uint32]struct{}),
 	}
-	heap.Init(h)
-	return h
 }
 
 func (h *shardHeap) Len() int { return len(h.elements) }
@@ -86,18 +83,27 @@ func (h *shardHeap) Less(i, j int) bool {
 }
 
 func (h *shardHeap) Swap(i, j int) { h.elements[i], h.elements[j] = h.elements[j], h.elements[i] }
-func (h *shardHeap) Push(x any) {
-	h.elements = append(h.elements, x.(fecPacket))
-	h.marks[x.(fecPacket).seqid()] = struct{}{}
+
+// push appends a FEC packet to the heap. No sift is needed because the heap
+// is always fully drained before reuse (it is used as a set/stack, not a
+// priority queue).
+func (h *shardHeap) push(pkt fecPacket) {
+	h.elements = append(h.elements, pkt)
+	h.marks[pkt.seqid()] = struct{}{}
 }
 
-func (h *shardHeap) Pop() any {
+// pop removes and returns the last FEC packet from the heap (stack-like
+// behavior). Returns (nil, false) if the heap is empty.
+func (h *shardHeap) pop() (fecPacket, bool) {
 	n := len(h.elements)
+	if n == 0 {
+		return nil, false
+	}
 	x := h.elements[n-1]
 	h.elements[n-1] = nil // clear to avoid memory leak
 	h.elements = h.elements[:n-1]
 	delete(h.marks, x.seqid())
-	return x
+	return x, true
 }
 
 func (h *shardHeap) Has(sn uint32) bool {
@@ -210,7 +216,7 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 				dec.decodeCache = make([][]byte, dec.shardSize)
 				dec.flagCache = make([]bool, dec.shardSize)
 				dec.paws = 0xffffffff / uint32(dec.shardSize) * uint32(dec.shardSize)
-				//log.Println("autotune to :", dec.dataShards, dec.parityShards)
+				// log.Println("autotune to :", dec.dataShards, dec.parityShards)
 			}
 			// reset shouldTune flag regardless of whether parameters changed
 			// to avoid permanent blocking when detected parameters match current ones
@@ -241,7 +247,7 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 	// push the packet into the shard heap
 	pkt := fecPacket(defaultBufferPool.Get()[:len(in)])
 	copy(pkt, in)
-	shard.Push(pkt)
+	shard.push(pkt)
 
 	// try to recover data if we have enough shards
 	if shard.Len() >= dec.dataShards {
@@ -258,7 +264,7 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 		// pop all shards from the heap and fill into the decode cache
 		var pkts []fecPacket
 		for shard.Len() > 0 {
-			pkt := shard.Pop().(fecPacket)
+			pkt, _ := shard.pop()
 			pkts = append(pkts, pkt)
 			seqid := pkt.seqid()
 			shards[seqid%uint32(dec.shardSize)] = pkt.data()
@@ -338,7 +344,7 @@ func (dec *fecDecoder) discardShards() {
 	for shardId, shard := range dec.shardSet {
 		// discard shards that are too old
 		if _itimediff(dec.newestShardId*uint32(dec.shardSize), shardId*uint32(dec.shardSize)) > maxShardSets*int32(dec.shardSize) {
-			//println("flushing shard", shardId, "minShardId", dec.minShardId, _itimediff(dec.minShardId, shardId))
+			// println("flushing shard", shardId, "minShardId", dec.minShardId, _itimediff(dec.minShardId, shardId))
 			for _, pkt := range shard.elements {
 				defaultBufferPool.Put(pkt)
 			}

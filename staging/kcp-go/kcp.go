@@ -23,7 +23,6 @@
 package kcp
 
 import (
-	"container/heap"
 	"encoding/binary"
 	"sync/atomic"
 	"time"
@@ -155,11 +154,9 @@ type segmentHeap struct {
 }
 
 func newSegmentHeap() *segmentHeap {
-	h := &segmentHeap{
+	return &segmentHeap{
 		marks: make(map[uint32]struct{}),
 	}
-	heap.Init(h)
-	return h
 }
 
 func (h *segmentHeap) Len() int { return len(h.segments) }
@@ -169,18 +166,62 @@ func (h *segmentHeap) Less(i, j int) bool {
 }
 
 func (h *segmentHeap) Swap(i, j int) { h.segments[i], h.segments[j] = h.segments[j], h.segments[i] }
-func (h *segmentHeap) Push(x any) {
-	h.segments = append(h.segments, x.(segment))
-	h.marks[x.(segment).sn] = struct{}{}
+
+// push inserts a segment into the heap and maintains the heap invariant.
+func (h *segmentHeap) push(seg segment) {
+	h.segments = append(h.segments, seg)
+	h.marks[seg.sn] = struct{}{}
+	h.up(len(h.segments) - 1)
 }
 
-func (h *segmentHeap) Pop() any {
+// pop removes and returns the smallest segment from the heap.
+// Returns (segment{}, false) if the heap is empty.
+func (h *segmentHeap) pop() (segment, bool) {
 	n := len(h.segments)
-	x := h.segments[n-1]
+	if n == 0 {
+		return segment{}, false
+	}
+	x := h.segments[0]
+	h.Swap(0, n-1)
 	h.segments[n-1] = segment{} // clear reference to avoid memory leak
-	h.segments = h.segments[0 : n-1]
+	h.segments = h.segments[:n-1]
+	if n > 1 {
+		h.down(0)
+	}
 	delete(h.marks, x.sn)
-	return x
+	return x, true
+}
+
+// up sifts the element at index j up to restore the heap invariant.
+func (h *segmentHeap) up(j int) {
+	for {
+		i := (j - 1) / 2 // parent
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+// down sifts the element at index i down to restore the heap invariant.
+func (h *segmentHeap) down(i int) {
+	n := len(h.segments)
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 { // overflow
+			break
+		}
+		j := j1 // left child
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2 // right child
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
 }
 
 func (h *segmentHeap) Has(sn uint32) bool {
@@ -364,7 +405,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
 			break
 		}
-		seg := heap.Pop(kcp.rcv_buf).(segment)
+		seg, _ := kcp.rcv_buf.pop()
 		kcp.rcv_queue.Push(seg)
 		kcp.rcv_nxt++
 	}
@@ -565,7 +606,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		newseg.data = dataCopy
 
 		// insert the new segment into rcv_buf
-		heap.Push(kcp.rcv_buf, newseg)
+		kcp.rcv_buf.push(newseg)
 	} else {
 		repeat = true
 	}
@@ -576,7 +617,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
 			break
 		}
-		seg := heap.Pop(kcp.rcv_buf).(segment)
+		seg, _ := kcp.rcv_buf.pop()
 		kcp.rcv_queue.Push(seg)
 		kcp.rcv_nxt++
 	}
