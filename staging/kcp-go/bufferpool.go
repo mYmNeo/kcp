@@ -32,26 +32,30 @@ var errBufferSizeMismatch = errors.New("buffer size mismatch")
 
 // A system-wide packet buffer shared among sending, receiving and FEC
 // to mitigate high-frequency memory allocation of packets.
-var defaultBufferPool = newBufferPool(mtuLimit)
+var defaultBufferPool = newBufferPool()
 
 type bufferPool struct {
 	xmitBuf sync.Pool
 }
 
-// newBufferPool creates a new buffer pool with buffers of the given size.
-func newBufferPool(size int) *bufferPool {
+// newBufferPool creates a system-wide packet buffer pool.
+// Buffers are stored as *[mtuLimit]byte array pointers (8 bytes) so that
+// Put/Get into sync.Pool avoids interface-boxing allocations — the same
+// technique used by bufPairPool below.
+func newBufferPool() *bufferPool {
 	return &bufferPool{
 		xmitBuf: sync.Pool{
 			New: func() any {
-				return make([]byte, size)
+				return new([mtuLimit]byte)
 			},
 		},
 	}
 }
 
-// Get retrieves a buffer from the pool.
+// Get retrieves a buffer from the pool as a []byte slice.
 func (bp *bufferPool) Get() []byte {
-	return bp.xmitBuf.Get().([]byte)
+	arr := bp.xmitBuf.Get().(*[mtuLimit]byte)
+	return arr[:]
 }
 
 // Put returns a buffer to the pool.
@@ -60,7 +64,8 @@ func (bp *bufferPool) Put(buf []byte) error {
 	if cap(buf) != mtuLimit {
 		return errBufferSizeMismatch
 	}
-	bp.xmitBuf.Put(buf[:cap(buf)]) // reset slice length to full capacity
+	// Convert slice back to array pointer — 8 bytes, no boxing allocation.
+	bp.xmitBuf.Put((*[mtuLimit]byte)(buf[:cap(buf)]))
 	return nil
 }
 

@@ -41,6 +41,7 @@ package kcp
 
 import (
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,6 +65,16 @@ func (bts fecPacket) seqid() uint32 { return binary.LittleEndian.Uint32(bts) }
 func (bts fecPacket) flag() uint16  { return binary.LittleEndian.Uint16(bts[4:]) }
 func (bts fecPacket) data() []byte  { return bts[6:] }
 
+// shardHeapPool recycles shardHeap allocations.
+// Each shardHeap lives for one shard set (~13 packets) then returns here.
+var shardHeapPool = sync.Pool{
+	New: func() any {
+		return &shardHeap{
+			marks: make(map[uint32]struct{}),
+		}
+	},
+}
+
 // shardHeap holds a corelated set of datashards from the peers
 type shardHeap struct {
 	elements []fecPacket
@@ -71,9 +82,20 @@ type shardHeap struct {
 }
 
 func newShardHeap() *shardHeap {
-	return &shardHeap{
-		marks: make(map[uint32]struct{}),
+	return shardHeapPool.Get().(*shardHeap)
+}
+
+// release resets the shardHeap and returns it to the pool.
+// Caller MUST have already recycled all elements' packet buffers.
+func (h *shardHeap) release() {
+	for k := range h.marks {
+		delete(h.marks, k)
 	}
+	for i := range h.elements {
+		h.elements[i] = nil
+	}
+	h.elements = h.elements[:0]
+	shardHeapPool.Put(h)
 }
 
 func (h *shardHeap) Len() int { return len(h.elements) }
@@ -348,6 +370,7 @@ func (dec *fecDecoder) discardShards() {
 			for _, pkt := range shard.elements {
 				defaultBufferPool.Put(pkt)
 			}
+			shard.release()
 			delete(dec.shardSet, shardId)
 		}
 	}

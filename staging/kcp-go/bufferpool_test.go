@@ -3,7 +3,7 @@ package kcp
 import "testing"
 
 func TestBufferPoolGetSize(t *testing.T) {
-	bp := newBufferPool(mtuLimit)
+	bp := newBufferPool()
 
 	buf := bp.Get()
 
@@ -21,7 +21,7 @@ func TestBufferPoolGetSize(t *testing.T) {
 }
 
 func TestBufferPoolPutAndReuse(t *testing.T) {
-	bp := newBufferPool(mtuLimit)
+	bp := newBufferPool()
 
 	buf := bp.Get()
 	// Modify buffer to track it
@@ -46,7 +46,7 @@ func TestBufferPoolPutAndReuse(t *testing.T) {
 }
 
 func TestBufferPoolPutWrongSizeIgnored(t *testing.T) {
-	bp := newBufferPool(mtuLimit)
+	bp := newBufferPool()
 
 	// Make a buffer with wrong capacity
 	wrongBuf := make([]byte, 100)
@@ -63,7 +63,7 @@ func TestBufferPoolPutWrongSizeIgnored(t *testing.T) {
 }
 
 func TestBufferPoolPutReturnsError(t *testing.T) {
-	bp := newBufferPool(mtuLimit)
+	bp := newBufferPool()
 
 	// 1. Correct size
 	buf := make([]byte, mtuLimit)
