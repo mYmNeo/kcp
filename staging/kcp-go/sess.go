@@ -367,22 +367,6 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 	var timeout *time.Timer
 	var c <-chan time.Time
 
-RESET_TIMER:
-	if twd, ok := s.wd.Load().(time.Time); ok && !twd.IsZero() {
-		if timeout == nil {
-			timeout = time.NewTimer(time.Until(twd))
-			c = timeout.C
-			defer timeout.Stop()
-		} else {
-			// Pre-Go 1.23: Reset does not drain the channel;
-			// callers must drain at the goto-site before arriving here.
-			timeout.Reset(time.Until(twd))
-		}
-	} else if timeout != nil {
-		timeout.Stop()
-		c = nil // disable timeout select case
-	}
-
 	for {
 		// check for connection close and socket error
 		select {
@@ -415,36 +399,60 @@ RESET_TIMER:
 
 			waitsnd = s.kcp.WaitSnd()
 			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
-				// put the packets on wire immediately if the inflight window is full
-				// or if we've specified write no delay(NO merging of outgoing bytes)
-				// we don't have to wait until the periodical update() procedure uncorks.
 				s.kcp.flush(IKCP_FLUSH_FULL)
 			}
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
+			if timeout != nil {
+				timeout.Stop()
+			}
 			return n, nil
 		}
 
 		s.mu.Unlock()
 
-		// if it runs here, that means we have to block the call, and wait until the
-		// transmit buffer to become available again.
-		select {
-		case <-s.chWriteEvent:
-			if timeout != nil {
+		// Lazy deadline setup: only allocate/arm the timer when we're about to
+		// block. The fast path above (window available) avoids this entirely.
+		if twd, ok := s.wd.Load().(time.Time); ok && !twd.IsZero() {
+			if timeout == nil {
+				timeout = time.NewTimer(time.Until(twd))
+				c = timeout.C
+			} else {
+				// drain the channel before Reset (required pre-Go 1.23)
 				if !timeout.Stop() {
 					select {
 					case <-timeout.C:
 					default:
 					}
 				}
-				goto RESET_TIMER
+				timeout.Reset(time.Until(twd))
 			}
+		} else {
+			if timeout != nil {
+				timeout.Stop()
+				timeout = nil
+			}
+			c = nil // no deadline active
+		}
+
+		// if it runs here, that means we have to block the call, and wait until the
+		// transmit buffer to become available again.
+		select {
+		case <-s.chWriteEvent:
 		case <-c:
+			if timeout != nil {
+				timeout.Stop()
+			}
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketWriteError:
+			if timeout != nil {
+				timeout.Stop()
+			}
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
+			if timeout != nil {
+				timeout.Stop()
+			}
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}

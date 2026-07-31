@@ -265,34 +265,26 @@ func (s *Store) Put(msg *dns.Msg) {
 	}
 
 	var minTTL uint32
+	hasIP := false
 	for i, rr := range msg.Answer {
+		if _, ok := rr.(*dns.A); ok {
+			hasIP = true
+		} else if _, ok := rr.(*dns.AAAA); ok {
+			hasIP = true
+		}
 		ttl := rr.Header().Ttl
 		if i == 0 || ttl < minTTL {
 			minTTL = ttl
 		}
 	}
-	if minTTL == 0 {
+	if !hasIP || minTTL == 0 {
 		return
 	}
-
 	domain := strings.ToLower(strings.TrimSuffix(q.Name, "."))
 	if len(domain) >= domainMax {
 		domain = domain[:domainMax-1]
 	}
 	expiresAt := uint64(time.Now().Unix()) + uint64(minTTL)
-
-	var ips []net.IP
-	for _, rr := range msg.Answer {
-		switch v := rr.(type) {
-		case *dns.A:
-			ips = append(ips, v.A)
-		case *dns.AAAA:
-			ips = append(ips, v.AAAA)
-		}
-	}
-	if len(ips) == 0 {
-		return
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -300,16 +292,25 @@ func (s *Store) Put(msg *dns.Msg) {
 		return
 	}
 	s.seqBeginWrite()
-	for _, ip := range ips {
-		sl := s.findSlot(ip, true)
-		if sl == nil {
-			continue
+	for _, rr := range msg.Answer {
+		switch v := rr.(type) {
+		case *dns.A:
+			if sl := s.findSlot(v.A, true); sl != nil {
+				sl.family = writeIP(&sl.ip, v.A)
+				sl.qtype = q.Qtype
+				sl.expiresAt = expiresAt
+				n := copy(sl.domain[:], domain)
+				sl.domain[n] = 0
+			}
+		case *dns.AAAA:
+			if sl := s.findSlot(v.AAAA, true); sl != nil {
+				sl.family = writeIP(&sl.ip, v.AAAA)
+				sl.qtype = q.Qtype
+				sl.expiresAt = expiresAt
+				n := copy(sl.domain[:], domain)
+				sl.domain[n] = 0
+			}
 		}
-		sl.family = writeIP(&sl.ip, ip)
-		sl.qtype = q.Qtype
-		sl.expiresAt = expiresAt
-		n := copy(sl.domain[:], domain)
-		sl.domain[n] = 0
 	}
 	s.seqEndWrite()
 }

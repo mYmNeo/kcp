@@ -457,7 +457,6 @@ func (s *stream) waitRead() error {
 	case <-s.die:
 		return io.ErrClosedPipe
 	}
-
 }
 
 // checkWriteClosed checks if the stream write side has been closed.
@@ -486,6 +485,27 @@ func (s *stream) Write(b []byte) (n int, err error) {
 	}
 }
 
+// writeTimerPool provides isolated *time.Timer instances for the write
+// deadline path. Each concurrent Write() call gets its own timer via Get,
+// uses it through the blocking select in writeFrameInternal, then returns
+// it via Put. This avoids both the per-call alloc of time.NewTimer and the
+// data-race hazard of sharing a single timer across goroutines.
+var writeTimerPool = sync.Pool{
+	New: func() any {
+		return time.NewTimer(time.Hour)
+	},
+}
+
+// stopTimerDrain stops t and drains its channel if needed, safe for all Go versions.
+func stopTimerDrain(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
 // writeV1 writes data to the stream for version 1 streams.
 func (s *stream) writeV1(b []byte) (n int, err error) {
 	// check empty input
@@ -497,14 +517,26 @@ func (s *stream) writeV1(b []byte) (n int, err error) {
 	if err := s.checkWriteClosed(); err != nil {
 		return 0, err
 	}
-
-	// create write deadline timer
+	// set up the write deadline timer from the pool. Each call gets
+	// its own isolated timer, so concurrent writes are safe.
 	var deadline <-chan time.Time
+	var writeTimer *time.Timer
 	if d, ok := s.writeDeadline.Load().(time.Time); ok && !d.IsZero() {
-		timer := time.NewTimer(time.Until(d))
-		defer timer.Stop()
-		deadline = timer.C
+		dur := time.Until(d)
+		if dur < 0 {
+			dur = 0
+		}
+		writeTimer = writeTimerPool.Get().(*time.Timer)
+		writeTimer.Reset(dur)
+		deadline = writeTimer.C
 	}
+
+	defer func() {
+		if writeTimer != nil {
+			stopTimerDrain(writeTimer)
+			writeTimerPool.Put(writeTimer)
+		}
+	}()
 
 	// frame split and transmit
 	sent := 0
@@ -545,9 +577,12 @@ func (s *stream) writeV2(b []byte) (n int, err error) {
 	sent := 0
 	frame := newFrame(byte(s.sess.config.Version), cmdPSH, s.id)
 
-	var deadlineTimer *time.Timer
+	var writeTimer *time.Timer
 	defer func() {
-		stopTimer(deadlineTimer)
+		if writeTimer != nil {
+			stopTimerDrain(writeTimer)
+			writeTimerPool.Put(writeTimer)
+		}
 	}()
 
 	for {
@@ -557,16 +592,17 @@ func (s *stream) writeV2(b []byte) (n int, err error) {
 			if dur < 0 {
 				dur = 0
 			}
-			if deadlineTimer == nil {
-				deadlineTimer = time.NewTimer(dur)
+			if writeTimer == nil {
+				writeTimer = writeTimerPool.Get().(*time.Timer)
+				writeTimer.Reset(dur)
 			} else {
-				stopTimer(deadlineTimer)
-				deadlineTimer.Reset(dur)
+				stopTimerDrain(writeTimer)
+				writeTimer.Reset(dur)
 			}
-			deadline = deadlineTimer.C
-		} else if deadlineTimer != nil {
-			stopTimer(deadlineTimer)
-			deadlineTimer = nil
+			deadline = writeTimer.C
+		} else if writeTimer != nil {
+			stopTimerDrain(writeTimer)
+			writeTimer = nil
 		}
 
 		// per stream sliding window control

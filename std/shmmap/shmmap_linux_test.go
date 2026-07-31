@@ -294,3 +294,22 @@ func BenchmarkLookup(b *testing.B) {
 		benchSink, _ = store.Lookup(net.IPv4(10, 0, 0, 1))
 	}
 }
+
+func BenchmarkPut(b *testing.B) {
+	name := "/doh-shm-bench-put"
+	size := uint(headerSize + slotSize*64)
+	store, err := Open(name, size)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	defer unixUnlink(name)
+
+	msg := newTestMsg("bench.example.com.", dns.TypeA, []string{"10.0.0.1"})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		store.Put(msg)
+	}
+}
