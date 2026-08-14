@@ -42,14 +42,20 @@ type snmpWriter struct {
 }
 
 // newSnmpWriter creates a snmpWriter bound to f.
+// If f already has content (reopen within the same rotation window), the
+// header is treated as already written so a second header is not appended.
 func newSnmpWriter(f *os.File) *snmpWriter {
 	cols := kcp.DefaultSnmp.Header()
 	rec := make([]string, 1+len(cols))
-	return &snmpWriter{
+	sw := &snmpWriter{
 		w:          csv.NewWriter(f),
 		record:     rec,
 		headerCols: cols,
 	}
+	if info, err := f.Stat(); err == nil && info.Size() > 0 {
+		sw.written = true
+	}
+	return sw
 }
 
 // writeTick writes one SNMP data row, preceded by the header row on first call.

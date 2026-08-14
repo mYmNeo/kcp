@@ -138,15 +138,15 @@ func TestSendWindowUpdateTimeout(t *testing.T) {
 	}
 }
 
-func TestStopTimer(t *testing.T) {
-	stopTimer(nil)
+func TestStopTimerDrain(t *testing.T) {
+	stopTimerDrain(nil)
 
 	timer := time.NewTimer(time.Nanosecond)
 	<-timer.C
-	stopTimer(timer)
+	stopTimerDrain(timer)
 
 	active := time.NewTimer(time.Second)
-	stopTimer(active)
+	stopTimerDrain(active)
 }
 
 func TestNewBufferRingMinCapacity(t *testing.T) {

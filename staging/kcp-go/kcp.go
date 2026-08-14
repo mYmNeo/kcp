@@ -399,16 +399,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	// move available data from rcv_buf -> rcv_queue
-	// peek at the root (minimum sn) first to avoid unnecessary
-	// Pop+Push when the segment isn't ready yet
-	for kcp.rcv_buf.Len() > 0 {
-		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
-			break
-		}
-		seg, _ := kcp.rcv_buf.pop()
-		kcp.rcv_queue.Push(seg)
-		kcp.rcv_nxt++
-	}
+	kcp.moveRcvBufToQueue()
 
 	// fast recover
 	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
@@ -417,6 +408,21 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		kcp.probe |= IKCP_ASK_TELL
 	}
 	return
+}
+
+
+// moveRcvBufToQueue moves contiguous in-order segments from rcv_buf into
+// rcv_queue. It peeks at the heap root (minimum sn) first to avoid an
+// unnecessary Pop+Push when the next expected segment is not ready yet.
+func (kcp *KCP) moveRcvBufToQueue() {
+	for kcp.rcv_buf.Len() > 0 {
+		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
+			break
+		}
+		seg, _ := kcp.rcv_buf.pop()
+		kcp.rcv_queue.Push(seg)
+		kcp.rcv_nxt++
+	}
 }
 
 // Send is user/upper level send, returns below zero for error
@@ -551,12 +557,13 @@ func (kcp *KCP) parse_fastack(sn, ts uint32) int {
 	}
 
 	for seg := range kcp.snd_buf.ForEach {
+		if _itimediff(sn, seg.sn) < 0 {
+			break
+		}
 		if seg.acked == 1 {
 			continue
 		}
-		if _itimediff(sn, seg.sn) < 0 {
-			break
-		} else if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {
+		if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {
 			if seg.fastack != 0xFFFFFFFF {
 				seg.fastack++
 				if seg.fastack >= uint32(kcp.fastresend) {
@@ -611,16 +618,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		repeat = true
 	}
 	// move available data from rcv_buf -> rcv_queue
-	// peek at the root (minimum sn) first to avoid unnecessary
-	// Pop+Push when the segment isn't ready yet
-	for kcp.rcv_buf.Len() > 0 {
-		if kcp.rcv_buf.segments[0].sn != kcp.rcv_nxt || kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
-			break
-		}
-		seg, _ := kcp.rcv_buf.pop()
-		kcp.rcv_queue.Push(seg)
-		kcp.rcv_nxt++
-	}
+	kcp.moveRcvBufToQueue()
 
 	return repeat
 }
@@ -930,6 +928,9 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	// - Fast retransmit (fastack >= fastresend threshold)
 	// - Early retransmit (fastack > 0, no new segments queued)
 	// - RTO-based retransmit (current >= resendts)
+	// Snapshot once for this flush. A long Phase 5 may therefore stamp
+	// retransmit timestamps slightly behind wall clock; that is intentional
+	// to avoid per-segment time.Now calls on the hot path.
 	current := currentMs()
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	nextUpdate = kcp.interval
@@ -1131,6 +1132,14 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	kcp.mtu = uint32(mtu)
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD
 	kcp.buffer = make([]byte, (mtu+IKCP_OVERHEAD)*3)
+	// Keep acklist capacity hint aligned with MTU so append growth does not
+	// silently degrade after a runtime MTU change.
+	want := int(kcp.mtu / IKCP_OVERHEAD)
+	if cap(kcp.acklist) < want {
+		grown := make([]ackItem, len(kcp.acklist), want)
+		copy(grown, kcp.acklist)
+		kcp.acklist = grown
+	}
 	return 0
 }
 

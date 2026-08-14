@@ -59,6 +59,9 @@ func (bp *bufferPool) Get() []byte {
 }
 
 // Put returns a buffer to the pool.
+// Invariant: buf must have cap == mtuLimit and be backed by a *[mtuLimit]byte
+// (as returned by Get). Wrong-sized slices are rejected; converting any other
+// backing array with that capacity would be unsafe.
 func (bp *bufferPool) Put(buf []byte) error {
 	// Only put back buffers of the correct size.
 	if cap(buf) != mtuLimit {
@@ -71,7 +74,8 @@ func (bp *bufferPool) Put(buf []byte) error {
 
 // bufPairPool reduces allocation of [][]byte wrapper slices used in
 // ipv4.Message.Buffers during TX batching. Each entry is a *[1][]byte
-// (8-byte pointer) that fits inline in any — no boxing allocation.
+// (8-byte pointer) that fits inline in any - no boxing allocation.
+// Retention justified by BenchmarkBufPairPool (Pooled vs AllocSlice/AllocArrayPtr).
 var bufPairPool = sync.Pool{
 	New: func() any {
 		var a [1][]byte

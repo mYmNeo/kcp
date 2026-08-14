@@ -31,12 +31,12 @@ Commands (`frame.go:31-39`): `cmdSYN=0` (open), `cmdFIN=1` (close/EOF), `cmdPSH=
 
 - **`recvLoop`** (`session.go:383-517`) — reads frames from `conn` under token-bucket control (`bucket int32`); dispatches by CMD: `SYN` → register stream, push to `chAccepts`; `PSH` → `stream.pushBytes` + wake reader; `FIN` → `stream.fin()`; `UPD` (v2) → `stream.update(consumed, window)` + wake writer; `NOP` → keepalive ack.
 - **`keepalive`** (`session.go:519-543`) — sends `NOP` on `KeepAliveInterval`; closes session on `KeepAliveTimeout`.
-- **`shaperLoop`** (`session.go:545-577`) — drains the `shaper` channel into a fair round-robin `shaperQueue`; control frames (`CLSCTRL`) are prioritized over data (`CLSDATA`).
+- **`shaperLoop`** (`session.go`) — drains `shaper`/`shaperCtrl` into a fair round-robin `shaperQueue`; CLSCTRL is preferred but both classes are admission-capped (`maxShaperSize` / `maxCtrlShaperSize`).
 - **`sendLoop`** (`session.go:595-662`) — pops from `shaperQueue` and writes to `conn`.
 
 ### Write path
 
-`Stream.Write` → `writeFrameInternal` (`session.go:673-711`) → `writeRequest{class, ...}` on `shaper` chan → `shaperLoop` → `shaperQueue` (round-robin across streams, min-heap by class then sequence, `shaper.go`) → `sendLoop` → `conn`. Control frames bypass the shaper via `writeControlFrame` (`session.go:664-671`).
+`Stream.Write` → `writeFrameInternal` → `writeRequest{class, ...}` on `shaper` (CLSDATA) or `shaperCtrl` (CLSCTRL) → `shaperLoop` → `shaperQueue` → `sendLoop` → `conn`. SYN/NOP/UPD use CLSCTRL; FIN uses CLSDATA.
 
 ### Flow control
 

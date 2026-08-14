@@ -371,8 +371,14 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 		// check for connection close and socket error
 		select {
 		case <-s.chSocketWriteError:
+			if timeout != nil {
+				timeout.Stop()
+			}
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
+			if timeout != nil {
+				timeout.Stop()
+			}
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		default:
 		}
@@ -814,6 +820,16 @@ func (s *UDPSession) postProcess() {
 			if len(s.chPostProcessing) > 0 {
 				chDie = nil // block chDie temporarily
 				continue
+			}
+			if len(txqueue) > 0 {
+				s.tx(txqueue)
+				for k := range txqueue {
+					defaultBufferPool.Put(txqueue[k].Buffers[0])
+					txqueue[k].Buffers[0] = nil
+					txqueue[k].Buffers = nil
+					bufPairs[k][0] = nil
+					bufPairPool.Put(bufPairs[k])
+				}
 			}
 			return
 		}

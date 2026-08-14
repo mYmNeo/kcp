@@ -13,9 +13,6 @@ import (
 // It feeds segments with non-sequential sequence numbers and confirms
 // that Recv delivers them in order.
 func TestRecvBufPeekOptimization(t *testing.T) {
-	// Save and restore SNMP state.
-	prev := DefaultSnmp.Copy()
-
 	kcp1 := NewKCP(0x11223344, func(buf []byte, size int) {})
 	kcp1.NoDelay(1, 10, 2, 1)
 	kcp1.WndSize(128, 128)
@@ -73,17 +70,11 @@ func TestRecvBufPeekOptimization(t *testing.T) {
 	if kcp2.rcv_buf.Len() != 0 {
 		t.Errorf("rcv_buf not empty after Recv: %d segments remain", kcp2.rcv_buf.Len())
 	}
-
-	// Restore SNMP.
-	DefaultSnmp.Reset()
-	*DefaultSnmp = *prev
 }
 
 // TestRecvBufPeek_GapInMiddle tests that the peek optimization handles
 // a gap in the middle of the receive window correctly.
 func TestRecvBufPeek_GapInMiddle(t *testing.T) {
-	prev := DefaultSnmp.Copy()
-
 	kcp1 := NewKCP(0x55667788, func(buf []byte, size int) {})
 	kcp1.NoDelay(1, 10, 2, 1)
 	kcp1.WndSize(128, 128)
@@ -133,9 +124,6 @@ func TestRecvBufPeek_GapInMiddle(t *testing.T) {
 	if kcp2.rcv_buf.Len() != 0 {
 		t.Errorf("rcv_buf not empty: %d segments remain", kcp2.rcv_buf.Len())
 	}
-
-	DefaultSnmp.Reset()
-	*DefaultSnmp = *prev
 }
 
 // --- OutSegs batching tests ---
@@ -234,13 +222,6 @@ func TestAcklistPreAllocated(t *testing.T) {
 // incremented. Tested segments should only accumulate fastack when they
 // are unacknowledged.
 func TestParseFastackSkipAcked(t *testing.T) {
-	// Save and restore SNMP state.
-	prev := DefaultSnmp.Copy()
-	defer func() {
-		DefaultSnmp.Reset()
-		*DefaultSnmp = *prev
-	}()
-
 	kcp1 := NewKCP(0xAABBCCDD, func(buf []byte, size int) {})
 	kcp1.NoDelay(1, 10, 2, 1)
 	kcp1.WndSize(128, 128)

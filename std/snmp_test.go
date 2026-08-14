@@ -197,6 +197,48 @@ func TestSnmpWriter_Rotation_NewHeader(t *testing.T) {
 	}
 }
 
+func TestSnmpWriter_ReopenNonEmpty_NoDuplicateHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/snmp.csv"
+
+	f1, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sw1 := newSnmpWriter(f1)
+	if err := sw1.writeTick(); err != nil {
+		t.Fatalf("writeTick 1: %v", err)
+	}
+	f1.Sync()
+	f1.Close()
+
+	// Reopen the same non-empty file (same rotation window / process restart).
+	f2, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	sw2 := newSnmpWriter(f2)
+	if err := sw2.writeTick(); err != nil {
+		t.Fatalf("writeTick 2: %v", err)
+	}
+	f2.Sync()
+	f2.Close()
+
+	rows := readAllCSV(t, path)
+	headers := 0
+	for _, row := range rows {
+		if len(row) > 0 && row[0] == "Unix" {
+			headers++
+		}
+	}
+	if headers != 1 {
+		t.Fatalf("header rows=%d, want 1 (reopen must not rewrite CSV header)", headers)
+	}
+	if len(rows) != 3 { // 1 header + 2 data
+		t.Fatalf("got %d rows, want 3 (1 header + 2 data)", len(rows))
+	}
+}
+
 func BenchmarkWriteSnmpTick(b *testing.B) {
 	b.ReportAllocs()
 

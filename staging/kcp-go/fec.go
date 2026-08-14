@@ -100,15 +100,8 @@ func (h *shardHeap) release() {
 
 func (h *shardHeap) Len() int { return len(h.elements) }
 
-func (h *shardHeap) Less(i, j int) bool {
-	return _itimediff(h.elements[j].seqid(), h.elements[i].seqid()) > 0
-}
-
-func (h *shardHeap) Swap(i, j int) { h.elements[i], h.elements[j] = h.elements[j], h.elements[i] }
-
-// push appends a FEC packet to the heap. No sift is needed because the heap
-// is always fully drained before reuse (it is used as a set/stack, not a
-// priority queue).
+// push appends a FEC packet. Ordering is LIFO via pop(); this is intentionally
+// a set/stack (not a priority queue) — callers only need membership + drain.
 func (h *shardHeap) push(pkt fecPacket) {
 	h.elements = append(h.elements, pkt)
 	h.marks[pkt.seqid()] = struct{}{}
@@ -228,6 +221,7 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 					for _, pkt := range shard.elements {
 						defaultBufferPool.Put(pkt)
 					}
+					shard.release()
 				}
 				dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
 				codec, err := reedsolomon.New(autoDS, autoPS)
@@ -342,6 +336,10 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 		for _, pkt := range pkts {
 			defaultBufferPool.Put(pkt)
 		}
+		// Set fully drained — return empty heap to pool early.
+		shard.release()
+		delete(dec.shardSet, shardId)
+		atomic.StoreUint64(&DefaultSnmp.FECShardSet, uint64(len(dec.shardSet)))
 	}
 
 	// update the newest shard id

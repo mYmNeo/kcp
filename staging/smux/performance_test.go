@@ -138,8 +138,8 @@ func TestRecvLoopBufferedRead(t *testing.T) {
 	}
 }
 
-// TestControlFramePriority verifies that CLSCTRL frames (SYN/FIN/NOP)
-// are not blocked by a saturated data queue. We create high throughput
+// TestControlFramePriority verifies that CLSCTRL frames (SYN/NOP/UPD)
+// are not blocked by a saturated data queue. FIN uses CLSDATA. We create high throughput
 // data on multiple streams and verify that a new stream can still be
 // opened and closed promptly.
 func TestControlFramePriority(t *testing.T) {
@@ -227,7 +227,7 @@ func TestControlFramePriority(t *testing.T) {
 	ctrlStream.Close()
 	ctrlElapsed := time.Since(ctrlStart)
 
-	// CloseWrite also sends FIN via CLSCTRL shaper path
+	// CloseWrite sends FIN via CLSDATA shaper path (EOF treated as data)
 	ctrlStream2, err := clientSess.OpenStream()
 	if err != nil {
 		t.Fatalf("second control stream open failed: %v", err)

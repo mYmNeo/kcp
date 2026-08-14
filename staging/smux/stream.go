@@ -498,6 +498,9 @@ var writeTimerPool = sync.Pool{
 
 // stopTimerDrain stops t and drains its channel if needed, safe for all Go versions.
 func stopTimerDrain(t *time.Timer) {
+	if t == nil {
+		return
+	}
 	if !t.Stop() {
 		select {
 		case <-t.C:
@@ -602,6 +605,7 @@ func (s *stream) writeV2(b []byte) (n int, err error) {
 			deadline = writeTimer.C
 		} else if writeTimer != nil {
 			stopTimerDrain(writeTimer)
+			writeTimerPool.Put(writeTimer)
 			writeTimer = nil
 		}
 
@@ -868,15 +872,3 @@ func (s *stream) tryHalfCloseCleanup() {
 	s.sess.streamClosed(s.id)
 }
 
-// stopTimer stops the supplied timer and drains its channel if needed.
-func stopTimer(t *time.Timer) {
-	if t == nil {
-		return
-	}
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-}

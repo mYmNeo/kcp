@@ -24,6 +24,7 @@ package smux
 
 import (
 	"fmt"
+	"io"
 	"math/rand"
 	"sync"
 	"testing"
@@ -437,4 +438,123 @@ func TestShaperIsEmpty(t *testing.T) {
 	if sq.IsEmpty() {
 		t.Fatal("ShaperQueue should not be empty")
 	}
+}
+
+// stallRWC blocks all Read/Write until Close, so sendLoop stalls and the
+// shaper queue can be observed under backpressure without a real peer.
+type stallRWC struct {
+	block chan struct{}
+}
+
+func newStallRWC() *stallRWC { return &stallRWC{block: make(chan struct{})} }
+
+func (s *stallRWC) Read(p []byte) (int, error) {
+	<-s.block
+	return 0, io.EOF
+}
+
+func (s *stallRWC) Write(p []byte) (int, error) {
+	<-s.block
+	return 0, io.ErrClosedPipe
+}
+
+func (s *stallRWC) Close() error {
+	select {
+	case <-s.block:
+	default:
+		close(s.block)
+	}
+	return nil
+}
+
+// TestShaperCtrlQueueBound verifies CLSCTRL admission respects maxCtrlShaperSize
+// when sendLoop cannot drain (Critical: no unbounded sq growth).
+func TestShaperCtrlQueueBound(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	cfg.Version = 2
+
+	conn := newStallRWC()
+	sess := newSession(cfg, conn, true)
+	defer sess.Close()
+
+	var wg sync.WaitGroup
+	const flood = 4000
+	for i := 0; i < flood; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f := newFrame(byte(cfg.Version), cmdNOP, 0)
+			deadline := time.After(200 * time.Millisecond)
+			_, _ = sess.writeFrameInternal(f, deadline, CLSCTRL)
+		}()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var peak int
+	for time.Now().Before(deadline) {
+		if n := sess.sq.Len(); n > peak {
+			peak = n
+		}
+		if peak > maxCtrlShaperSize {
+			t.Fatalf("shaper queue unbounded: peak=%d > maxCtrlShaperSize=%d", peak, maxCtrlShaperSize)
+		}
+		if peak >= maxCtrlShaperSize {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	wg.Wait()
+
+	if n := sess.sq.Len(); n > maxCtrlShaperSize {
+		t.Fatalf("after flood: sq.Len()=%d > maxCtrlShaperSize=%d", n, maxCtrlShaperSize)
+	}
+	if peak == 0 {
+		t.Fatal("expected shaper queue to accumulate while sendLoop stalled")
+	}
+	t.Logf("CLSCTRL flood peak sq.Len()=%d (cap=%d)", peak, maxCtrlShaperSize)
+}
+
+// TestShaperLoopExitsOnClose verifies Close remains responsive even while
+// CLSCTRL traffic is flooding the priority channel (no die-starvation).
+func TestShaperLoopExitsOnClose(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	cfg.Version = 2
+
+	conn := newStallRWC()
+	sess := newSession(cfg, conn, true)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f := newFrame(byte(cfg.Version), cmdNOP, 0)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				deadline := time.After(20 * time.Millisecond)
+				_, _ = sess.writeFrameInternal(f, deadline, CLSCTRL)
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	if err := sess.Close(); err != nil && err != io.ErrClosedPipe {
+		t.Fatalf("Close: %v", err)
+	}
+	elapsed := time.Since(start)
+	close(stop)
+	wg.Wait()
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("Close blocked for %v; shaperLoop may be starving s.die", elapsed)
+	}
+	t.Logf("Close under CLSCTRL flood: %v", elapsed)
 }

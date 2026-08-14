@@ -38,7 +38,14 @@ const (
 	defaultAcceptBacklog = 1024
 	minShaperNotifySize  = 16
 	maxShaperSize        = 1024
-	openCloseTimeout     = 30 * time.Second // Timeout for opening/closing streams
+	// maxCtrlShaperSize caps total sq occupancy for CLSCTRL. Slightly above
+	// maxShaperSize so control frames retain limited headroom when data has
+	// saturated the queue, without allowing unbounded growth.
+	maxCtrlShaperSize = maxShaperSize + 256
+	// maxCtrlDrain limits how many extra CLSCTRL frames are taken per wake so
+	// s.die / chShaperConsumed stay reachable in the same select.
+	maxCtrlDrain     = 32
+	openCloseTimeout = 30 * time.Second // Timeout for opening/closing streams
 )
 
 // resultChanPool reduces allocation of result channels
@@ -130,7 +137,7 @@ type Session struct {
 
 	requestID        uint32            // Monotonic increasing write request ID
 	shaper           chan writeRequest // channel for CLSDATA write requests
-	shaperCtrl       chan writeRequest // channel for CLSCTRL (keepalive NOP, SYN) — never blocked
+	shaperCtrl       chan writeRequest // channel for CLSCTRL (keepalive NOP, SYN, UPD); buffered, still subject to sq admission
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
@@ -140,7 +147,13 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s := new(Session)
 	s.die = make(chan struct{})
 	s.conn = conn
-	s.reader = bufio.NewReaderSize(conn, 65536)
+	// Size the session reader from MaxFrameSize so high fan-out RSS stays
+	// proportional to configured frame size (not a fixed 64KiB per session).
+	readerSize := config.MaxFrameSize + headerSize
+	if readerSize < 4096 {
+		readerSize = 4096
+	}
+	s.reader = bufio.NewReaderSize(conn, readerSize)
 	s.config = config
 	s.streams = make(map[uint32]*stream)
 	s.chAccepts = make(chan *stream, defaultAcceptBacklog)
@@ -552,55 +565,76 @@ func (s *Session) keepalive() {
 }
 
 // shaperLoop implements a priority queue and bandwidth shaping for write requests.
-// Eg: Control messages are prioritized over data messages, and shaper tries
+// CLSCTRL is preferred over CLSDATA when both are eligible, but both are subject
+// to sq admission caps (maxCtrlShaperSize / maxShaperSize). A single select keeps
+// s.die and chShaperConsumed reachable under control-frame bursts.
 func (s *Session) shaperLoop() {
 	chShaper := s.shaper
+	chCtrl := s.shaperCtrl
 
 	for {
-		// Always drain CLSCTRL (control) frames first — they bypass backpressure.
-		select {
-		case r := <-s.shaperCtrl:
-			s.sq.Push(r)
-			// drain any additional control frames without blocking
-			for len(s.shaperCtrl) > 0 {
-				select {
-				case r := <-s.shaperCtrl:
-					s.sq.Push(r)
-				default:
-				}
-			}
-			s.notifyShaperPending()
-			continue
-		default:
-		}
-
 		select {
 		case <-s.die:
 			return
-		case r := <-s.shaperCtrl:
-			s.sq.Push(r)
-			s.notifyShaperPending()
-		case r := <-chShaper:
-			s.sq.Push(r)
-			// batch drain: collect more requests if available
-			for len(chShaper) > 0 && s.sq.Len() < maxShaperSize {
+		case r := <-chCtrl:
+			// Admit only under cap; if select raced past nil, put back (never drop CLSCTRL).
+			if s.sq.Len() < maxCtrlShaperSize {
+				s.sq.Push(r)
+				// Bounded drain: prefer control frames but never starve die/consumed.
+				for i := 0; i < maxCtrlDrain && len(s.shaperCtrl) > 0 && s.sq.Len() < maxCtrlShaperSize; i++ {
+					select {
+					case r := <-s.shaperCtrl:
+						s.sq.Push(r)
+					default:
+					}
+				}
+				s.notifyShaperPending()
+			} else {
 				select {
-				case r := <-chShaper:
-					s.sq.Push(r)
+				case s.shaperCtrl <- r:
 				default:
+					s.sq.Push(r)
+					s.notifyShaperPending()
 				}
 			}
-			// notify sendLoop there are pending requests
-			s.notifyShaperPending()
-
+			if s.sq.Len() >= maxCtrlShaperSize {
+				chCtrl = nil
+			}
 			if s.sq.Len() >= maxShaperSize {
-				// stop accepting new CLSDATA requests temporarily if shaper queue is full
-				// CLSCTRL frames still enter via the shaperCtrl channel above
 				chShaper = nil
 			}
+		case r := <-chShaper:
+			if s.sq.Len() < maxShaperSize {
+				s.sq.Push(r)
+				for len(chShaper) > 0 && s.sq.Len() < maxShaperSize {
+					select {
+					case r := <-chShaper:
+						s.sq.Push(r)
+					default:
+					}
+				}
+				s.notifyShaperPending()
+			} else {
+				select {
+				case s.shaper <- r:
+				default:
+					s.sq.Push(r)
+					s.notifyShaperPending()
+				}
+			}
+			if s.sq.Len() >= maxShaperSize {
+				chShaper = nil
+			}
+			if s.sq.Len() >= maxCtrlShaperSize {
+				chCtrl = nil
+			}
 		case <-s.chShaperConsumed:
-			// re-enable shaper channel
-			chShaper = s.shaper
+			if s.sq.Len() < maxShaperSize {
+				chShaper = s.shaper
+			}
+			if s.sq.Len() < maxCtrlShaperSize {
+				chCtrl = s.shaperCtrl
+			}
 		}
 	}
 }
@@ -711,7 +745,7 @@ func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class C
 		seq:    atomic.AddUint32(&s.requestID, 1),
 		result: resultCh,
 	}
-	// route by class: CLSCTRL uses the priority channel that never blocks on backpressure
+	// route by class: CLSCTRL uses the priority channel (still subject to sq admission)
 	targetCh := s.shaper
 	if class == CLSCTRL {
 		targetCh = s.shaperCtrl
