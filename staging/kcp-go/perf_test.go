@@ -131,8 +131,6 @@ func TestRecvBufPeek_GapInMiddle(t *testing.T) {
 // TestOutSegsBatching verifies that the OutSegs SNMP counter is updated
 // once per flush() call, not once per segment encoded.
 func TestOutSegsBatching(t *testing.T) {
-	DefaultSnmp.Reset()
-
 	var outCalled []int // sizes passed to output callback
 	kcp1 := NewKCP(0xABCDEF01, func(buf []byte, size int) {
 		outCalled = append(outCalled, size)
@@ -170,8 +168,6 @@ func TestOutSegsBatching(t *testing.T) {
 // TestOutSegsBatching_BulkFlush verifies that OutSegs is correct
 // even when flush() is called from the normal update path.
 func TestOutSegsBatching_BulkFlush(t *testing.T) {
-	DefaultSnmp.Reset()
-
 	kcp1 := NewKCP(0xDEADBEEF, func(buf []byte, size int) {})
 	kcp1.NoDelay(1, 10, 2, 1)
 	kcp1.WndSize(128, 128)

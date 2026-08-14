@@ -71,6 +71,7 @@ func setupServer(tb testing.TB) (addr string, stopfunc func(), client net.Conn, 
 
 func handleConnection(conn net.Conn) {
 	session, _ := Server(conn, nil)
+	defer session.Close()
 	for {
 		if stream, err := session.AcceptStream(); err == nil {
 			go func(s io.ReadWriteCloser) {
@@ -117,6 +118,7 @@ func handleConnectionV2(conn net.Conn) {
 	config := DefaultConfig()
 	config.Version = 2
 	session, _ := Server(conn, config)
+	defer session.Close()
 	for {
 		if stream, err := session.AcceptStream(); err == nil {
 			go func(s io.ReadWriteCloser) {

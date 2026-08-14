@@ -27,12 +27,12 @@ Commands (`frame.go:31-39`): `cmdSYN=0` (open), `cmdFIN=1` (close/EOF), `cmdPSH=
 
 ### Session lifecycle and goroutines
 
-`Client(conn, cfg)` / `Server(conn, cfg)` (`mux.go:110-131`) → `newSession` (`session.go:136`) spawns four goroutines:
+`Client(conn, cfg)` / `Server(conn, cfg)` (`mux.go`) → `newSession` (`session.go`) spawns four goroutines:
 
-- **`recvLoop`** (`session.go:383-517`) — reads frames from `conn` under token-bucket control (`bucket int32`); dispatches by CMD: `SYN` → register stream, push to `chAccepts`; `PSH` → `stream.pushBytes` + wake reader; `FIN` → `stream.fin()`; `UPD` (v2) → `stream.update(consumed, window)` + wake writer; `NOP` → keepalive ack.
-- **`keepalive`** (`session.go:519-543`) — sends `NOP` on `KeepAliveInterval`; closes session on `KeepAliveTimeout`.
-- **`shaperLoop`** (`session.go`) — drains `shaper`/`shaperCtrl` into a fair round-robin `shaperQueue`; CLSCTRL is preferred but both classes are admission-capped (`maxShaperSize` / `maxCtrlShaperSize`).
-- **`sendLoop`** (`session.go:595-662`) — pops from `shaperQueue` and writes to `conn`.
+- **`recvLoop`** (`session.go`) — reads frames from `conn` under token-bucket control (`bucket int32`); dispatches by CMD: `SYN` → register stream, push to `chAccepts`; `PSH` → `stream.pushBytes` + wake reader; `FIN` → `stream.fin()`; `UPD` (v2) → `stream.update(consumed, window)` + wake writer; `NOP` → keepalive ack. On any read/protocol error it closes the session so `shaperLoop`/`sendLoop`/`keepalive` are reaped.
+- **`keepalive`** (`session.go`) — sends `NOP` on `KeepAliveInterval`; closes session on `KeepAliveTimeout`. CLSCTRL admission timeouts are observable via `KeepaliveCtrlTimeouts()`.
+- **`shaperLoop`** (`session.go`) — drains `shaper`/`shaperCtrl` into a fair round-robin `shaperQueue`; CLSCTRL is preferred but both classes are admission-capped (`maxShaperSize` / `maxCtrlShaperSize`). Channels are nil'd at cap so Push never overshoots. Exits when `s.die` closes and signals via `shaperLoopDone`.
+- **`sendLoop`** (`session.go`) — pops from `shaperQueue` and writes to `conn`.
 
 ### Write path
 

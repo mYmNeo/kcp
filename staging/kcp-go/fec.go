@@ -337,9 +337,9 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 			defaultBufferPool.Put(pkt)
 		}
 		// Set fully drained — return empty heap to pool early.
+		// FECShardSet is refreshed by discardShards() below.
 		shard.release()
 		delete(dec.shardSet, shardId)
-		atomic.StoreUint64(&DefaultSnmp.FECShardSet, uint64(len(dec.shardSet)))
 	}
 
 	// update the newest shard id

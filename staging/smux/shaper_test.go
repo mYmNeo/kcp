@@ -515,8 +515,12 @@ func TestShaperCtrlQueueBound(t *testing.T) {
 	t.Logf("CLSCTRL flood peak sq.Len()=%d (cap=%d)", peak, maxCtrlShaperSize)
 }
 
-// TestShaperLoopExitsOnClose verifies Close remains responsive even while
-// CLSCTRL traffic is flooding the priority channel (no die-starvation).
+// TestShaperLoopExitsOnClose verifies shaperLoop is reaped after Close while
+// CLSCTRL feeders keep refilling shaperCtrl. Feeders push directly into the
+// channel (bypassing writeFrameInternal's <-die) so Close cannot abort the
+// flood via the writer-side select. The single-select shaperLoop must keep
+// s.die reachable under control-frame pressure; shaperLoopDone is the
+// deterministic exit signal observed here.
 func TestShaperLoopExitsOnClose(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.KeepAliveDisabled = true
@@ -527,34 +531,40 @@ func TestShaperLoopExitsOnClose(t *testing.T) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	for i := 0; i < 64; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			f := newFrame(byte(cfg.Version), cmdNOP, 0)
 			for {
+				req := writeRequest{
+					class:  CLSCTRL,
+					frame:  newFrame(byte(cfg.Version), cmdNOP, 0),
+					seq:    1,
+					result: make(chan writeResult, 1),
+				}
 				select {
 				case <-stop:
 					return
-				default:
+				case sess.shaperCtrl <- req:
 				}
-				deadline := time.After(20 * time.Millisecond)
-				_, _ = sess.writeFrameInternal(f, deadline, CLSCTRL)
 			}
 		}()
 	}
 
 	time.Sleep(50 * time.Millisecond)
-	start := time.Now()
 	if err := sess.Close(); err != nil && err != io.ErrClosedPipe {
 		t.Fatalf("Close: %v", err)
 	}
-	elapsed := time.Since(start)
+
+	// Wait for shaperLoop to exit via its deterministic reaping signal,
+	// then stop the flood and reap the feeder goroutines.
+	select {
+	case <-sess.shaperLoopDone:
+	case <-time.After(2 * time.Second):
+		close(stop)
+		wg.Wait()
+		t.Fatal("shaperLoop still running after Close under CLSCTRL flood")
+	}
 	close(stop)
 	wg.Wait()
-
-	if elapsed > 2*time.Second {
-		t.Fatalf("Close blocked for %v; shaperLoop may be starving s.die", elapsed)
-	}
-	t.Logf("Close under CLSCTRL flood: %v", elapsed)
 }

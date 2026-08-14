@@ -410,7 +410,6 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	return
 }
 
-
 // moveRcvBufToQueue moves contiguous in-order segments from rcv_buf into
 // rcv_queue. It peeks at the heap root (minimum sn) first to avoid an
 // unnecessary Pop+Push when the next expected segment is not ready yet.

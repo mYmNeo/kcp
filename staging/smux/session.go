@@ -141,6 +141,10 @@ type Session struct {
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
+
+	// shaperLoopDone is closed when shaperLoop exits, providing a
+	// deterministic reaping signal for tests and lifecycle users.
+	shaperLoopDone chan struct{}
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
@@ -149,6 +153,8 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.conn = conn
 	// Size the session reader from MaxFrameSize so high fan-out RSS stays
 	// proportional to configured frame size (not a fixed 64KiB per session).
+	// Inbound frames larger than MaxFrameSize remain readable: bufio bypasses
+	// its buffer for oversized reads (extra syscall, not truncation).
 	readerSize := config.MaxFrameSize + headerSize
 	if readerSize < 4096 {
 		readerSize = 4096
@@ -166,6 +172,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chProtoError = make(chan struct{})
 	s.chShaperPending = make(chan struct{}, 1)
 	s.chShaperConsumed = make(chan struct{}, 1)
+	s.shaperLoopDone = make(chan struct{})
 	s.sq = NewShaperQueue()
 
 	if client {
@@ -421,6 +428,7 @@ func (s *Session) recvLoop() {
 		_, err := io.ReadFull(s.reader, hdr[:])
 		if err != nil {
 			s.notifyReadError(err)
+			s.Close()
 			return
 		}
 
@@ -487,6 +495,7 @@ func (s *Session) recvLoop() {
 
 				// recycle the buffer immediately.
 				defaultAllocator.Put(pNewbuf)
+				s.Close()
 				return
 			}
 
@@ -520,6 +529,7 @@ func (s *Session) recvLoop() {
 			_, err := io.ReadFull(s.reader, updHdr[:])
 			if err != nil {
 				s.notifyReadError(err)
+				s.Close()
 				return
 			}
 
@@ -538,6 +548,12 @@ func (s *Session) recvLoop() {
 	}
 }
 
+// KeepaliveCtrlTimeouts returns the number of NOP writes that failed under
+// shaper admission pressure (typically ErrTimeout). Diagnostic only.
+func KeepaliveCtrlTimeouts() uint64 { return atomic.LoadUint64(&keepaliveCtrlTimeouts) }
+
+var keepaliveCtrlTimeouts uint64
+
 // keepalive sends NOP frames periodically to keep the connection alive
 func (s *Session) keepalive() {
 	tickerPing := time.NewTicker(s.config.KeepAliveInterval)
@@ -547,7 +563,12 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-tickerPing.C:
-			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL)
+			// CLSCTRL is admission-capped; under saturation NOP may time out and
+			// the peer's KeepAliveTimeout can then tear down an otherwise healthy
+			// session. Count for observability; recvLoop still owns activity.
+			if _, err := s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL); err != nil && err != io.ErrClosedPipe {
+				atomic.AddUint64(&keepaliveCtrlTimeouts, 1)
+			}
 			s.notifyBucket() // force a wakeup signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.sessionIsActive, 1, 0) {
@@ -568,35 +589,30 @@ func (s *Session) keepalive() {
 // CLSCTRL is preferred over CLSDATA when both are eligible, but both are subject
 // to sq admission caps (maxCtrlShaperSize / maxShaperSize). A single select keeps
 // s.die and chShaperConsumed reachable under control-frame bursts.
+//
+// chCtrl / chShaper are set to nil whenever the corresponding cap is reached and
+// only re-armed under cap on chShaperConsumed, so receiving from either channel
+// always means Push is legal — never push past the documented bound.
 func (s *Session) shaperLoop() {
 	chShaper := s.shaper
 	chCtrl := s.shaperCtrl
+	defer close(s.shaperLoopDone)
 
 	for {
 		select {
 		case <-s.die:
 			return
 		case r := <-chCtrl:
-			// Admit only under cap; if select raced past nil, put back (never drop CLSCTRL).
-			if s.sq.Len() < maxCtrlShaperSize {
-				s.sq.Push(r)
-				// Bounded drain: prefer control frames but never starve die/consumed.
-				for i := 0; i < maxCtrlDrain && len(s.shaperCtrl) > 0 && s.sq.Len() < maxCtrlShaperSize; i++ {
-					select {
-					case r := <-s.shaperCtrl:
-						s.sq.Push(r)
-					default:
-					}
-				}
-				s.notifyShaperPending()
-			} else {
+			s.sq.Push(r)
+			// Bounded drain: prefer control frames but never starve die/consumed.
+			for i := 0; i < maxCtrlDrain && len(s.shaperCtrl) > 0 && s.sq.Len() < maxCtrlShaperSize; i++ {
 				select {
-				case s.shaperCtrl <- r:
-				default:
+				case r := <-s.shaperCtrl:
 					s.sq.Push(r)
-					s.notifyShaperPending()
+				default:
 				}
 			}
+			s.notifyShaperPending()
 			if s.sq.Len() >= maxCtrlShaperSize {
 				chCtrl = nil
 			}
@@ -604,24 +620,15 @@ func (s *Session) shaperLoop() {
 				chShaper = nil
 			}
 		case r := <-chShaper:
-			if s.sq.Len() < maxShaperSize {
-				s.sq.Push(r)
-				for len(chShaper) > 0 && s.sq.Len() < maxShaperSize {
-					select {
-					case r := <-chShaper:
-						s.sq.Push(r)
-					default:
-					}
-				}
-				s.notifyShaperPending()
-			} else {
+			s.sq.Push(r)
+			for len(chShaper) > 0 && s.sq.Len() < maxShaperSize {
 				select {
-				case s.shaper <- r:
-				default:
+				case r := <-chShaper:
 					s.sq.Push(r)
-					s.notifyShaperPending()
+				default:
 				}
 			}
+			s.notifyShaperPending()
 			if s.sq.Len() >= maxShaperSize {
 				chShaper = nil
 			}
