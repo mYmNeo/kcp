@@ -32,4 +32,4 @@ replace github.com/xtaci/kcp-go/v5 => ./staging/kcp-go/
 
 replace github.com/xtaci/smux => ./staging/smux/
 
-go 1.26.0
+go 1.27.0

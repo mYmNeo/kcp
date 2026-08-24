@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,11 +28,22 @@ type Store struct {
 	mu   sync.Mutex
 }
 
+var shmNamePattern = regexp.MustCompile(`^/[A-Za-z0-9._-]+$`)
+
 func shmPath(name string) (string, error) {
-	if !strings.HasPrefix(name, "/") {
-		return "", fmt.Errorf("shmmap: name must start with /")
+	if !shmNamePattern.MatchString(name) {
+		return "", fmt.Errorf("shmmap: invalid name %q (want / followed by [A-Za-z0-9._-]+)", name)
 	}
-	return filepath.Join("/dev/shm", strings.TrimPrefix(name, "/")), nil
+	body := strings.TrimPrefix(name, "/")
+	if body == "." || body == ".." {
+		return "", fmt.Errorf("shmmap: invalid name %q", name)
+	}
+	path := filepath.Join("/dev/shm", body)
+	// Must resolve to a file strictly under /dev/shm (not the directory itself).
+	if !strings.HasPrefix(path, "/dev/shm/") {
+		return "", fmt.Errorf("shmmap: resolved path %q escapes /dev/shm", path)
+	}
+	return path, nil
 }
 
 // Open creates or opens a POSIX shared memory region for the IP-to-domain index.
