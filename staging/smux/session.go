@@ -23,7 +23,6 @@
 package smux
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -100,7 +99,6 @@ type writeResult struct {
 // Session defines a multiplexed connection for streams
 type Session struct {
 	conn   io.ReadWriteCloser
-	reader *bufio.Reader // buffered reader for recvLoop to coalesce small reads
 
 	config           *Config
 	goAway           int32  // flag id exhausted
@@ -151,15 +149,6 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s := new(Session)
 	s.die = make(chan struct{})
 	s.conn = conn
-	// Size the session reader from MaxFrameSize so high fan-out RSS stays
-	// proportional to configured frame size (not a fixed 64KiB per session).
-	// Inbound frames larger than MaxFrameSize remain readable: bufio bypasses
-	// its buffer for oversized reads (extra syscall, not truncation).
-	readerSize := config.MaxFrameSize + headerSize
-	if readerSize < 4096 {
-		readerSize = 4096
-	}
-	s.reader = bufio.NewReaderSize(conn, readerSize)
 	s.config = config
 	s.streams = make(map[uint32]*stream)
 	s.chAccepts = make(chan *stream, defaultAcceptBacklog)
@@ -425,7 +414,7 @@ func (s *Session) recvLoop() {
 
 		// As long as we have tokens, try to read frames.
 		// read header first
-		_, err := io.ReadFull(s.reader, hdr[:])
+		_, err := io.ReadFull(s.conn, hdr[:])
 		if err != nil {
 			s.notifyReadError(err)
 			s.Close()
@@ -489,7 +478,7 @@ func (s *Session) recvLoop() {
 
 			// read payload from the underlying connection
 			pNewbuf := defaultAllocator.Get(int(hdr.Length()))
-			written, err := io.ReadFull(s.reader, *pNewbuf)
+			written, err := io.ReadFull(s.conn, *pNewbuf)
 			if err != nil {
 				s.notifyReadError(err)
 
@@ -526,7 +515,7 @@ func (s *Session) recvLoop() {
 				return
 			}
 
-			_, err := io.ReadFull(s.reader, updHdr[:])
+			_, err := io.ReadFull(s.conn, updHdr[:])
 			if err != nil {
 				s.notifyReadError(err)
 				s.Close()
