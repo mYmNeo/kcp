@@ -29,11 +29,29 @@ import (
 
 // Config defines the server-side settings supplied via flags or JSON.
 type Config struct {
-	std.BaseConfig              // Embed shared configuration
-	Listen         string       `json:"listen"`
-	Target         string       `json:"target"`
-	ProxyMode      int          `json:"proxy-mode"`
-	SmuxConfig     *smux.Config `json:"-"` // precomputed smux configuration
+	std.BaseConfig        // Embed shared configuration
+	Listen         string `json:"listen"`
+	TCP            bool   `json:"tcp"`
+
+	// CarrierMaxStreams caps how many parallel TCP streams one peer may attach
+	// when the carrier transport is selected. It is listener-side only: the
+	// dialer decides how many a client asks for.
+	//
+	// CarrierMaxStreamsTotal caps the same across every peer of this listener
+	// together. It is the bound that keeps a crowd of peers — or a crowd of
+	// clones of one — from consuming the process's descriptors. The carrier
+	// sizes its own default from the memory it can pin, so raising this raises
+	// that ceiling linearly; see defaultMaxStreamsTotal there.
+	CarrierMaxStreams      int `json:"carriermaxstreams"`
+	CarrierMaxStreamsTotal int `json:"carriermaxstreamstotal"`
+
+	// CarrierSecret authenticates the carrier handshake. It is the same
+	// PBKDF2-derived key the block crypt uses, so it is never read from a config
+	// file and never logged.
+	CarrierSecret []byte       `json:"-"`
+	Target        string       `json:"target"`
+	ProxyMode     int          `json:"proxy-mode"`
+	SmuxConfig    *smux.Config `json:"-"` // precomputed smux configuration
 }
 
 func parseJSONConfig(config *Config, path string) error {

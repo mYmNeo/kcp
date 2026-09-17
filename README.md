@@ -34,6 +34,7 @@
    - [Slow Devices](#slow-devices)
 - [Expert Tuning Guide](#expert-tuning-guide)
    - [Overview](#overview)
+   - [TCP Transport](#tcp-transport)
    - [Multiport Dialer](#multiport-dialer)
    - [Rate Limit and Pacing](#rate-limit-and-pacing)
    - [Forward Error Correction](#forward-error-correction)
@@ -207,10 +208,13 @@ COMMANDS:
 GLOBAL OPTIONS:
    --localaddr value, -l value      local listen address (default: ":12948")
    --remoteaddr value, -r value     kcp server address, eg: "IP:29900" a for single port, "IP:minport-maxport" for port range (default: "vps:29900")
+   --tcp                            use the TCP carrier instead of UDP for the kcp transport
    --key value                      pre-shared secret between client and server (default: "it's a secrect") [$KCPTUN_KEY]
    --crypt value                    sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20 (default: "aes-128-gcm")
    --mode value                     profiles: fast3, fast2, fast, normal, manual (default: "fast")
    --conn value                     set num of UDP connections to server (default: 1)
+   --carrierstreams value           TCP carrier: number of parallel TCP streams per connection, 0 for a single stream (default: 0)
+   --carrierqueuedepth value        TCP carrier: datagrams queued per stream before backpressure, 0 for the default (default: 0)
    --autoexpire value               set auto expiration time(in seconds) for a single UDP connection, 0 to disable (default: 0)
    --scavengettl value              set how long an expired connection can live (in seconds) (default: 600)
    --mtu value                      set maximum transmission unit for UDP packets (default: 1350)
@@ -265,6 +269,10 @@ GLOBAL OPTIONS:
    --dscp value                     set DSCP(6bit) (default: 0)
    --nocomp                         disable compression
    --sockbuf value                  per-socket buffer in bytes (default: 4194304)
+   --tcp                            use the TCP carrier instead of UDP for the kcp transport
+   --carriermaxstreams value        TCP carrier: max parallel TCP streams one peer may attach, 0 for the default (default: 0)
+   --carriermaxstreamstotal value   TCP carrier: max parallel TCP streams all peers together, 0 for the default (default: 0)
+   --carrierqueuedepth value        TCP carrier: datagrams queued per stream before backpressure, 0 for the default (default: 0)
    --smuxver value                  specify smux version, available 1,2 (default: 2)
    --smuxbuf value                  the overall de-mux buffer in bytes (default: 4194304)
    --framesize value                smux max frame size (default: 8192)
@@ -279,6 +287,24 @@ GLOBAL OPTIONS:
    -c value                         config from json file, which will override the command from shell
    --help, -h                       show help
    --version, -v                    print the version
+```
+
+### TCP Transport
+
+By default kcptun carries the KCP datagram stream over UDP. With `--tcp`, the datagrams are carried inside TCP instead, which is useful where UDP is throttled or blocked. The flag must be enabled on **BOTH** the KCP Client and KCP Server, and can also be set from the JSON config file as `"tcp": true`.
+
+- **Parallel streams (opt-in):** `--carrierstreams N` opens N TCP streams per KCP connection and stripes datagrams across them, so a single stalled stream does not freeze the session. The flag defaults to 0, which resolves to a single stream — striping helps on lossy or long-haul paths, but on a healthy path a single stream has less reordering to undo and the extra streams cost little more than sockets.
+- **Backpressure tuning:** `--carrierqueuedepth N` sets how many datagrams may wait on one stream before writes block. It defaults, identically on both ends, to 256 — deliberately not tied to `--sndwnd`, because each stream allocates its queue up front and a 1024-deep queue across a listener's whole stream budget costs far more memory than it buys in throughput. On the server, `--carriermaxstreams N` caps how many TCP streams one peer may attach, and `--carriermaxstreamstotal N` caps them across every peer together — the latter is what bounds the listener's total descriptors and buffers, since a per-peer cap alone leaves the total unbounded. On the client, `--carrierstreams` is bounded at 64, because each stream costs a receive buffer on both ends and a mistyped order of magnitude should fail loudly rather than turn into memory growth.
+- **Ordering:** a single stream preserves datagram order; datagrams on different streams may arrive out of order, which KCP tolerates.
+- **No retransmission:** a broken TCP stream drops the datagrams queued on it, and KCP retransmits them, exactly as it would over UDP. A stream whose queue stays full for a minute — a peer that has stopped reading entirely — is dropped as wedged and its traffic fails over to the remaining streams; this is a liveness backstop, not a congestion signal.
+- **Unchanged above the transport:** smux multiplexing, compression, `--autoexpire`, transparent proxy and SOCKS5 modes work as before. `--mtu`, `--sndwnd`/`--rcvwnd` and `--datashard`/`--parityshard` still tune KCP itself, while `--sockbuf` and `--dscp` now apply to the TCP sockets.
+- **Authenticated handshake:** the session id travels in the clear, so it is not a credential. Each stream answers a per-connection challenge from the server with an HMAC over that challenge, keyed by the secret derived from `--key`, which is what proves the right to join a session. Because the challenge is fresh per connection, a recorded handshake cannot be replayed onto a later one.
+- **Faster failure detection:** when the server is lost, a TCP stream breaks immediately, so the client abandons the dead session at once instead of waiting for KCP to exhaust its retransmit budget.
+
+Example:
+```
+KCP Client: ./client_linux_amd64 -r "KCP_SERVER_IP:4000" -l ":8388" -mode fast3 --tcp
+KCP Server: ./server_linux_amd64 -t "TARGET_IP:8388" -l ":4000" -mode fast3 --tcp
 ```
 
 ### Multiport Dialer
@@ -498,6 +524,7 @@ A: The following parameters **MUST** be exactly the same on both client and serv
 - `--key` and `--crypt`
 - `--nocomp`
 - `--smuxver`
+- `--tcp` (both ends must use the same transport)
 
 ### Q: How can I manually fine-tune KCP protocol parameters?
 A: You can use `-mode manual` along with `-nodelay`, `-interval`, `-resend`, and `-nc` for advanced tuning. For example:

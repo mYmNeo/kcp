@@ -1,6 +1,9 @@
 {
     "localaddr": ":3000",
     "remoteaddr": "127.0.0.1:29900-29999",
+    "tcp": false,
+    "carrierstreams": 0,
+    "carrierqueuedepth": 0,
     "key": "PASSWORD",
     "crypt": "aes-128",
     "mode": "fast3",

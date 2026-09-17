@@ -29,15 +29,26 @@ import (
 
 // Config models the client-side configuration loaded via flags or JSON.
 type Config struct {
-	std.BaseConfig              // Embed shared configuration
-	LocalAddr      string       `json:"localaddr"`
-	RemoteAddr     string       `json:"remoteaddr"`
-	Conn           int          `json:"conn"`
-	AutoExpire     int          `json:"autoexpire"`
-	ScavengeTTL    int          `json:"scavengettl"`
-	UseConntrack   bool         `json:"conntrack"`
-	ShmMap         string       `json:"shmmap"`
-	SmuxConfig     *smux.Config `json:"-"` // precomputed smux configuration
+	std.BaseConfig        // Embed shared configuration
+	LocalAddr      string `json:"localaddr"`
+	RemoteAddr     string `json:"remoteaddr"`
+	Conn           int    `json:"conn"`
+	TCP            bool   `json:"tcp"`
+
+	// CarrierStreams is the number of parallel TCP streams this client opens per
+	// KCP connection when the carrier transport is selected. It is dialer-side
+	// only: the listener adapts to however many streams arrive.
+	CarrierStreams int `json:"carrierstreams"`
+
+	// CarrierSecret authenticates the carrier handshake. It is the same
+	// PBKDF2-derived key the block crypt uses, so it is never read from a config
+	// file and never logged.
+	CarrierSecret []byte       `json:"-"`
+	AutoExpire    int          `json:"autoexpire"`
+	ScavengeTTL   int          `json:"scavengettl"`
+	UseConntrack  bool         `json:"conntrack"`
+	ShmMap        string       `json:"shmmap"`
+	SmuxConfig    *smux.Config `json:"-"` // precomputed smux configuration
 }
 
 func parseJSONConfig(config *Config, path string) error {

@@ -52,6 +52,12 @@ const (
 	maxSmuxVer = 2
 	// scavengePeriod defines how frequently expired sessions are purged.
 	scavengePeriod = 5
+	// maxCarrierStreams bounds --carrierstreams. Each stream costs a 64 KiB
+	// receive buffer on both ends plus a dial, so a typo of one or two orders of
+	// magnitude should be refused rather than turned into memory growth. The
+	// value is well above any useful striping fan-out: the point of striping is
+	// to dodge one stalled TCP stream, not to open a channel per datagram.
+	maxCarrierStreams = 64
 )
 
 // VERSION is populated via build flags when packaging official binaries.
@@ -78,6 +84,10 @@ func main() {
 			Value: "vps:29900",
 			Usage: `kcp server address, eg: "IP:29900" a for single port, "IP:minport-maxport" for port range`,
 		},
+		cli.BoolFlag{
+			Name:  "tcp",
+			Usage: "use the TCP carrier instead of UDP for the kcp transport",
+		},
 		cli.StringFlag{
 			Name:   "key",
 			Value:  "it's a secrect",
@@ -98,6 +108,16 @@ func main() {
 			Name:  "conn",
 			Value: 1,
 			Usage: "set num of UDP connections to server",
+		},
+		cli.IntFlag{
+			Name:  "carrierstreams",
+			Value: 0,
+			Usage: "TCP carrier: number of parallel TCP streams per connection, 0 for a single stream",
+		},
+		cli.IntFlag{
+			Name:  "carrierqueuedepth",
+			Value: 0,
+			Usage: "TCP carrier: datagrams queued per stream before backpressure, 0 for the default",
 		},
 		cli.IntFlag{
 			Name:  "autoexpire",
@@ -245,6 +265,9 @@ func main() {
 		config.Crypt = c.String("crypt")
 		config.Mode = c.String("mode")
 		config.Conn = c.Int("conn")
+		config.TCP = c.Bool("tcp")
+		config.CarrierStreams = c.Int("carrierstreams")
+		config.CarrierQueueDepth = c.Int("carrierqueuedepth")
 		config.AutoExpire = c.Int("autoexpire")
 		config.ScavengeTTL = c.Int("scavengettl")
 		config.MTU = c.Int("mtu")
@@ -325,6 +348,10 @@ func main() {
 		log.Println("encryption:", config.Crypt)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 		log.Println("remote address:", config.RemoteAddr)
+		log.Println("tcp carrier:", config.TCP)
+		if config.TCP {
+			log.Println("carrier streams:", config.CarrierStreams, "queue depth:", config.CarrierQueueDepth)
+		}
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
 		log.Println("compression:", !config.NoComp)
 		log.Println("mtu:", config.MTU)
@@ -369,6 +396,14 @@ func main() {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
 		}
 
+		// Bound the carrier fan-out. The carrier trusts what it is handed, and
+		// each stream it opens costs a receive buffer up front on both ends, so
+		// a mistyped order of magnitude must fail loudly here rather than turn
+		// into memory growth and a burst of dials.
+		if config.CarrierStreams > maxCarrierStreams {
+			log.Fatal("carrierstreams must not exceed ", maxCarrierStreams, ", got ", config.CarrierStreams)
+		}
+
 		// Precompute smux configuration once; it is identical for every session.
 		smuxConfig, err := std.BuildSmuxConfig(
 			config.SmuxVer, config.SmuxBuf, config.StreamBuf,
@@ -386,6 +421,10 @@ func main() {
 		block, effectiveCrypt, err := std.SelectBlockCrypt(config.Crypt, pass)
 		checkError(err)
 		config.Crypt = effectiveCrypt
+
+		// The carrier authenticates its handshake with the same derived key, so
+		// the TCP transport is not weaker than the UDP one it replaces.
+		config.CarrierSecret = pass
 
 		// Continuously export SNMP counters when requested.
 		go std.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
@@ -501,7 +540,18 @@ func main() {
 // createConn establishes a fresh KCP connection with all tunables applied and
 // then upgrades it into an smux session ready for multiplexing.
 func createConn(config *Config, block kcp.BlockCrypt) (*smux.Session, error) {
-	kcpconn, err := dial(config, block)
+	var kcpconn *kcp.UDPSession
+	var err error
+
+	// The two transports differ only in how the KCP session is carried; every
+	// tunable and the smux hand-off below are shared. Keeping the construction
+	// in dial.go is what lets this function read as one flow, rather than a
+	// transport branch wrapped around an unrelated one.
+	if config.TCP {
+		kcpconn, err = dialCarrier(config, block)
+	} else {
+		kcpconn, err = dial(config, block)
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "dial()")
 	}

@@ -1,5 +1,9 @@
 {
         "listen": ":29900-29999",
+        "tcp": false,
+        "carriermaxstreams": 0,
+        "carriermaxstreamstotal": 0,
+        "carrierqueuedepth": 0,
         "target": "127.0.0.1:2000",
         "key": "PASSWORD",
         "crypt": "aes-128",

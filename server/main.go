@@ -40,6 +40,7 @@ import (
 
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/kcptun/carrier"
 	"github.com/xtaci/kcptun/std"
 	"github.com/xtaci/smux"
 )
@@ -167,6 +168,25 @@ func main() {
 			Value: 4194304, // default socket buffer size in bytes
 			Usage: "per-socket buffer in bytes",
 		},
+		cli.BoolFlag{
+			Name:  "tcp",
+			Usage: "use the TCP carrier instead of UDP for the kcp transport",
+		},
+		cli.IntFlag{
+			Name:  "carriermaxstreams",
+			Value: 0,
+			Usage: "TCP carrier: max parallel TCP streams one peer may attach, 0 for the default",
+		},
+		cli.IntFlag{
+			Name:  "carriermaxstreamstotal",
+			Value: 0,
+			Usage: "TCP carrier: max parallel TCP streams all peers together, 0 for the default",
+		},
+		cli.IntFlag{
+			Name:  "carrierqueuedepth",
+			Value: 0,
+			Usage: "TCP carrier: datagrams queued per stream before backpressure, 0 for the default",
+		},
 		cli.IntFlag{
 			Name:  "smuxver",
 			Value: 2,
@@ -229,6 +249,10 @@ func main() {
 	myApp.Action = func(c *cli.Context) error {
 		config := Config{}
 		config.Listen = c.String("listen")
+		config.TCP = c.Bool("tcp")
+		config.CarrierMaxStreams = c.Int("carriermaxstreams")
+		config.CarrierMaxStreamsTotal = c.Int("carriermaxstreamstotal")
+		config.CarrierQueueDepth = c.Int("carrierqueuedepth")
 		config.Target = c.String("target")
 		config.Key = c.String("key")
 		config.Crypt = c.String("crypt")
@@ -288,6 +312,12 @@ func main() {
 		log.Println("version:", VERSION)
 		log.Println("smux version:", config.SmuxVer)
 		log.Println("listening on:", config.Listen)
+		log.Println("tcp carrier:", config.TCP)
+		if config.TCP {
+			log.Println("carrier max streams:", config.CarrierMaxStreams,
+				"total:", config.CarrierMaxStreamsTotal,
+				"queue depth:", config.CarrierQueueDepth)
+		}
 		log.Println("target:", config.Target)
 		log.Println("encryption:", config.Crypt)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
@@ -331,6 +361,10 @@ func main() {
 		checkError(err)
 		config.Crypt = effectiveCrypt
 
+		// The carrier authenticates its handshake with the same derived key, so
+		// the TCP transport is not weaker than the UDP one it replaces.
+		config.CarrierSecret = pass
+
 		// Start the SNMP logger if the feature is enabled.
 		go std.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 
@@ -356,18 +390,65 @@ func main() {
 		// Create listeners for every port inside the configured range.
 		for port := mp.MinPort; port <= mp.MaxPort; port++ {
 			listenAddr := fmt.Sprintf("%v:%v", mp.Host, port)
-			// Always stand up the UDP listener; this is the default transport.
-			log.Printf("Listening on: %v/udp", listenAddr)
-			lis, err := kcp.ListenWithOptions(listenAddr, block, config.DataShard, config.ParityShard)
-			checkError(err)
+
+			var lis *kcp.Listener
+			if config.TCP {
+				log.Printf("Listening on: %v/tcp", listenAddr)
+				lis = listenCarrier(listenAddr, block, &config)
+			} else {
+				// Always stand up the UDP listener; this is the default transport.
+				log.Printf("Listening on: %v/udp", listenAddr)
+				lis = listenUDP(listenAddr, block, &config)
+			}
+
 			wg.Add(1)
 			go serveListener(lis, &config, &wg)
 		}
 
+		// The accept loops run until the process is signalled, so there is no
+		// shutdown step here: std/sigHandler exits the process on SIGTERM or
+		// SIGINT, and that is what releases every listener and its sockets.
 		wg.Wait()
 		return nil
 	}
 	myApp.Run(os.Args)
+}
+
+// listenUDP binds a UDP KCP listener on listenAddr.
+func listenUDP(listenAddr string, block kcp.BlockCrypt, config *Config) *kcp.Listener {
+	lis, err := kcp.ListenWithOptions(listenAddr, block, config.DataShard, config.ParityShard)
+	checkError(err)
+	return lis
+}
+
+// listenCarrier wraps a TCP carrier listener in a KCP listener.
+//
+// ServeConn is handed a connection it does not own, so closing the kcp.Listener
+// would not release the carrier's TCP streams. Nothing closes either of them:
+// the process terminates by signal, which is what reclaims the sockets and
+// goroutines. A future graceful shutdown would have to close the carrier
+// explicitly.
+func listenCarrier(listenAddr string, block kcp.BlockCrypt, config *Config) *kcp.Listener {
+	// QueueDepth is passed through as-is: the zero value makes the carrier apply
+	// its own default, the same one the client uses, so both ends of a session
+	// throttle at the same point. See createConn in the client for why this is
+	// deliberately not derived from --sndwnd.
+	//
+	// KeepAlive is passed explicitly so --keepalive reaches the carrier as it
+	// does in the client; leaving it unset would silently pin the server's TCP
+	// streams to the carrier's own default instead.
+	carrierLis, err := carrier.ListenWithConfig("tcp", listenAddr, carrier.Config{
+		Secret:          config.CarrierSecret,
+		MaxStreams:      config.CarrierMaxStreams,
+		MaxStreamsTotal: config.CarrierMaxStreamsTotal,
+		QueueDepth:      config.CarrierQueueDepth,
+		KeepAlive:       time.Duration(config.KeepAlive) * time.Second,
+	})
+	checkError(err)
+
+	lis, err := kcp.ServeConn(block, config.DataShard, config.ParityShard, carrierLis)
+	checkError(err)
+	return lis
 }
 
 // serveListener drains incoming KCP conversations from lis and dispatches each

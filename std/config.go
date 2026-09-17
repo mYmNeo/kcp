@@ -58,6 +58,17 @@ type BaseConfig struct {
 	Quiet        bool   `json:"quiet"`
 	Pprof        bool   `json:"pprof"`
 	CloseWait    int    `json:"closewait"`
+
+	// CarrierQueueDepth bounds how many datagrams may wait for transmission on
+	// one carrier stream before writes apply backpressure. It lives here, with
+	// the other shared KCP tunables, because it is a per-stream queue depth both
+	// ends should set to the same value: a mismatch does not break the protocol,
+	// but it does make the two ends apply backpressure at different points.
+	//
+	// The per-side carrier settings live in the binary that owns them instead.
+	// Note that ParseJSONConfig does not reject unknown fields, so a per-side key
+	// placed in the wrong config file is silently ignored rather than reported.
+	CarrierQueueDepth int `json:"carrierqueuedepth"`
 }
 
 // ModeParams contains the KCP parameters for different transmission modes.
