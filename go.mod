@@ -3,7 +3,7 @@ module github.com/xtaci/kcptun
 require (
 	github.com/fatih/color v1.18.0
 	github.com/miekg/dns v1.1.72
-	github.com/pierrec/lz4/v4 v4.1.27
+	github.com/pierrec/lz4/v4 v4.1.30
 	github.com/pkg/errors v0.9.1
 	github.com/urfave/cli v1.22.17
 	github.com/xtaci/kcp-go/v5 v5.0.0
