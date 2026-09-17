@@ -3,8 +3,6 @@
     "remoteaddr": "127.0.0.1:29900-29999",
     "key": "PASSWORD",
     "crypt": "aes-128",
-    "qpp":true,
-    "qpp-count":61,
     "mode": "fast3",
     "mtu": 1400,
     "ratelimit": 1048576,
@@ -25,6 +23,5 @@
     "streambuf": 2097152,
     "keepalive": 10,
     "autoexpire": 300,
-    "quiet": false,
-    "tcp": false
+    "quiet": false
 }

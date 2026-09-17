@@ -309,7 +309,6 @@ Each new kcptun UDP/KCP session uses one randomly selected port from the range; 
 **Notes:**
 - Valid ranges are `1–65535` with `min <= max`.
 - Single-port usage still works: `IP:29900` (no hyphen).
-- Works with `--tcp` mode as well; the remote port is still chosen from the range before initializing the connection.
 
 ### Rate Limit and Pacing
 
@@ -497,7 +496,6 @@ Sending a `SIGUSR1` signal to the KCP Client or KCP Server will dump SNMP inform
 A: The following parameters **MUST** be exactly the same on both client and server, otherwise the connection will fail:
 
 - `--key` and `--crypt`
-- `--QPP` and `--QPPCount`
 - `--nocomp`
 - `--smuxver`
 

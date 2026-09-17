@@ -11,15 +11,8 @@ import (
 	"sync"
 )
 
-// UDPEnabled is the toggle for UDP support
-var UDPEnabled = false
-
-// SOCKS request commands as defined in RFC 1928 section 4.
-const (
-	CmdConnect      = 1
-	CmdBind         = 2
-	CmdUDPAssociate = 3
-)
+// SOCKS request command as defined in RFC 1928 section 4.
+const CmdConnect = 1
 
 // SOCKS address types as defined in RFC 1928 section 5.
 const (
@@ -37,15 +30,8 @@ func (err Error) Error() string {
 
 // SOCKS errors as defined in RFC 1928 section 6.
 const (
-	ErrGeneralFailure       = Error(1)
-	ErrConnectionNotAllowed = Error(2)
-	ErrNetworkUnreachable   = Error(3)
-	ErrHostUnreachable      = Error(4)
-	ErrConnectionRefused    = Error(5)
-	ErrTTLExpired           = Error(6)
-	ErrCommandNotSupported  = Error(7)
-	ErrAddressNotSupported  = Error(8)
-	InfoUDPAssociate        = Error(9)
+	ErrCommandNotSupported = Error(7)
+	ErrAddressNotSupported = Error(8)
 )
 
 // MaxAddrLen is the maximum size of SOCKS address in bytes.
@@ -157,55 +143,9 @@ func SocksHandshake(rw io.ReadWriter) (net.Conn, error) {
 		_, _ = rw.Write(connectSuccessReply)
 		log.Println("Connected", "addr", addrStr)
 		return rc, nil
-
-	case CmdUDPAssociate:
-		if !UDPEnabled {
-			return nil, ErrCommandNotSupported
-		}
-
-		conn, ok := rw.(net.Conn)
-		if !ok {
-			return nil, errors.New("not a net.Conn")
-		}
-		tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr)
-		if !ok {
-			return nil, errors.New("local address is not a TCPAddr")
-		}
-
-		// Build reply directly: VER(5) REP(0) RSV(0) ATYP ADDR PORT
-		buf[0] = 5 // VER
-		buf[1] = 0 // REP
-		buf[2] = 0 // RSV
-		var replyLen int
-		ip := tcpAddr.IP.To4()
-		if ip != nil {
-			buf[3] = AtypIPv4
-			copy(buf[4:], ip)
-			replyLen = 3 + 1 + net.IPv4len + 2
-		} else {
-			ip = tcpAddr.IP.To16()
-			if ip == nil {
-				return nil, ErrAddressNotSupported
-			}
-			buf[3] = AtypIPv6
-			copy(buf[4:], ip)
-			replyLen = 3 + 1 + net.IPv6len + 2
-		}
-		buf[replyLen-2] = byte(tcpAddr.Port >> 8)
-		buf[replyLen-1] = byte(tcpAddr.Port)
-
-		if _, err = rw.Write(buf[:replyLen]); err != nil {
-			return nil, ErrCommandNotSupported
-		}
-		return nil, InfoUDPAssociate
-
 	default:
 		return nil, ErrCommandNotSupported
 	}
-}
-
-func SendSocksConnectRequest(rw io.ReadWriter, addr *net.TCPAddr) error {
-	return SendSocksConnectRequestHost(rw, addr.IP.String(), addr.Port)
 }
 
 func SendSocksConnectRequestHost(rw io.ReadWriter, host string, port int) error {

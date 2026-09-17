@@ -28,7 +28,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 
 	kcp "github.com/xtaci/kcp-go/v5"
@@ -38,21 +37,7 @@ func init() {
 	go sigHandler()
 }
 
-var (
-	exitHandlers []func()
-	userHandlers []func()
-)
-
-func RegisterExitHandler(handler func()) {
-	exitHandlers = append(exitHandlers, handler)
-}
-
-func RegisterUserHandler(handler func()) {
-	userHandlers = append(userHandlers, handler)
-}
-
 func sigHandler() {
-	var exitOnce sync.Once
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGUSR1, syscall.SIGTERM, syscall.SIGINT)
 	signal.Ignore(syscall.SIGPIPE)
@@ -62,19 +47,9 @@ func sigHandler() {
 		switch sig {
 		case syscall.SIGUSR1:
 			log.Printf("KCP SNMP:%+v", kcp.DefaultSnmp.Copy())
-			for _, handler := range userHandlers {
-				log.Println("Running user handler")
-				handler()
-			}
 		case syscall.SIGTERM, syscall.SIGINT:
-			exitOnce.Do(func() {
-				for _, handler := range exitHandlers {
-					log.Println("Running exit handler")
-					handler()
-				}
-				signal.Stop(ch)
-				os.Exit(0)
-			})
+			signal.Stop(ch)
+			os.Exit(0)
 		}
 	}
 }

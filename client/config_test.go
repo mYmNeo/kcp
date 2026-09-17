@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseJSONConfigSuccessClient(t *testing.T) {
-	path := writeTempClientConfig(t, `{"localaddr":"127.0.0.1:12948","remoteaddr":"2.2.2.2:4000","key":"secret","conn":2,"tcp":true,"closewait":9}`)
+	path := writeTempClientConfig(t, `{"localaddr":"127.0.0.1:12948","remoteaddr":"2.2.2.2:4000","key":"secret","conn":2,"closewait":9}`)
 
 	var cfg Config
 	if err := parseJSONConfig(&cfg, path); err != nil {

@@ -78,17 +78,14 @@ kill -USR1 $(pgrep server_linux_amd64)
   - `comp.go` — LZ4 compression wrapper with 64KB block size for low-latency bulk transfer
   - `smuxcfg.go` — SMUX configuration (v1/v2 selection, buffer sizes)
   - `snmp.go` — Periodic SNMP stats logging to file (`--snmplog`/`--snmpperiod`)
-  - `signal.go` — Signal handling (Unix only): SIGUSR1 dumps KCP SNMP stats, SIGTERM/SIGINT runs registered exit handlers
-  - `atexit.go` — Exit handler registration for graceful shutdown
-
-- **`dns/`** — Minimal config struct (`DNSConfig`) for local interface name binding, used by client.
+  - `signal.go` — Signal handling (Unix only): SIGUSR1 dumps KCP SNMP stats, SIGTERM/SIGINT terminates the process
 
 **Data flow:**
 ```
 App → Client (TCP :12948) → [KCP/UDP + SMUX over internet] → Server (UDP :29900) → Target service
 ```
 
-**Key dependencies:** `github.com/xtaci/kcp-go/v5` (KCP transport), `github.com/xtaci/smux` (stream multiplexing), `github.com/urfave/cli` (CLI framework), `golang.org/x/crypto` (PBKDF2 key derivation), `github.com/fatih/color` (colored console output), `github.com/jellydator/ttlcache/v3` (TTL cache for Linux conntrack).
+**Key dependencies:** `github.com/xtaci/kcp-go/v5` (KCP transport), `github.com/xtaci/smux` (stream multiplexing), `github.com/urfave/cli` (CLI framework), `golang.org/x/crypto` (PBKDF2 key derivation), `github.com/fatih/color` (colored console output).
 
 **FEC (Forward Error Correction):** `--datashard N` and `--parityshard M` configure Reed-Solomon erasure codes. N data packets + M parity packets sent together; up to M can be lost without retransmission. Default: 10/3.
 
@@ -96,7 +93,7 @@ App → Client (TCP :12948) → [KCP/UDP + SMUX over internet] → Server (UDP :
 ## Key Patterns
 
 - **Configuration**: CLI flags (`urfave/cli`) with optional JSON config file override (`-c config.json`). Both client and server embed `std.BaseConfig` for shared KCP/SMUX parameters.
-- **Platform-specific files**: Build-constrained files for conntrack (`contrack_darwin.go`, `contrack_linux.go`) and signal handling (`std/signal.go` is `//go:build linux || darwin || freebsd`). The Linux conntrack implementation uses `ttlcache` and netfilter to detect original destination of redirected TCP connections (SOCKS5 proxy mode). The Darwin variant is a no-op stub.
+- **Platform-specific files**: Build-constrained files for original-destination lookup (`client/origdst_linux.go` uses `SO_ORIGINAL_DST`; `client/origdst_stub.go` is the no-op fallback) and signal handling (`std/signal.go` is `//go:build linux || darwin || freebsd`). The Linux implementation detects the original destination of redirected TCP connections for transparent SOCKS5 proxying.
 - **Version injection**: Build-time linker flags set `main.VERSION` and `main.SALT`.
 - **Buffer pooling**: `sync.Pool` used in proxy.go and copy.go to reduce GC pressure.
 - **Lazy init**: `sync.Once` in `client/dial.go` for one-time multiport address parsing.

@@ -36,7 +36,6 @@ type Config struct {
 	AutoExpire     int          `json:"autoexpire"`
 	ScavengeTTL    int          `json:"scavengettl"`
 	UseConntrack   bool         `json:"conntrack"`
-	ProxyMode      int          `json:"proxy-mode"`
 	ShmMap         string       `json:"shmmap"`
 	SmuxConfig     *smux.Config `json:"-"` // precomputed smux configuration
 }

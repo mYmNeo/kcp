@@ -7,6 +7,6 @@ import (
 	"net"
 )
 
-func GetOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
+func GetOriginalDst(_ *net.TCPConn) (*net.TCPAddr, error) {
 	return nil, errors.New("GetOriginalDst: not implemented on this platform")
 }

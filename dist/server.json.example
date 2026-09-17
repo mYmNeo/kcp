@@ -3,8 +3,6 @@
         "target": "127.0.0.1:2000",
         "key": "PASSWORD",
         "crypt": "aes-128",
-        "qpp":true,
-        "qpp-count":61,
         "mode": "fast3",
         "mtu": 1400,
         "ratelimit": 104857600,
@@ -25,6 +23,5 @@
         "streambuf": 2097152,
         "keepalive": 10,
         "pprof":false,
-        "quiet":false,
-        "tcp":false
+        "quiet":false
 }

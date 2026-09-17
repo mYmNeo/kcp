@@ -537,12 +537,6 @@ func (s *Session) recvLoop() {
 	}
 }
 
-// KeepaliveCtrlTimeouts returns the number of NOP writes that failed under
-// shaper admission pressure (typically ErrTimeout). Diagnostic only.
-func KeepaliveCtrlTimeouts() uint64 { return atomic.LoadUint64(&keepaliveCtrlTimeouts) }
-
-var keepaliveCtrlTimeouts uint64
-
 // keepalive sends NOP frames periodically to keep the connection alive
 func (s *Session) keepalive() {
 	tickerPing := time.NewTicker(s.config.KeepAliveInterval)
@@ -554,10 +548,8 @@ func (s *Session) keepalive() {
 		case <-tickerPing.C:
 			// CLSCTRL is admission-capped; under saturation NOP may time out and
 			// the peer's KeepAliveTimeout can then tear down an otherwise healthy
-			// session. Count for observability; recvLoop still owns activity.
-			if _, err := s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL); err != nil && err != io.ErrClosedPipe {
-				atomic.AddUint64(&keepaliveCtrlTimeouts, 1)
-			}
+			// session. recvLoop still owns activity tracking.
+			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL)
 			s.notifyBucket() // force a wakeup signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.sessionIsActive, 1, 0) {
