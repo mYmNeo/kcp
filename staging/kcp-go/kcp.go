@@ -1128,9 +1128,23 @@ func (kcp *KCP) SetMtu(mtu int) int {
 		return -1
 	}
 
+	// Queued segments may still carry an old, larger MSS. Size the flush
+	// buffer for the biggest one so a shrink cannot panic or truncate them.
+	bufferSize := (mtu + IKCP_OVERHEAD) * 3
+	for segment := range kcp.snd_buf.ForEach {
+		if size := IKCP_OVERHEAD + len(segment.data); size > bufferSize {
+			bufferSize = size
+		}
+	}
+	for segment := range kcp.snd_queue.ForEach {
+		if size := IKCP_OVERHEAD + len(segment.data); size > bufferSize {
+			bufferSize = size
+		}
+	}
+
 	kcp.mtu = uint32(mtu)
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD
-	kcp.buffer = make([]byte, (mtu+IKCP_OVERHEAD)*3)
+	kcp.buffer = make([]byte, bufferSize)
 	// Keep acklist capacity hint aligned with MTU so append growth does not
 	// silently degrade after a runtime MTU change.
 	want := int(kcp.mtu / IKCP_OVERHEAD)
