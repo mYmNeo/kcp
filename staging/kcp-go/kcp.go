@@ -350,7 +350,8 @@ func (kcp *KCP) PeekSize() (length int) {
 		return -1
 	}
 
-	for seg := range kcp.rcv_queue.ForEach {
+	for ri := 0; ri < kcp.rcv_queue.Len(); ri++ {
+		seg := kcp.rcv_queue.At(ri)
 		length += len(seg.data)
 		if seg.frg == 0 {
 			break
@@ -393,7 +394,9 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		n += len(seg.data)
 		kcp.recycleSegment(&seg)
 		if seg.frg == 0 {
-			kcp.debugLog(IKCP_LOG_RECV, "stream", kcp.stream, "conv", kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
+			if kcpTrace {
+				kcp.debugLog(IKCP_LOG_RECV, "stream", kcp.stream, "conv", kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
+			}
 			break
 		}
 	}
@@ -431,12 +434,15 @@ func (kcp *KCP) Send(buffer []byte) int {
 		return -1
 	}
 
-	kcp.debugLog(IKCP_LOG_SEND, "stream", kcp.stream, "conv", kcp.conv, "datalen", len(buffer))
+	if kcpTrace {
+		kcp.debugLog(IKCP_LOG_SEND, "stream", kcp.stream, "conv", kcp.conv, "datalen", len(buffer))
+	}
 
 	// append to previous segment in streaming mode (if possible)
 	if kcp.stream != 0 {
 		if n := kcp.snd_queue.Len(); n > 0 {
-			for seg := range kcp.snd_queue.ForEachReverse {
+			for ri := kcp.snd_queue.Len() - 1; ri >= 0; ri-- {
+				seg := kcp.snd_queue.At(ri)
 				if len(seg.data) < int(kcp.mss) {
 					capacity := int(kcp.mss) - len(seg.data)
 					extend := min(len(buffer), capacity)
@@ -531,7 +537,8 @@ func (kcp *KCP) parse_ack(sn uint32) {
 		return
 	}
 
-	for seg := range kcp.snd_buf.ForEach {
+	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+		seg := kcp.snd_buf.At(ri)
 		if sn == seg.sn {
 			// mark and free space, but leave the segment here,
 			// and wait until `una` to delete this, then we don't
@@ -555,7 +562,8 @@ func (kcp *KCP) parse_fastack(sn, ts uint32) int {
 		return 0
 	}
 
-	for seg := range kcp.snd_buf.ForEach {
+	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+		seg := kcp.snd_buf.At(ri)
 		if _itimediff(sn, seg.sn) < 0 {
 			break
 		}
@@ -579,7 +587,8 @@ func (kcp *KCP) parse_fastack(sn, ts uint32) int {
 // (i.e., segments with sn < una). Returns the number of segments removed.
 func (kcp *KCP) parse_una(una uint32) int {
 	count := 0
-	for seg := range kcp.snd_buf.ForEach {
+	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+		seg := kcp.snd_buf.At(ri)
 		if _itimediff(una, seg.sn) > 0 {
 			kcp.recycleSegment(seg)
 			count++
@@ -659,7 +668,9 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			return -1
 		}
 
-		kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", len(data))
+		if kcpTrace {
+			kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", len(data))
+		}
 
 		if len(data) < int(length) {
 			return -2
@@ -681,7 +692,9 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 
 		switch cmd {
 		case IKCP_CMD_ACK:
-			kcp.debugLog(IKCP_LOG_IN_ACK, "conv", conv, "sn", sn, "una", una, "ts", ts, "rto", kcp.rx_rto)
+			if kcpTrace {
+				kcp.debugLog(IKCP_LOG_IN_ACK, "conv", conv, "sn", sn, "una", una, "ts", ts, "rto", kcp.rx_rto)
+			}
 			kcp.parse_ack(sn)
 			flushSegments |= kcp.parse_fastack(sn, ts)
 			updateRTT |= 1
@@ -701,14 +714,20 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			if pktType == IKCP_PACKET_REGULAR && repeat {
 				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
 			}
-			kcp.debugLog(IKCP_LOG_IN_PUSH, "conv", conv, "sn", sn, "una", una, "ts", ts, "packettype", pktType, "repeat", repeat)
+			if kcpTrace {
+				kcp.debugLog(IKCP_LOG_IN_PUSH, "conv", conv, "sn", sn, "una", una, "ts", ts, "packettype", pktType, "repeat", repeat)
+			}
 		case IKCP_CMD_WASK:
 			// ready to send back IKCP_CMD_WINS in Ikcp_flush
 			// tell remote my window size
 			kcp.probe |= IKCP_ASK_TELL
-			kcp.debugLog(IKCP_LOG_IN_WASK, "conv", conv, "wnd", wnd, "ts", ts)
+			if kcpTrace {
+				kcp.debugLog(IKCP_LOG_IN_WASK, "conv", conv, "wnd", wnd, "ts", ts)
+			}
 		case IKCP_CMD_WINS:
-			kcp.debugLog(IKCP_LOG_IN_WINS, "conv", conv, "wnd", wnd, "ts", ts)
+			if kcpTrace {
+				kcp.debugLog(IKCP_LOG_IN_WINS, "conv", conv, "wnd", wnd, "ts", ts)
+			}
 		default:
 			return -3
 		}
@@ -805,41 +824,18 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	buffer := kcp.buffer
 	ptr := buffer
 
-	// makeSpace makes room for writing
-	makeSpace := func(space int) {
-		size := len(buffer) - len(ptr)
-		if size+space > int(kcp.mtu) {
-			kcp.output(buffer, size)
-			ptr = buffer
-		}
-	}
-
-	// flush bytes in buffer if there is any
-	flushBuffer := func() {
-		size := len(buffer) - len(ptr)
-		if size > 0 {
-			kcp.output(buffer, size)
-		}
-	}
-
-	defer func() {
-		flushBuffer()
-		atomic.AddUint64(&DefaultSnmp.OutSegs, outSegs)
-		atomic.StoreUint64(&DefaultSnmp.RingBufferSndQueue, uint64(kcp.snd_queue.Len()))
-		atomic.StoreUint64(&DefaultSnmp.RingBufferRcvQueue, uint64(kcp.rcv_queue.Len()))
-		atomic.StoreUint64(&DefaultSnmp.RingBufferSndBuffer, uint64(kcp.snd_buf.Len()))
-	}()
-
 	// --- Phase 1: Flush pending ACKs ---
 	if flushType == IKCP_FLUSH_ACKONLY || flushType == IKCP_FLUSH_FULL {
 		for i, ack := range kcp.acklist {
 			// filter jitters caused by bufferbloat
 			if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
-				makeSpace(IKCP_OVERHEAD)
+				ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
 				seg.sn, seg.ts = ack.sn, ack.ts
 				ptr = seg.encode(ptr)
 				outSegs++
-				kcp.debugLog(IKCP_LOG_OUT_ACK, "conv", seg.conv, "sn", seg.sn, "una", seg.una, "ts", seg.ts)
+				if kcpTrace {
+					kcp.debugLog(IKCP_LOG_OUT_ACK, "conv", seg.conv, "sn", seg.sn, "una", seg.una, "ts", seg.ts)
+				}
 			}
 		}
 		kcp.acklist = kcp.acklist[0:0]
@@ -872,19 +868,23 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	// --- Phase 3: Flush window probing commands ---
 	if (kcp.probe & IKCP_ASK_SEND) != 0 {
 		seg.cmd = IKCP_CMD_WASK
-		makeSpace(IKCP_OVERHEAD)
+		ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
 		ptr = seg.encode(ptr)
 		outSegs++
-		kcp.debugLog(IKCP_LOG_OUT_WASK, "conv", seg.conv, "wnd", seg.wnd, "ts", seg.ts)
+		if kcpTrace {
+			kcp.debugLog(IKCP_LOG_OUT_WASK, "conv", seg.conv, "wnd", seg.wnd, "ts", seg.ts)
+		}
 	}
 
 	// flush window probing commands
 	if (kcp.probe & IKCP_ASK_TELL) != 0 {
 		seg.cmd = IKCP_CMD_WINS
-		makeSpace(IKCP_OVERHEAD)
+		ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
 		ptr = seg.encode(ptr)
 		outSegs++
-		kcp.debugLog(IKCP_LOG_OUT_WINS, "conv", seg.conv, "wnd", seg.wnd, "ts", seg.ts)
+		if kcpTrace {
+			kcp.debugLog(IKCP_LOG_OUT_WINS, "conv", seg.conv, "wnd", seg.wnd, "ts", seg.ts)
+		}
 	}
 
 	kcp.probe = 0
@@ -935,7 +935,8 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	nextUpdate = kcp.interval
 
 	if flushType == IKCP_FLUSH_FULL {
-		for segment := range kcp.snd_buf.ForEach {
+		for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+			segment := kcp.snd_buf.At(ri)
 			needsend := false
 			if segment.acked == 1 {
 				continue
@@ -977,13 +978,15 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				segment.una = seg.una
 
 				need := IKCP_OVERHEAD + len(segment.data)
-				makeSpace(need)
+				ptr = kcp.makeSpace(buffer, ptr, need)
 				ptr = segment.encode(ptr)
 				outSegs++
 				copy(ptr, segment.data)
 				ptr = ptr[len(segment.data):]
 
-				kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
+				if kcpTrace {
+					kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
+				}
 
 				if segment.xmit >= kcp.dead_link {
 					kcp.state = 0xFFFFFFFF // mark connection as dead
@@ -1038,7 +1041,24 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		}
 	}
 
+	if size := len(buffer) - len(ptr); size > 0 {
+		kcp.output(buffer, size)
+	}
+	atomic.AddUint64(&DefaultSnmp.OutSegs, outSegs)
+	atomic.StoreUint64(&DefaultSnmp.RingBufferSndQueue, uint64(kcp.snd_queue.Len()))
+	atomic.StoreUint64(&DefaultSnmp.RingBufferRcvQueue, uint64(kcp.rcv_queue.Len()))
+	atomic.StoreUint64(&DefaultSnmp.RingBufferSndBuffer, uint64(kcp.snd_buf.Len()))
 	return nextUpdate
+}
+
+// makeSpace sends the buffered bytes if space more would not fit in one MTU,
+// and returns where to write next. A method, as TinyGo heap-allocates closures.
+func (kcp *KCP) makeSpace(buffer, ptr []byte, space int) []byte {
+	if size := len(buffer) - len(ptr); size+space > int(kcp.mtu) {
+		kcp.output(buffer, size)
+		return buffer
+	}
+	return ptr
 }
 
 // (deprecated)
@@ -1101,7 +1121,8 @@ func (kcp *KCP) Check() uint32 {
 
 	tm_flush = _itimediff(ts_flush, current)
 
-	for seg := range kcp.snd_buf.ForEach {
+	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+		seg := kcp.snd_buf.At(ri)
 		diff := _itimediff(seg.resendts, current)
 		if diff <= 0 {
 			return current
