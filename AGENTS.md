@@ -113,7 +113,7 @@ Release scripts write `build/` (`VERSION=$(date -u +%Y%m%d)`, strip with `-s -w`
 
 | Script | Matrix | CGO | Notes |
 |---|---|---|---|
-| `./build.sh` | linux/amd64; linux,darwin/arm64 | 0 | Works. `-pgo=auto`. Random `-X main.SALT`. |
+| `./build.sh` | linux,darwin/amd64; linux,darwin/arm64 | 0 | Works. `-pgo=auto`. Random `-X main.SALT`. |
 | `./build-release.sh` | 15 OS/ARCH | 0 | Official path. **Needs `go mod vendor` first** (`-mod=vendor`, no `vendor/` in tree). Optional UPX. |
 | `./build-release-cgo.sh` | same 15 | 1 | External linker only — this repo has no `import "C"`. |
 
