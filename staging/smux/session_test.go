@@ -33,8 +33,10 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -224,7 +226,7 @@ func TestWriteTo(t *testing.T) {
 
 	var rcvbuf bytes.Buffer
 	nw, ew := stream.WriteTo(&rcvbuf)
-	if ew != io.EOF {
+	if ew != nil {
 		t.Fatal(ew)
 	}
 
@@ -299,7 +301,7 @@ func TestWriteToV2(t *testing.T) {
 
 	var rcvbuf bytes.Buffer
 	nw, ew := stream.WriteTo(&rcvbuf)
-	if ew != io.EOF {
+	if ew != nil {
 		t.Fatal(ew)
 	}
 
@@ -1483,5 +1485,158 @@ func TestSessionCloseChan(t *testing.T) {
 	case <-ch:
 	default:
 		t.Fatal("CloseChan should be closed")
+	}
+}
+
+// countingWriter counts the bytes written to it. Used by
+// TestAcceptStreamNoCloseFinalizer to observe how much of an accepted stream
+// io.Copy managed to drain.
+type countingWriter struct{ n int64 }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	atomic.AddInt64(&w.n, int64(len(p)))
+	return len(p), nil
+}
+
+// TestAcceptStreamNoCloseFinalizer is a regression test for #116. AcceptStream
+// must not register a runtime finalizer that closes the returned stream: the
+// canonical usage `stream, _ := session.AcceptStream(); go io.Copy(dst, stream)`
+// dispatches to WriteTo promoted from the embedded *stream, so the outer
+// *Stream wrapper is reachable only through io.Copy's (now dead) argument. If a
+// Close finalizer were set, GC would run it and close the stream mid-transfer,
+// silently dropping the rest of the data.
+func TestAcceptStreamNoCloseFinalizer(t *testing.T) {
+	const N = 1 << 20
+
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cw := &countingWriter{}
+	serverReady := make(chan struct{})
+	testDone := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		session, err := Server(conn, nil)
+		if err != nil {
+			return
+		}
+		defer session.Close()
+		stream, err := session.AcceptStream()
+		if err != nil {
+			return
+		}
+		// Bare `go` so neither this goroutine nor a result-capturing closure
+		// retains the wrapper; io.Copy holds it only in its src argument, which
+		// is dead once WriteTo runs.
+		go io.Copy(cw, stream)
+		stream = nil
+		close(serverReady)
+		<-testDone // keep the session (and thus the stream) alive
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client, err := Client(conn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	cs, err := client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-serverReady
+
+	// Repeatedly force GC so that any finalizer runs while the copy is in flight.
+	gcDone := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-gcDone:
+				return
+			default:
+				runtime.GC()
+				runtime.Gosched()
+			}
+		}
+	}()
+	defer close(gcDone)
+	defer close(testDone)
+
+	go func() {
+		cs.Write(make([]byte, N))
+		cs.Close()
+	}()
+
+	deadline := time.After(30 * time.Second)
+	for atomic.LoadInt64(&cw.n) < N {
+		select {
+		case <-deadline:
+			t.Fatalf("server drained only %d of %d bytes from the accepted stream; "+
+				"the AcceptStream finalizer closed it mid-transfer (#116)", atomic.LoadInt64(&cw.n), N)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// synHoldConn holds the result of the SYN write until release is closed,
+// as if the OpenStream goroutine were descheduled right after sending SYN.
+type synHoldConn struct {
+	net.Conn
+	release <-chan struct{}
+}
+
+func (c *synHoldConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if len(b) >= headerSize && b[1] == cmdSYN {
+		<-c.release
+	}
+	return n, err
+}
+
+func TestOpenStreamReceivesDataSentRightAfterAccept(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			config := DefaultConfig()
+			config.Version = version
+			p1, p2 := net.Pipe()
+			release := make(chan struct{})
+			s, _ := Server(p1, config)
+			c, _ := Client(&synHoldConn{Conn: p2, release: release}, config)
+			defer s.Close()
+			defer c.Close()
+
+			go func() {
+				defer close(release)
+				st, err := s.AcceptStream()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				// net.Pipe is synchronous: once the FIN write returns, the
+				// client's recvLoop has already handled the PSH frame.
+				st.Write([]byte("hello"))
+				st.Close()
+			}()
+
+			cs, err := c.OpenStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cs.SetReadDeadline(time.Now().Add(2 * time.Second))
+			got, err := io.ReadAll(cs)
+			if err != nil || string(got) != "hello" {
+				t.Fatalf("got %q, %v; want \"hello\", nil", got, err)
+			}
+		})
 	}
 }

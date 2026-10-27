@@ -29,7 +29,7 @@ Commands (`frame.go:31-39`): `cmdSYN=0` (open), `cmdFIN=1` (close/EOF), `cmdPSH=
 
 `Client(conn, cfg)` / `Server(conn, cfg)` (`mux.go`) → `newSession` (`session.go`) spawns four goroutines:
 
-- **`recvLoop`** (`session.go`) — reads frames from `conn` under token-bucket control (`bucket int32`); dispatches by CMD: `SYN` → register stream, push to `chAccepts`; `PSH` → `stream.pushBytes` + wake reader; `FIN` → `stream.fin()`; `UPD` (v2) → `stream.update(consumed, window)` + wake writer; `NOP` → keepalive ack. On any read/protocol error it closes the session so `shaperLoop`/`sendLoop`/`keepalive` are reaped.
+- **`recvLoop`** (`session.go`) — reads frames from `conn` under token-bucket control (`bucket int32`); dispatches by CMD: `SYN` → register stream and push to `chAccepts` unless the session is already closed (a SYN that loses the race with `Close` is drained from `chAccepts`); `PSH` → `stream.pushBytes` + wake reader; `FIN` → `stream.fin()`; `UPD` (v2) → `stream.update(consumed, window)` + wake writer; `NOP` → keepalive ack. On any read/protocol error it closes the session so `shaperLoop`/`sendLoop`/`keepalive` are reaped.
 - **`keepalive`** (`session.go`) — sends `NOP` on `KeepAliveInterval`; closes session on `KeepAliveTimeout`.
 - **`shaperLoop`** (`session.go`) — drains `shaper`/`shaperCtrl` into a fair round-robin `shaperQueue`; CLSCTRL is preferred but both classes are admission-capped (`maxShaperSize` / `maxCtrlShaperSize`). Channels are nil'd at cap so Push never overshoots. Exits when `s.die` closes and signals via `shaperLoopDone`.
 - **`sendLoop`** (`session.go`) — pops from `shaperQueue` and writes to `conn`.
@@ -41,7 +41,15 @@ Commands (`frame.go:31-39`): `cmdSYN=0` (open), `cmdFIN=1` (close/EOF), `cmdPSH=
 ### Flow control
 
 - **v1**: token bucket on the receive side only (`bucket` int32, `bucketNotify` chan). `Stream.returnTokens` feeds tokens back to the session after reads.
-- **v2**: adds a per-stream sliding window. Each stream tracks `peerConsumed` / `peerWindow` (init 256 KB); `sendWindowUpdate` (`stream.go:411-428`) emits `cmdUPD` once `incr` crosses `windowUpdateThreshold` (MaxStreamBuffer/2).
+- **v2**: adds a per-stream sliding window. Each stream tracks `peerConsumed` / `peerWindow` (init 256 KB); `sendWindowUpdate` (`stream.go`) emits `cmdUPD` once `incr` crosses `windowUpdateThreshold` (MaxStreamBuffer/2).
+
+### Close, accept, and half-close
+
+- `OpenStream` inserts the stream into `streams` before writing SYN. If that write fails, or the session dies before the stream is returned, `streamClosed` removes it. Data the peer sends immediately after accept is not dropped as an unknown stream.
+- `AcceptStream` does not install a `Close` finalizer. `io.Copy` promotes `WriteTo` from the embedded `*stream`, so the outer `*Stream` can become unreachable during the copy; a finalizer would close the stream and drop the rest of the bytes.
+- `Session.Close` force-closes every stream, returns unread payload to the token bucket, deletes the stream map, closes the connection, and drains `chAccepts`.
+- Half-close (`CloseWrite` on both sides) closes `die` immediately but leaves the stream registered until `bufferRing` is empty, so bytes queued before FIN stay readable. A later `Close` sets `forcedClose` and discards that remainder. `WriteTo` returns `io.ErrShortWrite` when the destination writes fewer bytes than it was offered, and still runs half-close cleanup.
+- An empty `bufferRing` larger than `defaultBufferRingCapacity` (8) shrinks back to that capacity.
 
 ## Key Directories
 
@@ -66,7 +74,7 @@ The `.travis.yml` matrix targets Go `1.9.x`–`1.11.x` and runs the coverage com
 
 - **Concurrency is the central concern.** Every mutable struct is guarded explicitly. When adding a field to `Session` or `stream`, decide its synchronization owner first.
   - `Session`: `nextStreamIDLock` guards `nextStreamID`; `streamLock` guards the `streams` map; `bucket`/`closed`/`goAway`/`sessionIsActive` are `atomic` int32; `die` chan + `dieOnce` for lifecycle; `chAccepts`, `shaper`, `chShaperPending/Consumed`, `bucketNotify`, and the per-error `ch*Error` chans drive the goroutines (`session.go:93-134`).
-  - `stream`: `bufferLock` guards `bufferRing`; `die`+`dieOnce`, `chFinEvent`+`finEventOnce`, `chWriteClosed`+`writeClosedOnce` for half-close lifecycle; `readDeadline`/`writeDeadline` are `atomic.Value`; `chReaderWakeup`/`chWriterWakeup`/`chUpdate` chans for blocking read/write coordination (`stream.go:40-79`).
+  - `stream`: `bufferLock` guards `bufferRing`; `die`+`dieOnce` and atomic `forcedClose` (set by `Close` and `sessionClose`); `chFinEvent`+`finEventOnce`, `chWriteClosed`+`writeClosedOnce` for half-close lifecycle; `readDeadline`/`writeDeadline` are `atomic.Value`; `chReaderWakeup`/`chWriterWakeup`/`chUpdate` chans for blocking read/write coordination (`stream.go`).
 - **Channel-as-signal, not channel-as-queue.** Wakeup chans are `chan struct{}` closed or sent-to once to signal; `sync.Once` guarantees single close. `chAccepts` (`chan *stream`) is the only buffered-value channel.
 - **Error propagation** uses `atomic.Value` to store the first error + a `chan struct{}` + `sync.Once` to notify once (socket read/write errors, proto error). Sentinel errors: `ErrInvalidProtocol`, `ErrConsumed`, `ErrGoAway`, `ErrTimeout` (implements `net.Error`), `ErrWouldBlock` (`session.go:71-75`).
 - **v1/v2 split** is pervasive: `tryReadV1`/`tryReadV2`, `writeV1`/`writeV2`, `writeToV1`/`writeToV2`. Touching read/write logic means touching both paths unless the change is version-agnostic.
