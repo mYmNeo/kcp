@@ -220,6 +220,9 @@ func (s *stream) Read(b []byte) (n int, err error) {
 				return n, err
 			}
 			if ew := s.waitRead(); ew != nil {
+				if ew == io.ErrClosedPipe && s.isNormalHalfClosed() {
+					continue
+				}
 				return 0, ew
 			}
 		}
@@ -231,6 +234,9 @@ func (s *stream) Read(b []byte) (n int, err error) {
 			return n, err
 		}
 		if ew := s.waitRead(); ew != nil {
+			if ew == io.ErrClosedPipe && s.isNormalHalfClosed() {
+				continue
+			}
 			return 0, ew
 		}
 	}
@@ -265,6 +271,9 @@ func (s *stream) tryReadV1(b []byte) (n int, err error) {
 	// only when there's no data left in buffer, we return EOF to reader.
 	select {
 	case <-s.die:
+		if s.isForcedClosed() {
+			return 0, io.ErrClosedPipe
+		}
 		return 0, io.EOF
 	default:
 		return 0, ErrWouldBlock
@@ -321,6 +330,9 @@ func (s *stream) tryReadV2(b []byte) (n int, err error) {
 
 	select {
 	case <-s.die:
+		if s.isForcedClosed() {
+			return 0, io.ErrClosedPipe
+		}
 		return 0, io.EOF
 	default:
 		return 0, ErrWouldBlock
@@ -381,8 +393,8 @@ func (s *stream) writeToV1(w io.Writer) (n int64, err error) {
 				}
 				return n, nil
 			}
-			if ew == io.ErrClosedPipe && s.halfCloseComplete() {
-				return n, nil
+			if ew == io.ErrClosedPipe && s.isNormalHalfClosed() {
+				continue
 			}
 			return n, ew
 		}
@@ -457,8 +469,8 @@ func (s *stream) writeToV2(w io.Writer) (n int64, err error) {
 				}
 				return n, nil
 			}
-			if ew == io.ErrClosedPipe && s.halfCloseComplete() {
-				return n, nil
+			if ew == io.ErrClosedPipe && s.isNormalHalfClosed() {
+				continue
 			}
 			return n, ew
 		}
@@ -512,6 +524,15 @@ func (s *stream) waitRead() error {
 	case <-deadline:
 		return ErrTimeout
 	case <-s.die:
+		if s.isNormalHalfClosed() {
+			s.bufferLock.Lock()
+			drained := s.bufferRing.len() == 0
+			s.bufferLock.Unlock()
+			if drained {
+				return io.EOF
+			}
+			return nil
+		}
 		return io.ErrClosedPipe
 	}
 }
@@ -948,7 +969,7 @@ func (s *stream) tryHalfCloseCleanup() {
 	}
 }
 
-func (s *stream) halfCloseComplete() bool {
+func (s *stream) isNormalHalfClosed() bool {
 	if s.isForcedClosed() {
 		return false
 	}
@@ -965,10 +986,7 @@ func (s *stream) halfCloseComplete() bool {
 		return false
 	}
 
-	s.bufferLock.Lock()
-	drained := s.bufferRing.len() == 0
-	s.bufferLock.Unlock()
-	return drained && !s.isForcedClosed()
+	return true
 }
 
 func (s *stream) isForcedClosed() bool {

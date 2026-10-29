@@ -31,7 +31,7 @@ Commands (`frame.go:31-39`): `cmdSYN=0` (open), `cmdFIN=1` (close/EOF), `cmdPSH=
 
 - **`recvLoop`** (`session.go`) — reads frames from `conn` under token-bucket control (`bucket int32`); dispatches by CMD: `SYN` → register stream and push to `chAccepts` unless the session is already closed (a SYN that loses the race with `Close` is drained from `chAccepts`); `PSH` → `stream.pushBytes` + wake reader; `FIN` → `stream.fin()`; `UPD` (v2) → `stream.update(consumed, window)` + wake writer; `NOP` → keepalive ack. On any read/protocol error it closes the session so `shaperLoop`/`sendLoop`/`keepalive` are reaped.
 - **`keepalive`** (`session.go`) — sends `NOP` on `KeepAliveInterval`; closes session on `KeepAliveTimeout`.
-- **`shaperLoop`** (`session.go`) — drains `shaper`/`shaperCtrl` into a fair round-robin `shaperQueue`; CLSCTRL is preferred but both classes are admission-capped (`maxShaperSize` / `maxCtrlShaperSize`). Channels are nil'd at cap so Push never overshoots. Exits when `s.die` closes and signals via `shaperLoopDone`.
+- **`shaperLoop`** (`session.go`) — drains `shaper`/`shaperCtrl` into a fair round-robin `shaperQueue`; CLSCTRL is preferred but both classes are admission-capped (`maxShaperSize` / `maxCtrlShaperSize`). Channels are nil'd at cap so Push never overshoots. Exits when `s.die` closes or a socket write error occurs, completes all pending requests via `discardPendingWrites` (under `writeReqLock`, which fences new admissions), and signals via `shaperLoopDone`.
 - **`sendLoop`** (`session.go`) — pops from `shaperQueue` and writes to `conn`.
 
 ### Write path

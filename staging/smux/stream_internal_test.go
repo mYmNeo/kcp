@@ -80,6 +80,20 @@ func TestStreamWriteToReturnsForcedClose(t *testing.T) {
 	}
 }
 
+func TestStreamReadReturnsForcedClose(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			s := newUnitTestStream()
+			s.sess.config.Version = version
+			s.sessionClose()
+
+			if _, err := s.Read(make([]byte, 1)); err != io.ErrClosedPipe {
+				t.Fatalf("Read error = %v; want %v", err, io.ErrClosedPipe)
+			}
+		})
+	}
+}
+
 func TestSessionCloseRecyclesStreamBuffers(t *testing.T) {
 	s := newUnitTestStream()
 	conn, peer := net.Pipe()
@@ -113,6 +127,333 @@ func TestSessionCloseRecyclesStreamBuffers(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&s.sess.bucket); got != int32(s.sess.config.MaxReceiveBuffer) {
 		t.Fatalf("receive bucket = %d; want %d", got, s.sess.config.MaxReceiveBuffer)
+	}
+}
+
+func TestSessionCloseDrainsPendingWriteRequests(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	conn, peer := net.Pipe()
+	defer peer.Close()
+
+	sess := newSession(cfg, conn, true)
+	for i := 0; i < 32; i++ {
+		frame := newFrame(byte(cfg.Version), cmdPSH, 1)
+		frame.data = make([]byte, cfg.MaxFrameSize)
+		sess.shaper <- writeRequest{
+			class:  CLSDATA,
+			frame:  frame,
+			result: make(chan writeResult, 1),
+		}
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatal("session close failed:", err)
+	}
+	if got := len(sess.shaper); got != 0 {
+		t.Fatalf("session close left %d requests in shaper channel", got)
+	}
+	if got := sess.sq.Len(); got != 0 {
+		t.Fatalf("session close left %d requests in shaper queue", got)
+	}
+}
+
+type delayedWriteErrorConn struct {
+	net.Conn
+	started chan struct{}
+	release <-chan struct{}
+	err     error
+}
+
+func (c *delayedWriteErrorConn) Write([]byte) (int, error) {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	<-c.release
+	return 0, c.err
+}
+
+type shortWriteConn struct {
+	net.Conn
+	writeN int
+}
+
+func (c *shortWriteConn) Write(p []byte) (int, error) {
+	if c.writeN < 0 {
+		return 0, nil
+	}
+	if c.writeN > len(p) {
+		return len(p), nil
+	}
+	return c.writeN, nil
+}
+
+type shortWriteBuffersConn struct {
+	net.Conn
+	writeN     int
+	writeErr   error
+	writeCalls int32
+}
+
+func (c *shortWriteBuffersConn) WriteBuffers(v [][]byte) (int, error) {
+	atomic.AddInt32(&c.writeCalls, 1)
+	total := 0
+	for _, b := range v {
+		total += len(b)
+	}
+	if c.writeN > total {
+		return total, c.writeErr
+	}
+	if c.writeN < 0 {
+		return 0, c.writeErr
+	}
+	return c.writeN, c.writeErr
+}
+
+func TestSocketWriteErrorDrainsPendingWriteRequests(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	conn, peer := net.Pipe()
+	defer peer.Close()
+
+	writeErr := errors.New("write failed")
+	release := make(chan struct{})
+	wrapped := &delayedWriteErrorConn{
+		Conn:    conn,
+		started: make(chan struct{}, 1),
+		release: release,
+		err:     writeErr,
+	}
+	sess := newSession(cfg, wrapped, true)
+	sess.shaper <- writeRequest{
+		frame:  newFrame(byte(cfg.Version), cmdPSH, 1),
+		result: make(chan writeResult, 1),
+	}
+	select {
+	case <-wrapped.started:
+	case <-time.After(time.Second):
+		t.Fatal("sendLoop did not start writing")
+	}
+
+	for i := 0; i < 32; i++ {
+		frame := newFrame(byte(cfg.Version), cmdPSH, 1)
+		frame.data = make([]byte, cfg.MaxFrameSize)
+		sess.shaper <- writeRequest{
+			class:  CLSDATA,
+			frame:  frame,
+			result: make(chan writeResult, 1),
+		}
+	}
+	close(release)
+
+	select {
+	case <-sess.shaperLoopDone:
+	case <-time.After(time.Second):
+		t.Fatal("shaperLoop did not stop after the socket write error")
+	}
+	if got := len(sess.shaper); got != 0 {
+		t.Fatalf("socket write error left %d requests in shaper channel", got)
+	}
+	if got := sess.sq.Len(); got != 0 {
+		t.Fatalf("socket write error left %d requests in shaper queue", got)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatal("session close failed:", err)
+	}
+}
+
+func TestWriteFrameInternalShortWriteReturnsError(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	conn, peer := net.Pipe()
+	defer peer.Close()
+
+	wrapped := &shortWriteConn{Conn: conn, writeN: headerSize + 1}
+	sess := newSession(cfg, wrapped, true)
+	defer sess.Close()
+
+	frame := newFrame(byte(cfg.Version), cmdPSH, 1)
+	frame.data = []byte("payload")
+	n, err := sess.writeFrameInternal(frame, nil, CLSDATA)
+	if err != io.ErrShortWrite {
+		t.Fatalf("writeFrameInternal error = %v; want %v", err, io.ErrShortWrite)
+	}
+	if n < 0 || n > len(frame.data) {
+		t.Fatalf("writeFrameInternal n = %d; want within [0,%d]", n, len(frame.data))
+	}
+
+	select {
+	case <-sess.chSocketWriteError:
+	case <-time.After(time.Second):
+		t.Fatal("short write did not notify socket write error")
+	}
+}
+
+func TestWriteFrameInternalShortWriteFromWriteBuffersReturnsError(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	conn, peer := net.Pipe()
+	defer peer.Close()
+
+	wrapped := &shortWriteBuffersConn{
+		Conn:   conn,
+		writeN: headerSize + 1, // only one payload byte reported written
+	}
+	sess := newSession(cfg, wrapped, true)
+	defer sess.Close()
+
+	frame := newFrame(byte(cfg.Version), cmdPSH, 1)
+	frame.data = []byte("payload")
+	n, err := sess.writeFrameInternal(frame, nil, CLSDATA)
+	if err != io.ErrShortWrite {
+		t.Fatalf("writeFrameInternal error = %v; want %v", err, io.ErrShortWrite)
+	}
+	if n < 0 || n > len(frame.data) {
+		t.Fatalf("writeFrameInternal n = %d; want within [0,%d]", n, len(frame.data))
+	}
+	if calls := atomic.LoadInt32(&wrapped.writeCalls); calls == 0 {
+		t.Fatal("WriteBuffers was not used")
+	}
+
+	select {
+	case <-sess.chSocketWriteError:
+	case <-time.After(time.Second):
+		t.Fatal("short WriteBuffers did not notify socket write error")
+	}
+}
+
+func TestWriteFrameInternalWriteBuffersErrorPreserved(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeepAliveDisabled = true
+	conn, peer := net.Pipe()
+	defer peer.Close()
+
+	wantErr := errors.New("synthetic writebuffers failure")
+	wrapped := &shortWriteBuffersConn{
+		Conn:     conn,
+		writeN:   headerSize + 1,
+		writeErr: wantErr,
+	}
+	sess := newSession(cfg, wrapped, true)
+	defer sess.Close()
+
+	frame := newFrame(byte(cfg.Version), cmdPSH, 1)
+	frame.data = []byte("payload")
+	if _, err := sess.writeFrameInternal(frame, nil, CLSDATA); err != wantErr {
+		t.Fatalf("writeFrameInternal error = %v; want %v", err, wantErr)
+	}
+}
+
+func TestNotifyWriteErrorDoesNotWaitForWriteAdmissionLock(t *testing.T) {
+	sess := &Session{chSocketWriteError: make(chan struct{})}
+	sess.writeReqLock.Lock()
+	done := make(chan struct{})
+	writeErr := errors.New("write failed")
+	go func() {
+		sess.notifyWriteError(writeErr)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		sess.writeReqLock.Unlock()
+		t.Fatal("write error notification blocked on write admission lock")
+	}
+	sess.writeReqLock.Unlock()
+
+	select {
+	case <-sess.chSocketWriteError:
+	default:
+		t.Fatal("write error notification did not close the error channel")
+	}
+	if got := sess.socketWriteError.Load(); got != writeErr {
+		t.Fatalf("stored write error = %v; want %v", got, writeErr)
+	}
+}
+
+func TestDiscardPendingWritesSignalsWaitingWriters(t *testing.T) {
+	sess := &Session{
+		shaper: make(chan writeRequest, 2),
+		sq:     NewShaperQueue(),
+	}
+
+	reqInChannel := writeRequest{
+		frame:  newFrame(2, cmdPSH, 1),
+		result: make(chan writeResult, 1),
+	}
+	reqInQueue := writeRequest{
+		frame:  newFrame(2, cmdPSH, 2),
+		result: make(chan writeResult, 1),
+	}
+	sess.shaper <- reqInChannel
+	sess.sq.Push(reqInQueue)
+
+	wantErr := errors.New("synthetic write error")
+	sess.discardPendingWrites(wantErr)
+
+	select {
+	case res := <-reqInChannel.result:
+		if res.err != wantErr {
+			t.Fatalf("channel request error = %v; want %v", res.err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("channel request did not receive completion signal")
+	}
+
+	select {
+	case res := <-reqInQueue.result:
+		if res.err != wantErr {
+			t.Fatalf("queue request error = %v; want %v", res.err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queue request did not receive completion signal")
+	}
+}
+
+func TestWriteFrameInternalDoesNotTimeoutWhenPendingWriteDiscarded(t *testing.T) {
+	cfg := DefaultConfig()
+	sess := &Session{
+		config:             cfg,
+		shaper:             make(chan writeRequest, 1),
+		sq:                 NewShaperQueue(),
+		die:                make(chan struct{}),
+		chSocketReadError:  make(chan struct{}),
+		chSocketWriteError: make(chan struct{}),
+		chProtoError:       make(chan struct{}),
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer stopTimerDrain(deadline)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := sess.writeFrameInternal(newFrame(byte(cfg.Version), cmdPSH, 1), deadline.C, CLSDATA)
+		done <- err
+	}()
+
+	waitQueued := time.NewTimer(time.Second)
+	defer stopTimerDrain(waitQueued)
+	for len(sess.shaper) == 0 {
+		select {
+		case <-waitQueued.C:
+			t.Fatal("write request was not queued in time")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	wantErr := errors.New("drained while closing")
+	sess.discardPendingWrites(wantErr)
+
+	select {
+	case err := <-done:
+		if err != wantErr {
+			t.Fatalf("writeFrameInternal error = %v; want %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writeFrameInternal blocked after pending write was discarded")
 	}
 }
 
@@ -226,6 +567,31 @@ func TestStreamWaitReadFinWithBufferedData(t *testing.T) {
 	}
 	if !bytes.Equal(readBuf, []byte("abc")) {
 		t.Fatalf("read mismatch: %q", readBuf)
+	}
+}
+
+func TestStreamWaitReadHalfCloseWithBufferedData(t *testing.T) {
+	s := newUnitTestStream()
+	buf := []byte("abc")
+	s.pushBytes(&buf)
+
+	s.fin()
+	s.writeClosedOnce.Do(func() { close(s.chWriteClosed) })
+	s.tryHalfCloseCleanup()
+
+	if err := s.waitRead(); err != nil {
+		t.Fatalf("expected nil for buffered half-close stream, got %v", err)
+	}
+}
+
+func TestStreamWaitReadHalfCloseDrainedEOF(t *testing.T) {
+	s := newUnitTestStream()
+	s.fin()
+	s.writeClosedOnce.Do(func() { close(s.chWriteClosed) })
+	s.tryHalfCloseCleanup()
+
+	if err := s.waitRead(); err != io.EOF {
+		t.Fatalf("expected io.EOF for drained half-close stream, got %v", err)
 	}
 }
 

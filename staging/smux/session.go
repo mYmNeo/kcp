@@ -133,6 +133,7 @@ type Session struct {
 	acceptDeadline  atomic.Value // deadline for Accept()
 
 	requestID        uint32            // Monotonic increasing write request ID
+	writeReqLock     sync.RWMutex      // fences write request admission during shutdown
 	shaper           chan writeRequest // channel for CLSDATA write requests
 	shaperCtrl       chan writeRequest // channel for CLSCTRL (keepalive NOP, SYN, UPD); buffered, still subject to sq admission
 	sq               *shaperQueue
@@ -298,6 +299,10 @@ func (s *Session) Close() error {
 		return io.ErrClosedPipe
 	}
 
+	// Prevent requests from being enqueued after shaperLoop drains the queues.
+	s.writeReqLock.Lock()
+	s.writeReqLock.Unlock()
+
 	s.streamLock.Lock()
 	for k, stream := range s.streams {
 		stream.sessionClose()
@@ -308,6 +313,12 @@ func (s *Session) Close() error {
 	}
 	s.streamLock.Unlock()
 	err := s.conn.Close()
+	if s.shaperLoopDone != nil {
+		<-s.shaperLoopDone
+	}
+	// A request admission that raced with the shutdown signal may have won
+	// its select after shaperLoop's initial drain.
+	s.discardPendingWrites(io.ErrClosedPipe)
 	s.drainAccepts()
 	return err
 }
@@ -615,11 +626,26 @@ func (s *Session) keepalive() {
 func (s *Session) shaperLoop() {
 	chShaper := s.shaper
 	chCtrl := s.shaperCtrl
-	defer close(s.shaperLoopDone)
+	defer func() {
+		err := io.ErrClosedPipe
+		select {
+		case <-s.chSocketWriteError:
+			if writeErr, ok := s.socketWriteError.Load().(error); ok && writeErr != nil {
+				err = writeErr
+			}
+		default:
+		}
+		s.writeReqLock.Lock()
+		s.discardPendingWrites(err)
+		s.writeReqLock.Unlock()
+		close(s.shaperLoopDone)
+	}()
 
 	for {
 		select {
 		case <-s.die:
+			return
+		case <-s.chSocketWriteError:
 			return
 		case r := <-chCtrl:
 			s.sq.Push(r)
@@ -661,6 +687,45 @@ func (s *Session) shaperLoop() {
 			if s.sq.Len() < maxCtrlShaperSize {
 				chCtrl = s.shaperCtrl
 			}
+		}
+	}
+}
+
+// discardPendingWrites completes every request still waiting in the shaper
+// channels or queue with err, so writers never block on a stopped sendLoop.
+// The channel drain is bounded by a length snapshot: writers admitted through
+// writeFrameInternal are fenced by writeReqLock, so the snapshot covers every
+// legitimate request, and a concurrent refill cannot keep the drain spinning.
+func (s *Session) discardPendingWrites(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	for n := len(s.shaperCtrl) + len(s.shaper); n > 0; n-- {
+		var req writeRequest
+		select {
+		case req = <-s.shaperCtrl:
+		case req = <-s.shaper:
+		default:
+			goto drainQueue
+		}
+		select {
+		case req.result <- writeResult{err: err}:
+		default:
+		}
+	}
+
+drainQueue:
+	if s.sq == nil {
+		return
+	}
+	for {
+		req, ok := s.sq.Pop()
+		if !ok {
+			return
+		}
+		select {
+		case req.result <- writeResult{err: err}:
+		default:
 		}
 	}
 }
@@ -728,6 +793,9 @@ EVENT_LOOP:
 					copy(buf[headerSize:], request.frame.data)
 					n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
 				}
+				if err == nil && n != headerSize+len(request.frame.data) {
+					err = io.ErrShortWrite
+				}
 
 				n -= headerSize
 				if n < 0 {
@@ -776,18 +844,35 @@ func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class C
 	if class == CLSCTRL {
 		targetCh = s.shaperCtrl
 	}
+	s.writeReqLock.RLock()
+	if s.IsClosed() {
+		s.writeReqLock.RUnlock()
+		resultChanPool.Put(resultCh)
+		return 0, io.ErrClosedPipe
+	}
+	select {
+	case <-s.chSocketWriteError:
+		s.writeReqLock.RUnlock()
+		resultChanPool.Put(resultCh)
+		return 0, s.socketWriteError.Load().(error)
+	default:
+	}
 	select {
 	case targetCh <- req:
 	case <-s.die:
+		s.writeReqLock.RUnlock()
 		resultChanPool.Put(resultCh)
 		return 0, io.ErrClosedPipe
 	case <-s.chSocketWriteError:
+		s.writeReqLock.RUnlock()
 		resultChanPool.Put(resultCh)
 		return 0, s.socketWriteError.Load().(error)
 	case <-deadline:
+		s.writeReqLock.RUnlock()
 		resultChanPool.Put(resultCh)
 		return 0, ErrTimeout
 	}
+	s.writeReqLock.RUnlock()
 
 	select {
 	case result := <-resultCh:
