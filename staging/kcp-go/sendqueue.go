@@ -22,7 +22,10 @@
 
 package kcp
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // sendQueue holds a session's packets waiting for post processing. It allocates
 // its slice on demand and retains at most sendQueueKeep slots after draining,
@@ -35,6 +38,7 @@ type sendQueue struct {
 	mu   sync.Mutex
 	q    []sendRequest
 	head int
+	n    atomic.Int32 // len(q)-head, so len() does not take mu
 }
 
 // push queues r, or reports false when devBacklog packets are already waiting.
@@ -50,6 +54,7 @@ func (sq *sendQueue) push(r sendRequest) bool {
 		sq.q, sq.head = sq.q[:n], 0
 	}
 	sq.q = append(sq.q, r)
+	sq.n.Add(1)
 	return true
 }
 
@@ -59,11 +64,13 @@ func (sq *sendQueue) pop() (sendRequest, bool) {
 	sq.mu.Lock()
 	defer sq.mu.Unlock()
 	if sq.head == len(sq.q) {
+		sq.n.Store(0)
 		return sendRequest{}, false
 	}
 	r := sq.q[sq.head]
 	sq.q[sq.head] = sendRequest{}
 	sq.head++
+	sq.n.Add(-1)
 	if sq.head == len(sq.q) {
 		sq.q, sq.head = sq.q[:0], 0
 		if cap(sq.q) > sendQueueKeep {
@@ -73,9 +80,7 @@ func (sq *sendQueue) pop() (sendRequest, bool) {
 	return r, true
 }
 
-// len returns the number of queued packets.
+// len returns the number of queued packets. It does not take the queue lock.
 func (sq *sendQueue) len() int {
-	sq.mu.Lock()
-	defer sq.mu.Unlock()
-	return len(sq.q) - sq.head
+	return int(sq.n.Load())
 }

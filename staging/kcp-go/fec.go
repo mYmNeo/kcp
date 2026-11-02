@@ -43,7 +43,6 @@ import (
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -430,7 +429,13 @@ func newFECEncoder(dataShards, parityShards, offset int) *fecEncoder {
 
 // encode encodes a packet and may output parity shards once enough data shards
 // have been collected. The contents of ps are overwritten on subsequent calls.
-func (enc *fecEncoder) encode(b []byte, rto uint32) (ps [][]byte) {
+func (enc *fecEncoder) encode(b []byte, rto uint32) [][]byte {
+	return enc.encodeAt(b, rto, int64(currentMs()))
+}
+
+// encodeAt is encode with the flush's millisecond clock. FEC only compares
+// deltas, so the caller can reuse a stamp it already took.
+func (enc *fecEncoder) encodeAt(b []byte, rto uint32, now int64) (ps [][]byte) {
 	// The header format:
 	// | FEC SEQID(4B) | FEC TYPE(2B) | SIZE (2B) | PAYLOAD(SIZE-2) |
 	// |<-headerOffset                |<-payloadOffset
@@ -449,7 +454,6 @@ func (enc *fecEncoder) encode(b []byte, rto uint32) (ps [][]byte) {
 	}
 
 	// Generate Reed-Solomon erasure codes once enough data shards are collected.
-	now := time.Now().UnixMilli()
 	if enc.shardCount == enc.dataShards {
 		// Generate parity shards once enough data shards are collected.
 		// Whether to generate parity depends on the interval between the

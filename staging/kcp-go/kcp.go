@@ -75,6 +75,11 @@ type FlushType int8
 const (
 	IKCP_FLUSH_ACKONLY FlushType = 1 << iota
 	IKCP_FLUSH_FULL
+	// IKCP_FLUSH_SEND emits ACKs and segments that have never been sent.
+	// It does not walk the whole send buffer for retransmit or the next
+	// update time; the periodic update flush does that. Write uses it so a
+	// data packet does not scan every in-flight segment.
+	IKCP_FLUSH_SEND
 )
 
 type KCPLogType int32
@@ -283,6 +288,14 @@ type KCP struct {
 
 	buffer []byte          // pre-allocated encoding buffer for flush()
 	output output_callback // callback to write data to the underlying transport
+	// segFree caches segment payloads so a steady send/ACK cycle does not
+	// take the global buffer pool. Its cap is the send window, not a fixed
+	// 256, and Close returns the entries to the pool. Callers of newSegment
+	// and recycleSegment already hold the session lock.
+	segFree [][]byte
+	// flushMs is the millisecond clock sampled for this flush. The output
+	// callback copies it onto each packet so FEC does not read the clock again.
+	flushMs int64
 
 	log logoutput_callback // trace log callback
 }
@@ -306,6 +319,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.mtu = IKCP_MTU_DEF
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD
 	kcp.buffer = make([]byte, (kcp.mtu+IKCP_OVERHEAD)*3)
+	kcp.segFree = make([][]byte, 0, IKCP_WND_SND)
 	kcp.rx_rto = IKCP_RTO_DEF
 	kcp.rx_minrto = IKCP_RTO_MIN
 	kcp.interval = IKCP_INTERVAL
@@ -323,16 +337,59 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 
 // newSegment creates a KCP segment
 func (kcp *KCP) newSegment(size int) (seg segment) {
+	n := len(kcp.segFree)
+	if n > 0 && size <= cap(kcp.segFree[n-1]) {
+		seg.data = kcp.segFree[n-1][:size]
+		kcp.segFree[n-1] = nil
+		kcp.segFree = kcp.segFree[:n-1]
+		return
+	}
 	seg.data = defaultBufferPool.Get()[:size]
 	return
 }
 
 // recycleSegment recycles a KCP segment
 func (kcp *KCP) recycleSegment(seg *segment) {
-	if seg.data != nil {
-		defaultBufferPool.Put(seg.data)
-		seg.data = nil
+	if seg.data == nil {
+		return
 	}
+	if cap(seg.data) == mtuLimit && len(kcp.segFree) < cap(kcp.segFree) {
+		kcp.segFree = append(kcp.segFree, seg.data[:cap(seg.data)])
+	} else {
+		defaultBufferPool.Put(seg.data)
+	}
+	seg.data = nil
+}
+
+// fitSegFree makes the payload cache the same size as the send window.
+// Extra buffers go back to the shared pool.
+func (kcp *KCP) fitSegFree() {
+	n := int(kcp.snd_wnd)
+	if n < 1 {
+		n = 1
+	}
+	if cap(kcp.segFree) == n {
+		return
+	}
+	if len(kcp.segFree) > n {
+		for _, b := range kcp.segFree[n:] {
+			defaultBufferPool.Put(b)
+		}
+		clear(kcp.segFree[n:])
+	}
+	kept := min(len(kcp.segFree), n)
+	next := make([][]byte, kept, n)
+	copy(next, kcp.segFree[:kept])
+	kcp.segFree = next
+}
+
+// releaseSegFree returns cached payloads to the shared pool. Later recycles
+// go straight to the pool because the cache cap is then zero.
+func (kcp *KCP) releaseSegFree() {
+	for _, b := range kcp.segFree {
+		defaultBufferPool.Put(b)
+	}
+	kcp.segFree = nil
 }
 
 // PeekSize checks the size of next message in the recv queue
@@ -795,6 +852,60 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 	return 0
 }
 
+// flushOneSend emits the single queued segment. It reports false, without
+// changing state, when the general flush is required.
+func (kcp *KCP) flushOneSend() bool {
+	if kcp.rmt_wnd == 0 || kcp.probe != 0 || kcp.snd_queue.Len() != 1 {
+		return false
+	}
+	// ACK-only flushes move queued segments into snd_buf and leave xmit at 0.
+	// Unsent segments are a suffix, so the general SEND flush must run when
+	// the newest in-flight segment has not been sent yet.
+	if n := kcp.snd_buf.Len(); n > 0 && kcp.snd_buf.At(n-1).xmit == 0 {
+		return false
+	}
+	cwnd := min(kcp.snd_wnd, kcp.rmt_wnd)
+	if kcp.nocwnd == 0 {
+		cwnd = min(kcp.cwnd, cwnd)
+	}
+	if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
+		return false
+	}
+	seg, ok := kcp.snd_queue.Pop()
+	if !ok {
+		return false
+	}
+	kcp.ts_probe = 0
+	kcp.probe_wait = 0
+	seg.conv = kcp.conv
+	seg.cmd = IKCP_CMD_PUSH
+	seg.sn = kcp.snd_nxt
+	kcp.snd_nxt++
+	kcp.snd_buf.Push(seg)
+	slot := kcp.snd_buf.At(kcp.snd_buf.Len() - 1)
+	current := currentMs()
+	kcp.flushMs = int64(current)
+	slot.xmit = 1
+	slot.ts = current
+	slot.rto = kcp.rx_rto
+	slot.resendts = current + slot.rto
+	slot.wnd = kcp.wnd_unused()
+	slot.una = kcp.rcv_nxt
+	if slot.xmit >= kcp.dead_link {
+		kcp.state = 0xFFFFFFFF
+	}
+	dst := slot.encode(kcp.buffer)
+	copy(dst, slot.data)
+	kcp.output(kcp.buffer, IKCP_OVERHEAD+len(slot.data))
+	if kcpTrace {
+		kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", slot.conv, "sn", slot.sn, "frg", slot.frg, "una", slot.una, "ts", slot.ts, "xmit", slot.xmit, "datalen", len(slot.data))
+	}
+	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
+	// Queue-length gauges are published by the periodic full flush. Storing
+	// them here bounced three shared counters on every data packet.
+	return true
+}
+
 func (kcp *KCP) wnd_unused() uint16 {
 	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
 		return uint16(int(kcp.rcv_wnd) - kcp.rcv_queue.Len())
@@ -814,6 +925,11 @@ func (kcp *KCP) wnd_unused() uint16 {
 //
 // Returns the suggested interval (ms) until the next flush call.
 func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
+	// A Write of one segment does not need the ACK, probe, or retransmit
+	// scans. Those stay on the periodic full flush.
+	if flushType == IKCP_FLUSH_SEND && kcp.flushOneSend() {
+		return kcp.interval
+	}
 	var outSegs uint64
 	var seg segment
 	seg.conv = kcp.conv
@@ -931,11 +1047,22 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	// retransmit timestamps slightly behind wall clock; that is intentional
 	// to avoid per-segment time.Now calls on the hot path.
 	current := currentMs()
+	kcp.flushMs = int64(current)
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	nextUpdate = kcp.interval
 
-	if flushType == IKCP_FLUSH_FULL {
-		for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+	if flushType == IKCP_FLUSH_FULL || flushType == IKCP_FLUSH_SEND {
+		// Unsent segments are a suffix: send buffer is in sn order and a
+		// segment is stamped xmit when it is first sent. SEND starts there
+		// instead of walking every in-flight segment.
+		start := 0
+		if flushType == IKCP_FLUSH_SEND {
+			start = kcp.snd_buf.Len()
+			for start > 0 && kcp.snd_buf.At(start-1).xmit == 0 {
+				start--
+			}
+		}
+		for ri := start; ri < kcp.snd_buf.Len(); ri++ {
 			segment := kcp.snd_buf.At(ri)
 			needsend := false
 			if segment.acked == 1 {
@@ -1212,6 +1339,7 @@ func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
 func (kcp *KCP) WndSize(sndwnd, rcvwnd int) int {
 	if sndwnd > 0 {
 		kcp.snd_wnd = uint32(sndwnd)
+		kcp.fitSegFree()
 	}
 	if rcvwnd > 0 {
 		kcp.rcv_wnd = uint32(rcvwnd)

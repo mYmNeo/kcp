@@ -110,6 +110,7 @@ func (timeoutError) Temporary() bool { return true }
 type sendRequest struct {
 	buffer []byte
 	oob    bool
+	ms     int64 // flush clock, 0 if the sender did not sample one
 }
 
 // OOB callback function
@@ -123,6 +124,11 @@ type (
 		kcp     *KCP           // KCP ARQ protocol
 		l       *Listener      // pointing to the Listener object if it's been accepted by a Listener
 		block   BlockCrypt     // block encryption object
+		// Per-session GCM nonce. A counter on the shared BlockCrypt bounces
+		// between the two peers, because kcptun uses one cipher for every
+		// session. The random prefix keeps those counters from colliding.
+		nonceHi uint32
+		nonceLo atomic.Uint64
 
 		updateFn func() // s.update, made once so rescheduling does not allocate
 
@@ -149,6 +155,8 @@ type (
 		// notifications
 		die          chan struct{} // notify current session has Closed
 		dieOnce      sync.Once
+		closing      atomic.Bool   // set before die is closed; Write checks this instead of select
+		writeFailed  atomic.Bool   // set after socketWriteError is stored
 		chReadEvent  chan struct{} // notify Read() can be called without blocking
 		chWriteEvent chan struct{} // notify Write() can be called without blocking
 
@@ -162,6 +170,10 @@ type (
 
 		// packets waiting to be sent on wire
 		postQueue sendQueue
+		// stageArr backs staging while Write flushes. Packets collected there
+		// skip postQueue; the writer transmits them after releasing mu.
+		stageArr  [8]sendRequest
+		staging   []sendRequest
 		ppRunning atomic.Bool // queued for or served by a postProcess worker
 		ppHeld    struct {    // a batch waiting for the rate limiter
 			w     *ppWorker
@@ -210,6 +222,14 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.ownConn = ownConn
 	sess.l = l
 	sess.block = block
+	if _, ok := block.(*aeadCrypt); ok {
+		var seed [12]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			panic(err)
+		}
+		sess.nonceHi = binary.BigEndian.Uint32(seed[:4])
+		sess.nonceLo.Store(binary.BigEndian.Uint64(seed[4:]))
+	}
 	sess.recvbuf = make([]byte, mtuLimit)
 	sess.initPlatform()
 
@@ -240,16 +260,25 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			// copy the data to a new buffer, and reserve header space
 			copy(bts[sess.headerSize:], buf)
 
-			// delivery to post processing (non-blocking to avoid deadlock under lock)
-			select {
-			case <-sess.die:
+			// Queue only. The caller transmits after releasing s.mu: Write does it
+			// inline, and the update and input paths hand the session to a worker.
+			// Kicking a worker from here would schedule that handoff while the
+			// KCP lock is still held.
+			if sess.closing.Load() {
 				defaultBufferPool.Put(bts)
 				return
-			default:
 			}
-			if sess.postQueue.push(sendRequest{bts, false}) {
-				sess.kickPostProcess()
-			} else {
+			// Write publishes staging for the duration of its flush so the
+			// packet it just built does not take the send-queue lock.
+			if sess.staging != nil {
+				if len(sess.staging) < devBacklog {
+					sess.staging = append(sess.staging, sendRequest{bts, false, sess.kcp.flushMs})
+					return
+				}
+				defaultBufferPool.Put(bts)
+				return
+			}
+			if !sess.postQueue.push(sendRequest{bts, false, sess.kcp.flushMs}) {
 				// drop and recycle to avoid blocking; KCP will retransmit if needed
 				defaultBufferPool.Put(bts)
 			}
@@ -336,13 +365,12 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 	// The deadline timer is armed only when the write has to wait.
 	var timeout *time.Timer
 	for {
-		// check for connection close and socket error
-		select {
-		case <-s.chSocketWriteError:
-			return 0, s.socketWriteError.Load().(error)
-		case <-s.die:
+		// Closed and write-failed are atomics so the fast path does not enter select.
+		if s.closing.Load() {
 			return 0, errors.WithStack(io.ErrClosedPipe)
-		default:
+		}
+		if s.writeFailed.Load() {
+			return 0, s.socketWriteError.Load().(error)
 		}
 
 		s.mu.Lock()
@@ -366,13 +394,28 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 			}
 
 			waitsnd = s.kcp.WaitSnd()
+			var lone sendRequest
+			var many []sendRequest
+			nStaged := 0
 			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
 				// put the packets on wire immediately if the inflight window is full
 				// or if write delay is disabled (no merging of outgoing bytes),
 				// so we do not have to wait for the periodic update to uncork.
-				s.kcp.flush(IKCP_FLUSH_FULL)
+				s.staging = s.stageArr[:0]
+				s.kcp.flush(IKCP_FLUSH_SEND)
+				nStaged = len(s.staging)
+				if nStaged == 1 {
+					lone = s.staging[0]
+				} else if nStaged > 1 {
+					many = make([]sendRequest, nStaged)
+					copy(many, s.staging)
+				}
+				s.staging = nil
 			}
 			s.mu.Unlock()
+			// FEC, encryption, and the socket write run here, on the writer,
+			// instead of after a worker wakeup.
+			s.dispatchStaged(nStaged, lone, many)
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
 			return n, nil
 		}
@@ -398,18 +441,14 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 }
 
 func (s *UDPSession) isClosed() bool {
-	select {
-	case <-s.die:
-		return true
-	default:
-		return false
-	}
+	return s.closing.Load()
 }
 
 // Close closes the connection.
 func (s *UDPSession) Close() error {
 	var once bool
 	s.dieOnce.Do(func() {
+		s.closing.Store(true)
 		close(s.die)
 		once = true
 	})
@@ -424,7 +463,9 @@ func (s *UDPSession) Close() error {
 	// try best to send all queued messages especially the data in txqueue
 	s.mu.Lock()
 	s.kcp.flush((IKCP_FLUSH_FULL))
+	s.kcp.releaseSegFree()
 	s.mu.Unlock()
+	s.dispatchPost()
 
 	if s.l != nil { // belongs to listener
 		s.l.closeSession(s.remote)
@@ -596,16 +637,14 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 }
 
 // SetRateLimit sets the session's rate limit in bytes per second. A value of 0
-// disables rate limiting.
+// disables rate limiting. The unlimited path stores no limiter: an infinite
+// limiter still takes its lock and allocates a reservation on every batch.
 func (s *UDPSession) SetRateLimit(bytesPerSecond uint32) {
-	var limiter *rate.Limiter
 	if bytesPerSecond == 0 {
-		limiter = rate.NewLimiter(rate.Inf, maxBatchSize*mtuLimit)
-	} else {
-		limiter = rate.NewLimiter(rate.Limit(bytesPerSecond), maxBatchSize*mtuLimit)
+		s.rateLimiter.Store((*rate.Limiter)(nil))
+		return
 	}
-
-	s.rateLimiter.Store(limiter)
+	s.rateLimiter.Store(rate.NewLimiter(rate.Limit(bytesPerSecond), maxBatchSize*mtuLimit))
 }
 
 // SetLogger configures the kcp trace logger
@@ -644,84 +683,7 @@ func (s *UDPSession) postProcess(w *ppWorker) bool {
 		if !ok {
 			return false
 		}
-		buf := req.buffer
-		oob := req.oob
-
-		var ecc [][]byte
-
-		// --- Stage 1: FEC encoding ---
-		if s.fecEncoder != nil {
-			if !oob {
-				ecc = s.fecEncoder.encode(buf, maxFECEncodeLatency)
-			} else {
-				s.fecEncoder.encodeOOB(buf)
-			}
-		}
-
-		// --- Stage 2: Encryption ---
-		// Two modes supported:
-		//   - AEAD (e.g. AES-GCM): nonce + authenticated ciphertext, no separate CRC
-		//   - CFB (legacy block ciphers): random nonce + CRC32 checksum + CFB encryption
-		switch block := s.block.(type) {
-		case nil:
-		case *aeadCrypt: // AEAD mode
-			nonceSize := block.NonceSize()
-
-			dst := buf[:nonceSize]
-			nonce := buf[:nonceSize]
-			plaintext := buf[nonceSize:]
-
-			fillRand(nonce)
-			buf = block.Seal(dst, nonce, plaintext, nil)
-
-			for k := range ecc {
-				dst := ecc[k][:nonceSize]
-				nonce := ecc[k][:nonceSize]
-				plaintext := ecc[k][nonceSize:]
-
-				fillRand(nonce)
-				ecc[k] = block.Seal(dst, nonce, plaintext, nil)
-			}
-		default: // Cipher Feedback (CFB) mode
-			fillRand(buf[:nonceSize])
-			checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
-			binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
-			block.Encrypt(buf, buf)
-
-			for k := range ecc {
-				fillRand(ecc[k][:nonceSize])
-				checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
-				binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
-				block.Encrypt(ecc[k], ecc[k])
-			}
-		}
-
-		// --- Stage 3: TX batching ---
-		var msg ipv4.Message
-		msg.Addr = s.remote
-
-		// original copy, move buf to txqueue directly
-		msg.Buffers = w.oneBuf(buf)
-		bytesToSend += len(buf)
-		w.txqueue = append(w.txqueue, msg)
-
-		// dup copies for testing if set
-		for i := 0; i < s.dup; i++ {
-			bts := defaultBufferPool.Get()[:len(buf)]
-			copy(bts, buf)
-			msg.Buffers = w.oneBuf(bts)
-			bytesToSend += len(bts)
-			w.txqueue = append(w.txqueue, msg)
-		}
-
-		// parity
-		for k := range ecc {
-			bts := defaultBufferPool.Get()[:len(ecc[k])]
-			copy(bts, ecc[k])
-			msg.Buffers = w.oneBuf(bts)
-			bytesToSend += len(bts)
-			w.txqueue = append(w.txqueue, msg)
-		}
+		bytesToSend += s.txAdd(w, req)
 
 		// transmit when postQueue is empty or we've reached max batch size
 		if s.postQueue.len() == 0 || len(w.txqueue) >= maxBatchSize {
@@ -749,6 +711,8 @@ func (s *UDPSession) update() {
 			s.notifyWriteEvent()
 		}
 		s.mu.Unlock()
+		// Timer shard stays free of FEC and encryption; a worker transmits.
+		s.kickPostProcess()
 		// self-synchronized timed scheduling
 		fn := s.updateFn
 		if fn == nil {
@@ -843,6 +807,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 
 	// lock the session during OOB packet construction
 	s.mu.Lock()
+	defer s.dispatchPost()
 	defer s.mu.Unlock()
 
 	// Packet layout: | conv (4B) | OOB payload |
@@ -862,6 +827,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 
 	// Enqueue the packet for post-processing.
 	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
+	// Transmission happens after the lock is released, via the deferred dispatch.
 	select {
 	case <-s.die:
 		// Session is closing.
@@ -869,9 +835,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 		return errors.WithStack(io.ErrClosedPipe)
 	default:
 	}
-	if s.postQueue.push(sendRequest{buf, true}) {
-		s.kickPostProcess()
-	} else {
+	if !s.postQueue.push(sendRequest{buf, true, 0}) {
 		// Drop silently to avoid blocking the sender.
 		// OOB delivery is best-effort by design.
 		defaultBufferPool.Put(buf)
@@ -905,6 +869,7 @@ func (s *UDPSession) notifyReadError(err error) {
 func (s *UDPSession) notifyWriteError(err error) {
 	s.socketWriteErrorOnce.Do(func() {
 		s.socketWriteError.Store(err)
+		s.writeFailed.Store(true)
 		close(s.chSocketWriteError)
 	})
 }
@@ -995,6 +960,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 
 		// lock
 		s.mu.Lock()
+		defer s.kickPostProcess()
 		defer s.mu.Unlock()
 
 		// if fecDecoder is not initialized, create one with default parameter
@@ -1054,6 +1020,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 		}
 	default: // packet without FEC
 		s.mu.Lock()
+		defer s.kickPostProcess()
 		defer s.mu.Unlock()
 
 		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
