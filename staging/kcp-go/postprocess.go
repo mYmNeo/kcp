@@ -1,3 +1,25 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package kcp
 
 import (
@@ -59,8 +81,8 @@ var ppWorkers = sync.Pool{New: func() any {
 func (s *UDPSession) flushTx(w *ppWorker, bytesToSend int) bool {
 	if limiter, ok := s.rateLimiter.Load().(*rate.Limiter); ok {
 		now := time.Now()
-		// A batch above the burst can never be allowed. WaitN failed on it
-		// and the batch was sent anyway, so it still is.
+		// A batch larger than the burst cannot be reserved, so it is sent
+		// immediately without rate limiting.
 		if r := limiter.ReserveN(now, bytesToSend); r.OK() {
 			if d := r.DelayFrom(now); d > 0 {
 				s.ppHeld.w, s.ppHeld.bytes, s.ppHeld.until = w, bytesToSend, now.Add(d)
@@ -75,7 +97,9 @@ func (s *UDPSession) flushTx(w *ppWorker, bytesToSend int) bool {
 func (s *UDPSession) sendTx(w *ppWorker, bytesToSend int) {
 	s.tx(w.txqueue)
 	if kcpTrace {
+		s.mu.Lock()
 		s.kcp.debugLog(IKCP_LOG_OUTPUT, "conv", s.kcp.conv, "datalen", bytesToSend)
+		s.mu.Unlock()
 	}
 	w.recycle()
 }
@@ -83,9 +107,18 @@ func (s *UDPSession) sendTx(w *ppWorker, bytesToSend int) {
 // kickPostProcess queues s for a worker unless it is already queued or being
 // served. Callers queue their packet first.
 func (s *UDPSession) kickPostProcess() {
-	if s.ppRunning.CompareAndSwap(false, true) {
+	if s.claimPostProcess() {
 		ppEnqueue(s)
 	}
+}
+
+func (s *UDPSession) claimPostProcess() bool {
+	return s.ppRunning.CompareAndSwap(false, true)
+}
+
+func (s *UDPSession) finishPostProcess() bool {
+	s.ppRunning.Store(false)
+	return s.postQueue.len() > 0 && s.claimPostProcess()
 }
 
 func ppEnqueue(s *UDPSession) {
@@ -149,8 +182,7 @@ func postProcessWorker() {
 			continue
 		}
 		// Hand back to kickPostProcess, unless a packet arrived meanwhile.
-		s.ppRunning.Store(false)
-		if len(s.chPostProcessing) > 0 && s.ppRunning.CompareAndSwap(false, true) {
+		if s.finishPostProcess() {
 			ppEnqueue(s)
 		}
 	}

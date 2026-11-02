@@ -16,7 +16,7 @@ The library is layered as three subsystems, all in `package kcp`:
 
 ### Data pipeline (documented in `sess.go:23-44`)
 
-**Write path**: `App → UDPSession.Write → KCP.Send → KCP.flush → output callback → chPostProcessing → postProcess goroutine → [FEC Encode] → [Encrypt/CRC32] → TxQueue → tx(txqueue) → net.PacketConn → UDP`
+**Write path**: `App → UDPSession.Write → KCP.Send → KCP.flush → output callback → postQueue → shared postProcess worker → [FEC Encode] → [Encrypt/CRC32] → TxQueue → tx(txqueue) → net.PacketConn → UDP`
 
 **Read path**: `UDP → readLoop goroutine → packetInput → [Decrypt] → [CRC32] → kcpInput → demux FEC type marker → [FEC Decode] / [OOB] → KCP.Input → UDPSession.Read → App`
 
@@ -33,19 +33,24 @@ Key methods: `NewKCP(conv, output_callback)`, `Send(buf)`, `Recv(buf)`, `Input(d
 
 `flush()` (`kcp.go:759-996`) is the core scheduler — 6 phases: flush ACKs, window probing, move snd_queue→snd_buf, retransmit (initial/fast/early/RTO), update SNMP/cwnd.
 
-### Session (`sess.go:121-176`)
+### Session (`sess.go:118-185`)
 
 `UDPSession` implements `net.Conn`. Key fields:
 - `conn net.PacketConn`, `kcp *KCP`, `block BlockCrypt` — the transport/protocol/crypto triad
 - `fecEncoder *fecEncoder`, `fecDecoder *fecDecoder` — forward error correction
-- `mu sync.Mutex` — guards KCP state (all `Read`/`Write`/`update` serialize on this)
+- `mu sync.Mutex` — guards KCP state (`Read`/`Write`/`update`, and any other path that touches `kcp`, serialize on this)
 - `chReadEvent`, `chWriteEvent` — wakeup channels for blocking Read/Write
-- `chPostProcessing chan sendRequest` — feeds the postProcess pipeline
+- `postQueue sendQueue` — packets waiting for a shared postProcess worker (`sendqueue.go`). The slice is allocated only while packets wait and keeps at most `sendQueueKeep` (64) slots after it drains. `push` fails once `devBacklog` packets are waiting; the caller drops the packet and recycles its buffer.
+- `ppRunning` — set while the session is queued for or served by a worker
 - `die`, `dieOnce`, `chSocketReadError`, `chSocketWriteError` — lifecycle/error signals
 - `rd`, `wd atomic.Value` — read/write deadlines
 - `ackNoDelay bool`, `writeDelay bool` — protocol tuning
 
-The `Listener` type (`sess.go:1129-1149`) demuxes incoming packets by remote address (`packetInput` → lookup or create session), enabling a single UDP socket to serve many connections.
+`postprocess.go` runs a fixed worker pool (`ppQueue`). An idle session has no postProcess goroutine. `kickPostProcess` claims `ppRunning` and enqueues the session; a worker calls `postProcess` for at most `ppBudget` packets, then `finishPostProcess` either releases the session or requeues it if more packets arrived.
+
+The `Listener` type (`sess.go:1079-1101`) demuxes incoming packets by remote address (`packetInput` → lookup or create session), enabling a single UDP socket to serve many connections. `Close` holds `sessionLock` while it closes `die`, so `packetInput` cannot register a session on an already-closed listener: under that lock it sees `die`, unlocks, closes the new session, and returns. When the listener is closed and its last session is gone, `releasePusherLocked` returns the `PacketPusher`; the caller calls `SetPacketReceiver(nil)` after releasing `sessionLock`.
+
+A short `Read` calls `notifyReadIfAvailableLocked` before returning. If `bufptr` or `KCP` still has bytes, it signals `chReadEvent` so another reader is not left blocked.
 
 ### Global timer scheduler (`timedsched.go`)
 
@@ -95,14 +100,14 @@ Travis CI (`go 1.11.x`–`1.13.x`) runs the coverage command above, uploading to
 ### Concurrency
 
 - **`UDPSession.mu` is the central lock** — it serializes `Read`, `Write`, and `update()` calls. KCP is NOT thread-safe internally; all access must be behind this mutex.
-- **Goroutines per session**: `readLoop` (reads from `net.PacketConn`, calls `packetInput` → `kcpInput` → `KCP.Input`), `postProcess` (FEC encode → encrypt → TX), and the scheduler callback `update()`. `readLoop` and `Write` contend on `mu`; the scheduler runs `update()` on a pooled goroutine from `SystemTimedSched`.
-- **Channel-as-signal pattern**: `chReadEvent`, `chWriteEvent`, `chSocketReadError`, `chSocketWriteError` are `chan struct{}` used for wakeup/notification, NOT as data queues. `chPostProcessing` (`chan sendRequest`) is the only buffered data-carrying channel.
+- **Goroutines**: `readLoop` (reads from `net.PacketConn`, calls `packetInput` → `kcpInput` → `KCP.Input`) is per owning connection. Post-processing (FEC encode → encrypt → TX) runs on the shared `ppQueue` workers, not a goroutine per session. The scheduler runs `update()` on a pooled goroutine from `SystemTimedSched`. `readLoop` and `Write` contend on `mu`. `SetLogger`, `GetOOBMaxSize`, and the trace log in `sendTx` also take `mu` before touching KCP state.
+- **Channel-as-signal pattern**: `chReadEvent`, `chWriteEvent`, `chSocketReadError`, `chSocketWriteError` are `chan struct{}` used for wakeup/notification, NOT as data queues. Outbound packets wait on `postQueue`, a mutex-guarded slice, not a channel.
 - **Error propagation**: `atomic.Value` stores the first error; `sync.Once` + `chan struct{}` signals exactly once.
 - **`sync.Once` for one-shot channel close** — `dieOnce`, `socketReadErrorOnce`, `socketWriteErrorOnce`.
 
 ### KCP is a pure state machine
 
-`KCP` has **no I/O**, no channels, no goroutines. It calls `output(buf, size)` (a callback set at construction) when it needs to emit packets. This property is load-bearing — the session layer wraps the output callback to inject packets into `chPostProcessing`.
+`KCP` has **no I/O**, no channels, no goroutines. It calls `output(buf, size)` (a callback set at construction) when it needs to emit packets. This property is load-bearing — the session layer wraps the output callback to push packets onto `postQueue`. `push` does not block; a full queue drops the packet.
 
 ### v1/v2 protocol constants
 
@@ -163,5 +168,5 @@ When modifying this codebase, an AI assistant should:
 2. **Respect `UDPSession.mu`** — `Read`, `Write`, and `update()` all hold it. Adding a new path that touches KCP state outside the lock is a concurrency bug.
 3. **Touch both platform branches** when modifying I/O — any change to `readLoop` or `tx` must have a corresponding change in `readloop_generic.go`/`tx_generic.go` or vice versa.
 4. **Always `Put` back pool buffers** — `defaultBufferPool.Get()` must be paired with `.Put()`. A leaked buffer is a GC pressure leak.
-5. **Preserve the output callback contract** — `KCP.output` is called from `flush()` and must never block. The session implementation (`postProcess`) is non-blocking with a buffered channel.
+5. **Preserve the output callback contract** — `KCP.output` is called from `flush()` and must never block. The session implementation pushes onto `postQueue` and returns; a full queue drops the packet and recycles its buffer. Do not call `SetPacketReceiver` while holding `Listener.sessionLock`.
 6. **Add a test** using the `dialEcho`/`listenEcho` harness for integration changes, or `lossyconn` for loss-simulation scenarios. Match the flat `TestXxx` naming convention.

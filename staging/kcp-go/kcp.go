@@ -52,10 +52,10 @@ const (
 	IKCP_MTU_DEF = 1400 // default MTU (bytes, not including UDP/IP header)
 
 	// Protocol parameters
-	IKCP_ACK_FAST    = 3      // fast retransmit trigger threshold (duplicate ACK count)
+	IKCP_ACK_FAST    = 3      // number of later ACKs needed to trigger fast retransmit
 	IKCP_INTERVAL    = 100    // default flush interval (ms)
 	IKCP_OVERHEAD    = 24     // per-segment header size: conv(4) + cmd(1) + frg(1) + wnd(2) + ts(4) + sn(4) + una(4) + len(4)
-	IKCP_DEADLINK    = 20     // max retransmissions before declaring dead link
+	IKCP_DEADLINK    = 20     // maximum transmissions before declaring the link dead
 	IKCP_THRESH_INIT = 2      // initial slow-start threshold (packets)
 	IKCP_THRESH_MIN  = 2      // minimum slow-start threshold (packets)
 	IKCP_PROBE_INIT  = 500    // initial window probe timeout (ms)
@@ -100,16 +100,16 @@ const (
 	IKCP_LOG_ALL        = IKCP_LOG_OUTPUT_ALL | IKCP_LOG_INPUT_ALL | IKCP_LOG_SEND | IKCP_LOG_RECV
 )
 
-// monotonic reference time point
+// refTime is the monotonic reference time point for KCP timestamps.
 var refTime time.Time = time.Now()
 
-// currentMs returns current elapsed monotonic milliseconds since program startup
+// currentMs returns elapsed monotonic milliseconds since package initialization.
 func currentMs() uint32 { return uint32(time.Since(refTime) / time.Millisecond) }
 
-// output_callback is a prototype which ought capture conn and call conn.Write
+// output_callback receives packet data emitted by KCP.
 type output_callback func(buf []byte, size int)
 
-// logoutput_callback is a prototype which logging kcp trace output
+// logoutput_callback logs KCP trace output.
 type logoutput_callback func(msg string, args ...any)
 
 func _itimediff(later, earlier uint32) int32 {
@@ -129,7 +129,7 @@ type segment struct {
 	xmit     uint32
 	resendts uint32
 	fastack  uint32
-	acked    uint32 // mark if the seg has acked
+	acked    uint32 // whether the segment has been acknowledged
 	data     []byte
 }
 
@@ -243,7 +243,7 @@ type KCP struct {
 	snd_nxt uint32 // next sequence number to send
 	rcv_nxt uint32 // next expected sequence number to receive
 
-	// Congestion control (RFC 5681 / RFC 6937)
+	// Congestion control
 	ssthresh           uint32 // slow-start threshold (packets)
 	rx_rttvar, rx_srtt int32  // RTT variance and smoothed RTT (ms), per RFC 6298
 	rx_rto, rx_minrto  uint32 // retransmission timeout and its lower bound (ms)
@@ -256,7 +256,7 @@ type KCP struct {
 	// Window probing
 	probe      uint32 // probe flags (IKCP_ASK_SEND / IKCP_ASK_TELL)
 	ts_probe   uint32 // timestamp for next window probe (ms)
-	probe_wait uint32 // current probe timeout (ms), doubles on each retry
+	probe_wait uint32 // current probe timeout (ms), increases on each retry
 
 	// Timers and scheduling
 	interval uint32 // flush interval (ms)
@@ -265,7 +265,7 @@ type KCP struct {
 	updated  uint32 // whether Update() has been called at least once
 
 	// Reliability
-	dead_link  uint32 // max retransmit count before link is considered dead
+	dead_link  uint32 // transmission count at which the link is considered dead
 	fastresend int32  // fast retransmit trigger count, 0 = disabled
 	nocwnd     int32  // 1 = disable congestion control
 	stream     int32  // 1 = stream mode (no message boundaries), 0 = message mode
@@ -292,11 +292,11 @@ type ackItem struct {
 	ts uint32
 }
 
-// NewKCP create a new kcp state machine
+// NewKCP creates a new KCP state machine.
 //
-// 'conv' must be equal in the connection peers, or else data will be silently rejected.
+// conv must be the same at both endpoints, or data will be silently rejected.
 //
-// 'output' function will be called whenever these is data to be sent on wire.
+// The output function is called whenever data needs to be sent on the wire.
 func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp := new(KCP)
 	kcp.conv = conv
@@ -360,13 +360,13 @@ func (kcp *KCP) PeekSize() (length int) {
 	return
 }
 
-// Receive data from kcp state machine
+// Recv reads data from the KCP state machine.
 //
-// Return number of bytes read.
+// It returns the number of bytes read.
 //
-// Return -1 when there is no readable data.
+// It returns -1 when there is no readable data.
 //
-// Return -2 if len(buffer) is smaller than kcp.PeekSize().
+// It returns -2 if len(buffer) is smaller than kcp.PeekSize().
 func (kcp *KCP) Recv(buffer []byte) (n int) {
 	peeksize := kcp.PeekSize()
 	if peeksize < 0 {
@@ -406,8 +406,8 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 
 	// fast recover
 	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
-		// ready to send back IKCP_CMD_WINS in ikcp_flush
-		// tell remote my window size
+		// The next flush will send IKCP_CMD_WINS to advertise the receive
+		// window to the peer.
 		kcp.probe |= IKCP_ASK_TELL
 	}
 	return
@@ -427,7 +427,7 @@ func (kcp *KCP) moveRcvBufToQueue() {
 	}
 }
 
-// Send is user/upper level send, returns below zero for error
+// Send sends data from the user level and returns a negative value on error.
 func (kcp *KCP) Send(buffer []byte) int {
 	var count int
 	if len(buffer) == 0 {
@@ -495,7 +495,8 @@ func (kcp *KCP) Send(buffer []byte) int {
 }
 
 // update_ack updates the smoothed RTT and RTO based on a new RTT sample.
-// Algorithm follows RFC 6298: Computing TCP's Retransmission Timer.
+// The estimator is based on RFC 6298, with reduced weight for RTT samples well
+// below the current smoothed RTT.
 func (kcp *KCP) update_ack(rtt int32) {
 	var rto uint32
 	if kcp.rx_srtt == 0 {
@@ -508,9 +509,8 @@ func (kcp *KCP) update_ack(rtt int32) {
 			delta = -delta
 		}
 		if rtt < kcp.rx_srtt-kcp.rx_rttvar {
-			// if the new RTT sample is below the bottom of the range of
-			// what an RTT measurement is expected to be.
-			// give an 8x reduced weight versus its normal weighting
+			// If the RTT sample is below SRTT minus the current RTT variance,
+			// give it one-eighth of the usual weight.
 			kcp.rx_rttvar += (delta - kcp.rx_rttvar) >> 5
 		} else {
 			kcp.rx_rttvar += (delta - kcp.rx_rttvar) >> 2
@@ -540,10 +540,9 @@ func (kcp *KCP) parse_ack(sn uint32) {
 	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
 		seg := kcp.snd_buf.At(ri)
 		if sn == seg.sn {
-			// mark and free space, but leave the segment here,
-			// and wait until `una` to delete this, then we don't
-			// have to shift the segments behind forward,
-			// which is an expensive operation for large window
+			// Mark it acknowledged and recycle its data, but leave the slot
+			// until `una` advances. This avoids shifting later segments in the
+			// ring buffer.
 			seg.acked = 1
 			kcp.recycleSegment(seg)
 			break
@@ -600,12 +599,12 @@ func (kcp *KCP) parse_una(una uint32) int {
 	return count
 }
 
-// ack append
+// ack_push appends an ACK to the pending ACK list.
 func (kcp *KCP) ack_push(sn, ts uint32) {
 	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})
 }
 
-// returns true if data has repeated
+// parse_data returns true if the segment is outside the receive window or is a duplicate.
 func (kcp *KCP) parse_data(newseg segment) bool {
 	sn := newseg.sn
 	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 ||
@@ -631,12 +630,12 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 	return repeat
 }
 
-// Input a packet into kcp state machine.
+// Input feeds a packet into the KCP state machine.
 //
-// 'regular' indicates it's a real data packet from remote, and it means it's not generated from ReedSolomon
-// codecs.
+// pktType distinguishes regular packets from packets recovered by FEC.
 //
-// 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
+// ackNoDelay causes pending ACKs to be flushed immediately, at the cost of
+// increased bandwidth.
 func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 	snd_una := kcp.snd_una
 	if len(data) < IKCP_OVERHEAD {
@@ -681,7 +680,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			return -3
 		}
 
-		// only trust window updates from regular packets. i.e: latest update
+		// Accept remote-window updates only from regular packets.
 		if pktType == IKCP_PACKET_REGULAR {
 			kcp.rmt_wnd = uint32(wnd)
 		}
@@ -778,18 +777,19 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 
 	// Determine if we need to flush data segments or acks
 	if flushSegments != 0 {
-		// If window has slided or, a fastack should be triggered,
+		// If the window has slid or a fast ACK should be triggered,
 		// Flush immediately. In previous implementations, we only
 		// send out fastacks when interval timeouts, so the resending packets
 		// have to wait until then. Now, we try to flush as soon as we can.
 		kcp.flush(IKCP_FLUSH_FULL)
 	} else if len(kcp.acklist) >= int(kcp.mtu/IKCP_OVERHEAD) { // clocking
-		// This serves as the clock for low-latency network.(i.e. the latency is less than the interval.)
-		// If the other end is waiting for confirmations, it has to want until the interval timeouts then
-		// the flush() is triggered to send out the una & acks. In low-latency network, the interval time is too long to wait,
-		// so acks have to be sent out immediately when there are too many.
+		// This threshold serves as a clock for low-latency networks, where
+		// latency is below the flush interval. Otherwise, the peer would wait
+		// for the next interval-triggered flush to send UNA and ACKs. In such
+		// networks, that interval is too long, so flush ACKs immediately once
+		// the list grows large.
 		kcp.flush(IKCP_FLUSH_ACKONLY)
-	} else if ackNoDelay && len(kcp.acklist) > 0 { // testing(xtaci): ack immediately if acNoDelay is set
+	} else if ackNoDelay && len(kcp.acklist) > 0 { // Test-only: flush ACKs immediately when ackNoDelay is set.
 		kcp.flush(IKCP_FLUSH_ACKONLY)
 	}
 	return 0
@@ -1019,8 +1019,8 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 	// cwnd update
 	if kcp.nocwnd == 0 {
-		// Update ssthresh after fast retransmit.
-		// Rate halving per RFC 6937: ssthresh = inflight / 2
+		// Update ssthresh after fast or early retransmit.
+		// Reduce the slow-start threshold to half the inflight window.
 		if change > 0 {
 			inflight := kcp.snd_nxt - kcp.snd_una
 			kcp.ssthresh = max(inflight/2, IKCP_THRESH_MIN)
@@ -1051,8 +1051,9 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	return nextUpdate
 }
 
-// makeSpace sends the buffered bytes if space more would not fit in one MTU,
-// and returns where to write next. A method, as TinyGo heap-allocates closures.
+// makeSpace sends buffered bytes when adding space would exceed one MTU, then
+// returns where to write next. Using a method avoids a closure allocation in
+// TinyGo.
 func (kcp *KCP) makeSpace(buffer, ptr []byte, space int) []byte {
 	if size := len(buffer) - len(ptr); size+space > int(kcp.mtu) {
 		kcp.output(buffer, size)
@@ -1063,9 +1064,9 @@ func (kcp *KCP) makeSpace(buffer, ptr []byte, space int) []byte {
 
 // (deprecated)
 //
-// Update updates state (call it repeatedly, every 10ms-100ms), or you can ask
-// ikcp_check when to call it again (without ikcp_input/_send calling).
-// 'current' - current timestamp in millisec.
+// Update advances the protocol state and flushes pending data. Call it
+// periodically; use Check to determine when the next call is due. Internal
+// timestamps are in milliseconds.
 func (kcp *KCP) Update() {
 	var slap int32
 
@@ -1093,13 +1094,9 @@ func (kcp *KCP) Update() {
 
 // (deprecated)
 //
-// Check determines when should you invoke ikcp_update:
-// returns when you should invoke ikcp_update in millisec, if there
-// is no ikcp_input/_send calling. you can call ikcp_update in that
-// time, instead of call update repeatly.
-// Important to reduce unnacessary ikcp_update invoking. use it to
-// schedule ikcp_update (eg. implementing an epoll-like mechanism,
-// or optimize ikcp_update when handling massive kcp connections)
+// Check returns the elapsed-millisecond timestamp when Update should next be
+// called. Scheduling updates this way avoids unnecessary calls and can help
+// manage large numbers of KCP connections.
 func (kcp *KCP) Check() uint32 {
 	current := currentMs()
 	ts_flush := kcp.ts_flush
@@ -1143,7 +1140,7 @@ func (kcp *KCP) Check() uint32 {
 	return current + minimal
 }
 
-// SetMtu changes MTU size, default is 1400
+// SetMtu changes the MTU size. The default is 1400 bytes.
 func (kcp *KCP) SetMtu(mtu int) int {
 	if mtu <= IKCP_OVERHEAD {
 		return -1
@@ -1177,12 +1174,13 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	return 0
 }
 
-// NoDelay options
+// NoDelay configures no-delay mode, the update interval, fast retransmit, and
+// congestion control.
 // fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
-// nodelay: 0:disable(default), 1:enable
-// interval: internal update timer interval in millisec, default is 100ms
-// resend: 0:disable fast resend(default), 1:enable fast resend
-// nc: 0:normal congestion control(default), 1:disable congestion control
+// nodelay: 0 disables (default); 1 enables
+// interval: internal update interval in milliseconds (default 100 ms)
+// resend: fast retransmit threshold; 0 disables it (default)
+// nc: 0 enables congestion control (default); 1 disables it
 func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
 	if nodelay >= 0 {
 		kcp.nodelay = uint32(nodelay)
@@ -1209,7 +1207,8 @@ func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
 	return 0
 }
 
-// WndSize sets maximum window size: sndwnd=32, rcvwnd=32 by default
+// WndSize sets the send and receive window sizes. The defaults are 32 segments
+// for each.
 func (kcp *KCP) WndSize(sndwnd, rcvwnd int) int {
 	if sndwnd > 0 {
 		kcp.snd_wnd = uint32(sndwnd)
@@ -1220,7 +1219,7 @@ func (kcp *KCP) WndSize(sndwnd, rcvwnd int) int {
 	return 0
 }
 
-// WaitSnd gets how many packet is waiting to be sent
+// WaitSnd returns the number of segments in the send buffer and send queue.
 func (kcp *KCP) WaitSnd() int {
 	return kcp.snd_buf.Len() + kcp.snd_queue.Len()
 }

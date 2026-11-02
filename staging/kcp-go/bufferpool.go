@@ -63,7 +63,7 @@ func (bp *bufferPool) Get() []byte {
 // (as returned by Get). Wrong-sized slices are rejected; converting any other
 // backing array with that capacity would be unsafe.
 func (bp *bufferPool) Put(buf []byte) error {
-	// Only put back buffers of the correct size.
+	// Only put back buffers whose capacity matches mtuLimit.
 	if cap(buf) != mtuLimit {
 		return errBufferSizeMismatch
 	}

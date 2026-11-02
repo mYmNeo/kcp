@@ -49,7 +49,7 @@ func TestRingSize(t *testing.T) {
 }
 
 func TestRingSize2(t *testing.T) {
-	// emulate a condition where head = 32， tail=31, and Len() = 63
+	// Emulate a condition where head = 32, tail = 31, and Len() = 63.
 	r := NewRingBuffer[int](64)
 	for i := range 63 {
 		r.Push(i)
@@ -180,12 +180,13 @@ func TestRingBufferGrow(t *testing.T) {
 		}
 	}
 
-	// Push to 1024
+	// The 1024th element grows the backing slice from 1024 to
+	// 1024+ceil(1024/10)=1127 slots, for a usable capacity of 1126.
 	for i := pushCount; i < 1024; i++ {
 		r.Push(i)
 	}
 
-	// Make sure the growth is 10% increase after 4096
+	// Another push fits without further growth.
 	r.Push(1)
 	if r.MaxLen() != 1126 {
 		t.Errorf("expected capacity to be 1126, got %d", r.MaxLen())

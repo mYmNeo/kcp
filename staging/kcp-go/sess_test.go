@@ -928,7 +928,7 @@ func TestUDPSessionNonOwnedPacketConn(t *testing.T) {
 	}
 }
 
-// this function test the data correctness with FEC and encryption enabled
+// TestReliability verifies data correctness with FEC and encryption enabled.
 func TestReliability(t *testing.T) {
 	port := nextPort()
 	block1, _ := NewSalsa20BlockCrypt(pass)
@@ -1157,7 +1157,7 @@ func newLoggerWithMilliseconds() *slog.Logger {
 	return slog.New(handler)
 }
 
-// TestSetLogger if want logging kcp trace need set build tags with debug
+// TestSetLogger requires the debug build tag to enable KCP trace logging.
 // trace log on:
 //
 //	go test -run ^TestSetLogger$ -tags debug
@@ -1629,6 +1629,53 @@ func TestGetOOBMaxSize(t *testing.T) {
 	}
 }
 
+func TestGetOOBMaxSizeConcurrentSetMtu(t *testing.T) {
+	sess, err := DialWithOptions("127.0.0.1:9", nil, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close() //nolint:errcheck
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10000; i++ {
+			sess.SetMtu(1200 + i%2*100)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10000; i++ {
+			if size := sess.GetOOBMaxSize(); size <= 0 {
+				t.Errorf("invalid OOB maximum size: %d", size)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestSetLoggerConcurrentWithKCPTrace(t *testing.T) {
+	sess := &UDPSession{kcp: NewKCP(1, nil)}
+	logger := logoutput_callback(func(string, ...any) {})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10000; i++ {
+			sess.SetLogger(IKCP_LOG_ALL, logger)
+		}
+	}()
+	for i := 0; i < 10000; i++ {
+		sess.mu.Lock()
+		sess.kcp.debugLog(IKCP_LOG_INPUT, "test")
+		sess.mu.Unlock()
+	}
+	wg.Wait()
+}
+
 func TestSendOOB_Errors(t *testing.T) {
 	sess := new(UDPSession)
 	sess.kcp = NewKCP(1, func(buf []byte, size int) {})
@@ -1639,16 +1686,20 @@ func TestSendOOB_Errors(t *testing.T) {
 	}
 	// NOTE: SendOOB no longer requires callbackForOOB to be non-nil on sender side.
 	// It should not return error if callback is not set after FEC is enabled.
-	sess.fecEncoder = newFECEncoder(1, 1, 0)
+	// An accepted packet is sent, so this needs a real session.
+	sess, err = DialWithOptions("127.0.0.1:9", nil, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close() //nolint:errcheck
 	err = sess.SendOOB([]byte("abc"))
 	if err != nil {
 		t.Errorf("expected no error when callback not set, got %v", err)
 	}
 	// Should error if payload is too large
-	sess.kcp.mtu = 8
 	cb := func([]byte) {}
 	sess.SetOOBHandler(cb)
-	err = sess.SendOOB([]byte("123456789"))
+	err = sess.SendOOB(make([]byte, sess.GetOOBMaxSize()+1))
 	if err == nil || err.Error() != "OOB payload too large" {
 		t.Errorf("expected 'OOB payload too large', got %v", err)
 	}
