@@ -98,9 +98,8 @@ func drainInBackground(tb testing.TB, rc io.ReadCloser) func() {
 // ---------------------------------------------------------------------------
 // Stream.Write: writeV1 / writeV2, with and without a write deadline.
 //
-// The deadline variants specifically exercise the time.NewTimer path
-// (stream.go:504 in writeV1, stream.go:561 in writeV2). Without a deadline
-// neither path allocates a timer.
+// The deadline variants exercise the shared deadline channel in each Write.
+// Deadline timers are owned by the stream rather than allocated per call.
 // ---------------------------------------------------------------------------
 
 func benchStreamWrite(b *testing.B, version int, deadline bool) {
@@ -112,8 +111,8 @@ func benchStreamWrite(b *testing.B, version int, deadline bool) {
 	total := 0
 
 	if deadline {
-		// A far-future deadline keeps the timer path active every Write
-		// without ever firing (no timeout reset churn mid-loop).
+		// A far-future deadline keeps the deadline path active every Write
+		// without ever firing.
 		if err := cs.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
 			b.Fatal(err)
 		}
@@ -328,9 +327,8 @@ func BenchmarkHotPathMSB(b *testing.B) {
 	}
 }
 
-// TestConcurrentWriteSameStream exercises the writeTimer field under
-// concurrent goroutines writing to the SAME stream — the precise pattern
-// that would race without writeTimerMu. Run with -race.
+// TestConcurrentWriteSameStream exercises shared stream deadlines under
+// concurrent goroutines writing to the SAME stream. Run with -race.
 func TestConcurrentWriteSameStream(t *testing.T) {
 	_, _, cs, ss := benchStreamPairVersion(t, 1)
 	drain := drainInBackground(t, ss)

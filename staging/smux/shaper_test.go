@@ -23,44 +23,55 @@
 package smux
 
 import (
-	"fmt"
 	"io"
-	"math/rand"
+	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestShaper(t *testing.T) {
-	w1 := writeRequest{seq: 1}
-	w2 := writeRequest{seq: 2}
-	w3 := writeRequest{seq: 3}
-	w4 := writeRequest{seq: 4}
-	w5 := writeRequest{seq: 5}
-
 	var reqs shaperHeap
+
+	w1 := writeRequest{frame: newFrame(1, cmdPSH, 1), seq: 1}
+	w2 := writeRequest{frame: newFrame(2, cmdPSH, 2), seq: 2}
+	w3 := writeRequest{frame: newFrame(3, cmdPSH, 3), seq: 3}
+	w4 := writeRequest{frame: newFrame(4, cmdPSH, 4), seq: 4}
+	w5 := writeRequest{frame: newFrame(5, cmdPSH, 5), seq: 5}
+
 	reqs.push(w5)
 	reqs.push(w4)
 	reqs.push(w3)
 	reqs.push(w2)
 	reqs.push(w1)
 
-	for reqs.Len() > 0 {
+	wantSeqs := []uint32{1, 2, 3, 4, 5}
+	for _, want := range wantSeqs {
+		if len(reqs) == 0 {
+			t.Fatalf("heap empty before sequence %d", want)
+		}
 		w, _ := reqs.pop()
-		t.Log("sid:", w.frame.sid, "seq:", w.seq)
+		if w.seq != want {
+			t.Fatalf("heap popped sequence %d; want %d", w.seq, want)
+		}
+	}
+	if len(reqs) != 0 {
+		t.Fatalf("heap contains %d requests after expected pops", len(reqs))
 	}
 }
 
 func TestShaper2(t *testing.T) {
-	w1 := writeRequest{class: CLSDATA, seq: 1} // stream 0
-	w2 := writeRequest{class: CLSDATA, seq: 2}
-	w3 := writeRequest{class: CLSDATA, seq: 3}
-	w4 := writeRequest{class: CLSDATA, seq: 4}
-	w5 := writeRequest{class: CLSDATA, seq: 5}
-	w6 := writeRequest{class: CLSCTRL, seq: 6, frame: Frame{sid: 10}} // ctrl 1
-	w7 := writeRequest{class: CLSCTRL, seq: 7, frame: Frame{sid: 11}} // ctrl 2
-
 	var reqs shaperHeap
+
+	w1 := writeRequest{class: CLSDATA, frame: newFrame(1, cmdPSH, 1), seq: 1}
+	w2 := writeRequest{class: CLSDATA, frame: newFrame(2, cmdPSH, 2), seq: 2}
+	w3 := writeRequest{class: CLSDATA, frame: newFrame(3, cmdPSH, 3), seq: 3}
+	w4 := writeRequest{class: CLSDATA, frame: newFrame(4, cmdPSH, 4), seq: 4}
+	w5 := writeRequest{class: CLSDATA, frame: newFrame(5, cmdPSH, 5), seq: 5}
+	w6 := writeRequest{class: CLSCTRL, frame: newFrame(1, cmdPSH, 10), seq: 6}
+	w7 := writeRequest{class: CLSCTRL, frame: newFrame(1, cmdPSH, 11), seq: 7}
+
 	reqs.push(w6)
 	reqs.push(w5)
 	reqs.push(w4)
@@ -69,211 +80,122 @@ func TestShaper2(t *testing.T) {
 	reqs.push(w1)
 	reqs.push(w7)
 
-	for reqs.Len() > 0 {
+	wantSeqs := []uint32{6, 7, 1, 2, 3, 4, 5}
+	for _, want := range wantSeqs {
+		if len(reqs) == 0 {
+			t.Fatalf("heap empty before sequence %d", want)
+		}
 		w, _ := reqs.pop()
-		t.Log("sid:", w.frame.sid, "seq:", w.seq)
+		if w.seq != want {
+			t.Fatalf("heap popped sequence %d; want %d", w.seq, want)
+		}
+	}
+	if len(reqs) != 0 {
+		t.Fatalf("heap contains %d requests after expected pops", len(reqs))
 	}
 }
 
 func TestShaperQueueFairness(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
-
 	sq := NewShaperQueue()
+	const (
+		streams           = 10
+		requestsPerStream = 16
+	)
 
-	const streams = 10
-	const testDuration = 10 * time.Second
-
-	var wg sync.WaitGroup
-	sendCount := make([]uint64, streams)
-	var sendCountLock sync.Mutex
-
-	stop := make(chan struct{})
-
-	// Producers: each stream pushes packets
-	for sid := 0; sid < streams; sid++ {
-		sid := sid
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			seq := uint32(0)
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				sq.Push(writeRequest{
-					frame: Frame{sid: uint32(sid)},
-					seq:   seq,
-				})
-				seq++
-				time.Sleep(time.Duration(rand.Intn(300)) * time.Microsecond)
-			}
-		}()
+	for sid := range streams {
+		for seq := range requestsPerStream {
+			sq.Push(writeRequest{
+				frame: Frame{sid: uint32(sid)},
+				seq:   uint32(seq),
+			})
+		}
 	}
 
-	// Consumer: slow network, 1 pop every 10ms
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(10 * time.Millisecond)
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				req, ok := sq.Pop()
-				if !ok {
-					continue
-				}
-
-				sendCountLock.Lock()
-				sendCount[req.frame.sid]++
-				sendCountLock.Unlock()
-			}
+	for index := range streams * requestsPerStream {
+		req, ok := sq.Pop()
+		if !ok {
+			t.Fatalf("queue became empty after %d of %d pops", index, streams*requestsPerStream)
 		}
-	}()
 
-	// ---- NEW: periodic live report ----
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				sendCountLock.Lock()
-				fmt.Printf("[DEBUG] Current counts: %v\n", sendCount)
-				sendCountLock.Unlock()
-			}
+		wantSID := uint32(index % streams)
+		wantSeq := uint32(index / streams)
+		if req.frame.sid != wantSID || req.seq != wantSeq {
+			t.Fatalf("pop %d = (sid=%d, seq=%d); want (sid=%d, seq=%d)",
+				index, req.frame.sid, req.seq, wantSID, wantSeq)
 		}
-	}()
-
-	// run test
-	time.Sleep(testDuration)
-	close(stop)
-	wg.Wait()
-
-	// ---- final report ----
-	fmt.Println("=== FINAL COUNTS ===")
-	fmt.Println(sendCount)
-
-	// ---- fairness check ----
-	total := uint64(0)
-	sendCountLock.Lock()
-	defer sendCountLock.Unlock()
-	for _, c := range sendCount {
-		total += c
 	}
-	avg := total / streams
-	tolerance := avg / 4 // 25%
-
-	for sid, c := range sendCount {
-		if c < avg-tolerance || c > avg+tolerance {
-			t.Errorf("stream %d unfair: got %d, avg %d", sid, c, avg)
-		}
+	if !sq.IsEmpty() || sq.Len() != 0 {
+		t.Fatalf("queue not empty after draining: len=%d", sq.Len())
 	}
 }
 
-func TestShaperQueue_FastWriteSlowRead(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
+func TestShaperQueueConcurrentStress(t *testing.T) {
+	if os.Getenv("SMUX_SHAPER_STRESS") != "1" {
+		t.Skip("set SMUX_SHAPER_STRESS=1 to run concurrent shaper stress test")
+	}
 
 	const (
-		streams      = 10
-		duration     = 10 * time.Second
-		producerWait = 1 * time.Microsecond  // super fast writing
-		consumerWait = 15 * time.Millisecond // super slow reading
+		streams           = 10
+		requestsPerStream = 1000
 	)
 
 	sq := NewShaperQueue()
-
-	sendCount := make([]uint64, streams)
-	var sendCountLock sync.Mutex
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-
-	// Producers: extremely fast writers
-	for sid := 0; sid < streams; sid++ {
+	start := make(chan struct{})
+	var producers sync.WaitGroup
+	producers.Add(streams)
+	for sid := range streams {
 		sid := sid
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			seq := uint32(0)
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-
+			defer producers.Done()
+			<-start
+			for seq := range requestsPerStream {
 				sq.Push(writeRequest{
 					frame: Frame{sid: uint32(sid)},
-					seq:   seq,
+					seq:   uint32(seq),
 				})
-				seq++
-				time.Sleep(producerWait)
 			}
 		}()
 	}
+	close(start)
 
-	// Consumer: very slow reader
-	wg.Add(1)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-
-			req, ok := sq.Pop()
-			if ok {
-				sendCountLock.Lock()
-				sendCount[req.frame.sid]++
-				sendCountLock.Unlock()
-			}
-
-			time.Sleep(consumerWait)
-		}
+		producers.Wait()
+		close(done)
 	}()
 
-	// Periodic monitor
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				sendCountLock.Lock()
-				fmt.Printf("[DEBUG] Queue size=%d, counts=%v\n", sq.Len(), sendCount)
-				sendCountLock.Unlock()
+	nextSeq := make([]uint32, streams)
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for total := 0; total < streams*requestsPerStream; {
+		req, ok := sq.Pop()
+		if ok {
+			if int(req.frame.sid) >= streams {
+				t.Fatalf("unexpected stream ID %d", req.frame.sid)
 			}
+			sid := int(req.frame.sid)
+			if req.seq != nextSeq[sid] {
+				t.Fatalf("stream %d sequence = %d; want %d", sid, req.seq, nextSeq[sid])
+			}
+			nextSeq[sid]++
+			total++
+			continue
 		}
-	}()
 
-	// Run test
-	time.Sleep(duration)
-	close(stop)
-	wg.Wait()
-
-	sendCountLock.Lock()
-	defer sendCountLock.Unlock()
-	fmt.Printf("=== FINAL ===\ncounts=%v\nqueue remaining=%d\n", sendCount, sq.Len())
-
-	// Check fairness
-	total := uint64(0)
-	for _, v := range sendCount {
-		total += v
+		select {
+		case <-done:
+			if sq.IsEmpty() {
+				t.Fatalf("queue drained after %d of %d requests", total, streams*requestsPerStream)
+			}
+		case <-timer.C:
+			t.Fatalf("timed out after popping %d of %d requests", total, streams*requestsPerStream)
+		default:
+			runtime.Gosched()
+		}
 	}
-	avg := total / streams
-	tolerance := avg / 3 // allow 33%
-
-	for sid, c := range sendCount {
-		if c < avg-tolerance || c > avg+tolerance {
-			t.Errorf("stream %d unfair: got %d, avg %d", sid, c, avg)
-		}
+	<-done
+	if !sq.IsEmpty() {
+		t.Fatalf("queue has %d requests after expected drain", sq.Len())
 	}
 }
 
@@ -401,29 +323,30 @@ func TestShaperQueue_MultiStreamRemoval(t *testing.T) {
 }
 
 func TestShaperHeap_MemoryLeak(t *testing.T) {
-	// Verify the fix for memory leak in Pop
 	h := &shaperHeap{}
-
-	// Push a request with a large payload (simulated by checking the struct field)
-	// We can't easily check memory usage of the specific array slot in Go without unsafe or reflection tricks,
-	// but we can verify the logic by ensuring the popped element is returned correctly
-	// and trusting the code review that we set it to zero.
-	// However, we can check if the code runs without panic.
-
 	req := writeRequest{frame: Frame{sid: 1, data: make([]byte, 100)}}
 	h.push(req)
 
 	if h.Len() != 1 {
 		t.Fatal("Heap len should be 1")
 	}
+	backing := *h
 
 	popped, _ := h.pop()
 	if popped.frame.sid != 1 {
-		t.Fatal("Incorrect popped item")
+		t.Fatal("Unexpected sid:", popped.frame.sid)
 	}
-
 	if h.Len() != 0 {
 		t.Fatal("Heap len should be 0")
+	}
+	if popped.frame.data == nil || len(popped.frame.data) != len(req.frame.data) {
+		t.Fatal("popped request should retain its returned payload")
+	}
+	if popped.frame.data[0] != req.frame.data[0] {
+		t.Fatal("popped request payload unexpectedly changed")
+	}
+	if backing[0].frame.data != nil || backing[0].frame.sid != 0 {
+		t.Fatal("heap retained a reference to the popped request")
 	}
 }
 
@@ -486,7 +409,7 @@ func TestShaperCtrlQueueBound(t *testing.T) {
 			defer wg.Done()
 			f := newFrame(byte(cfg.Version), cmdNOP, 0)
 			deadline := time.After(200 * time.Millisecond)
-			_, _ = sess.writeFrameInternal(f, deadline, CLSCTRL)
+			_, _ = writeFrameInternal(sess, f, deadline, CLSCTRL)
 		}()
 	}
 

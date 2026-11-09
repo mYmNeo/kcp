@@ -108,7 +108,7 @@ func (h *shaperHeap) down(i int) {
 
 // shaperQueue schedules writeRequests from multiple streams in round-robin order.
 type shaperQueue struct {
-	count   int64 // atomic counter for fast Len() and IsEmpty()
+	count   atomic.Int64 // atomic counter for fast Len() and IsEmpty()
 	streams map[uint32]*shaperHeap
 	rrList  *list.List    // list of sid (RR queue)
 	next    *list.Element // next node to pop
@@ -151,7 +151,7 @@ func (sq *shaperQueue) Push(req writeRequest) {
 	// push the request into the corresponding stream heap.
 	h := sq.streams[sid]
 	h.push(req)
-	atomic.AddInt64(&sq.count, 1)
+	sq.count.Add(1)
 }
 
 // Pop returns the next writeRequest in round-robin order, if one is available.
@@ -160,7 +160,7 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 	defer sq.mu.Unlock()
 
 	// if there are no streams, return false
-	if sq.next == nil || atomic.LoadInt64(&sq.count) == 0 {
+	if sq.next == nil || sq.count.Load() == 0 {
 		return writeRequest{}, false
 	}
 
@@ -176,7 +176,7 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 		if h.Len() > 0 {
 			// pop the top request from the heap
 			req, _ := h.pop()
-			atomic.AddInt64(&sq.count, -1)
+			sq.count.Add(-1)
 
 			// update next pointer for round-robin
 			next := current.Next()
@@ -216,10 +216,10 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 
 // IsEmpty reports whether the queue contains any write requests.
 func (sq *shaperQueue) IsEmpty() bool {
-	return atomic.LoadInt64(&sq.count) == 0
+	return sq.count.Load() == 0
 }
 
 // Len returns the total number of writeRequests in the shaperQueue.
 func (sq *shaperQueue) Len() int {
-	return int(atomic.LoadInt64(&sq.count))
+	return int(sq.count.Load())
 }

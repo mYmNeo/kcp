@@ -68,7 +68,7 @@ Key types: `client.Config` / `server.Config` (both embed `std.BaseConfig`), `kcp
 | `std/` | Shared helpers used by **both** binaries. Touching `BaseConfig`, `Pipe`, `SelectBlockCrypt`, `BuildSmuxConfig`, `ParseMultiPort`, or `SnmpLogger` affects both. |
 | `std/shmmap/` | Linux POSIX shm IP→domain store for transparent proxy. Cross-process ABI. |
 | `staging/kcp-go/` | In-tree `github.com/xtaci/kcp-go/v5` (own `go.mod`). |
-| `staging/smux/` | In-tree `github.com/xtaci/smux` (own `go.mod`, zero deps). |
+| `staging/smux/` | In-tree `github.com/xtaci/smux` (own `go.mod`; single direct dep `github.com/pion/transport/v5`). |
 | `dist/` | JSON examples, systemd units, sysctl, Debian/RPM/FreeBSD packaging. |
 | `build/` | Gitignored release output. |
 
@@ -205,7 +205,7 @@ kcp-go uses the same `//go:build linux` / `!linux` split for `readloop*` / `tx*`
 
 ## Runtime/Tooling Preferences
 
-- **Runtime:** Go 1.27.0 at the root. Nested baselines differ (`staging/kcp-go` 1.26.2, `staging/smux` 1.18) — do not bump those casually. No Node/Bun/npm.
+- **Runtime:** Go 1.27.0 at the root. Nested baselines differ (`staging/kcp-go` 1.26.2, `staging/smux` 1.24.0) — do not bump those casually. No Node/Bun/npm.
 - **CGO:** not used. `CGO_ENABLED=0` everywhere except `build-release-cgo.sh` (static/external linking for RPM). Platform work is build tags, not cgo.
 - **No formatter/linter config.** `gofmt`/`go vet` locally. Root `.travis.yml` is GOPATH-era goveralls + `exit 0` — **non-gating**. Staging Travis files run real `go test` but target ancient Go.
 - **PGO:** `build.sh` uses `-pgo=auto`. Official release scripts do not.
@@ -216,13 +216,13 @@ Default ports: client TCP `:12948`, server UDP `:29900`. Default cipher is `aes-
 
 ## Testing & QA
 
-Three modules, three invocations. All tests are stdlib `testing` (testify only in `staging/kcp-go/autotune_test.go`). No `TestMain`, no fuzz, no `testing.Short()`, no `t.Parallel()`, no golden/`testdata/`. White-box throughout (`package kcp` / `package smux` / `package std` / `package main`).
+Three modules, three invocations. All tests are stdlib `testing` (testify only in `staging/kcp-go/autotune_test.go`). No `TestMain`, no fuzz, no `t.Parallel()`, no golden/`testdata/`. `testing.Short()` skips smux's 8GB transfers and kcp-go's large echo/rate-limit tests. White-box throughout (`package kcp` / `package smux` / `package std` / `package main`).
 
 **Root module** — ~32 fast unit tests. Style: table-driven `t.Run`, `t.TempDir()`, `t.Helper()`. Copy `std/config_test.go` (`TestBaseConfigApplyMode`) and `std/multiport_test.go`. Platform tests use `//go:build linux` (`origdst_linux_test.go`, `shmmap_linux_test.go`); stubs are untested.
 
-**staging/kcp-go** — socket-level integration. Harness in `sess_test.go`: `nextPort()`, `dialEcho`/`listenEcho`/`echoServer`/`handleEcho`, `lossyconn` for loss. Giant tests: `Test1GBEcho`, `Test6GBEcho`. `-short` is a no-op. `nextPort()` collides if two `go test` processes share a host.
+**staging/kcp-go** — socket-level integration. Harness in `sess_test.go`: `nextPort()`, `dialEcho`/`listenEcho`/`echoServer`/`handleEcho`, `lossyconn` for loss. Giant tests: `Test1GBEcho`, `Test6GBEcho`; `-short` skips these and the end-to-end rate-limit throughput test. `nextPort()` collides if two `go test` processes share a host.
 
-**staging/smux** — TCP echo harness: `setupServer`/`setupServerV2` (`testing.TB` so benches reuse it), `newUnitTestStream()` for zero-I/O state. Always cover **v1 and v2**. Giant tests: `Test8GBTransferV1/V2`. `TestConcurrentWriteSameStream` is meant to run with `-race`.
+**staging/smux** — TCP echo harness: `setupServer`/`setupServerV2` (`testing.TB` so benches reuse it), `newUnitTestStream()` for zero-I/O state. Always cover **v1 and v2**. Giant tests: `Test8GBTransferV1/V2` (skipped by `-short`). `TestConcurrentWriteSameStream` is meant to run with `-race`.
 
 ```bash
 go test ./...                                      # root only

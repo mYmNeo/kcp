@@ -1,7 +1,7 @@
 # Multi-stage build for smux container integration test.
 # Both client and server use the same image, differentiated by CMD.
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY *.go ./

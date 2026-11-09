@@ -68,15 +68,15 @@ go test -v -run=^$ -bench .                            # benchmarks only
 go test -coverprofile=coverage.txt -covermode=atomic -bench .   # CI coverage run (Travis)
 ```
 
-The `.travis.yml` matrix targets Go `1.9.x`–`1.11.x` and runs the coverage command above, uploading to codecov. The `go.mod` directive is `go 1.18`; any Go ≥ 1.18 builds cleanly.
+The `.travis.yml` matrix targets Go `1.9.x`–`1.11.x` and runs the coverage command above, uploading to codecov (legacy; not exercised by the current toolchain). The `go.mod` directive is `go 1.24.0`; any Go ≥ 1.24.0 builds cleanly.
 
 ## Code Conventions & Common Patterns
 
 - **Concurrency is the central concern.** Every mutable struct is guarded explicitly. When adding a field to `Session` or `stream`, decide its synchronization owner first.
-  - `Session`: `nextStreamIDLock` guards `nextStreamID`; `streamLock` guards the `streams` map; `bucket`/`closed`/`goAway`/`sessionIsActive` are `atomic` int32; `die` chan + `dieOnce` for lifecycle; `chAccepts`, `shaper`, `chShaperPending/Consumed`, `bucketNotify`, and the per-error `ch*Error` chans drive the goroutines (`session.go:93-134`).
-  - `stream`: `bufferLock` guards `bufferRing`; `die`+`dieOnce` and atomic `forcedClose` (set by `Close` and `sessionClose`); `chFinEvent`+`finEventOnce`, `chWriteClosed`+`writeClosedOnce` for half-close lifecycle; `readDeadline`/`writeDeadline` are `atomic.Value`; `chReaderWakeup`/`chWriterWakeup`/`chUpdate` chans for blocking read/write coordination (`stream.go`).
+  - `Session`: `nextStreamIDLock` guards `nextStreamID`; `streamLock` guards the `streams` map; `closed`/`sessionIsActive` are typed `atomic.Int32`, `requestID` is `atomic.Uint32`, `bucket` is an `int32` token bucket accessed only through `atomic.AddInt32`/`LoadInt32`; `die` chan + `dieOnce` for lifecycle; `chAccepts`, `shaper`, `shaperCtrl`, `chShaperPending/Consumed`, `bucketNotify`, and the per-error `ch*Error` chans drive the goroutines (`session.go:101-149`).
+  - `stream`: `bufferLock` guards `bufferRing`; `die`+`dieOnce` and typed atomic `forcedClose` (`atomic.Uint32`, set by `Close` and `sessionClose`); `chFinEvent`+`finEventOnce`, `chWriteClosed`+`writeClosedOnce` for half-close lifecycle; `readDeadline`/`writeDeadline` are pion `*deadline.Deadline` objects (`github.com/pion/transport/v5/deadline`), freed via `runtime.AddCleanup`; `chReaderWakeup`/`chWriterWakeup`/`chUpdate` chans for blocking read/write coordination (`stream.go`).
 - **Channel-as-signal, not channel-as-queue.** Wakeup chans are `chan struct{}` closed or sent-to once to signal; `sync.Once` guarantees single close. `chAccepts` (`chan *stream`) is the only buffered-value channel.
-- **Error propagation** uses `atomic.Value` to store the first error + a `chan struct{}` + `sync.Once` to notify once (socket read/write errors, proto error). Sentinel errors: `ErrInvalidProtocol`, `ErrConsumed`, `ErrGoAway`, `ErrTimeout` (implements `net.Error`), `ErrWouldBlock` (`session.go:71-75`).
+- **Error propagation** stores the first error in a plain struct field, written under a dedicated `sync.Once` before closing the paired `chan struct{}` (socket read/write errors, proto error): `notifyReadError`/`notifyWriteError`/`notifyProtoError` (`session.go`). Sentinel errors: `ErrInvalidProtocol`, `ErrConsumed`, `ErrGoAway`, `ErrTimeout` (implements `net.Error`), `ErrWouldBlock` (`session.go:79-85`).
 - **v1/v2 split** is pervasive: `tryReadV1`/`tryReadV2`, `writeV1`/`writeV2`, `writeToV1`/`writeToV2`. Touching read/write logic means touching both paths unless the change is version-agnostic.
 - **`net.Conn` on `Stream`**: `Read`, `Write`, `Close`, `CloseWrite` (half-close, like `TCPConn`), `SetReadDeadline`/`SetWriteDeadline`/`SetDeadline`, `LocalAddr`, `RemoteAddr`, plus `WriteTo` (io.WriterTo) and `GetDieCh`.
 - **Buffer pooling**: `alloc.go` provides `Allocator` (array of `sync.Pool`, one per 2^n size class) with De Bruijn `msb()` for O(1) bucket selection; `defaultAllocator` is initialized in `init()`. `Put` requires `cap == 2^n`. `resultChanPool` (`session.go`) pools write-result channels.
@@ -94,14 +94,14 @@ The `.travis.yml` matrix targets Go `1.9.x`–`1.11.x` and runs the coverage com
 
 ## Runtime/Tooling Preferences
 
-- **Runtime**: Go toolchain, `go 1.18` minimum (per `go.mod`).
-- **Dependencies**: none — stdlib only (`go.sum` is empty; no `require` block). Do not add external dependencies without strong justification; this is a deliberate zero-dep library.
-- **CI**: Travis CI (legacy matrix Go 1.9–1.11). Local dev uses any modern Go.
+- **Runtime**: Go toolchain, `go 1.24.0` minimum (per `go.mod`). Requires `runtime.AddCleanup` (Go ≥ 1.24), used to free `deadline.Deadline` objects.
+- **Dependencies**: one direct dependency — `github.com/pion/transport/v5 v5.1.4`, used only for its `deadline` package (pion deadline objects back stream/session deadlines). Everything else is stdlib. Do not add further external dependencies without strong justification.
+- **CI**: Travis CI (legacy matrix Go 1.9–1.11, predates the current `go.mod` baseline). Local dev uses any modern Go (≥ 1.24.0).
 - **Package manager**: `go mod` (modules). No vendoring.
 
 ## Testing & QA
 
-- **Framework**: stdlib `testing` only — no testify, gomock, or any third-party test lib (confirmed by the empty `go.sum`).
+- **Framework**: stdlib `testing` only — no testify, gomock, or any third-party test lib (the `go.sum` entries are all runtime-dependency transitive modules, none imported by tests).
 - **Test files** (all at root): `alloc_test.go`, `mux_test.go`, `session_test.go` (~1500 lines, the bulk), `shaper_test.go`, `stream_test.go`, `stream_internal_test.go`.
 - **Harness patterns**:
   - `setupServer(tb)` / `setupServerV2(tb)` (`session_test.go:51-114`) — TCP echo server on `localhost:0`, wraps a real `net.Dial` connection in smux. V1 and V2 variants. Most end-to-end tests use these.
@@ -111,7 +111,7 @@ The `.travis.yml` matrix targets Go `1.9.x`–`1.11.x` and runs the coverage com
 - **`stream_internal_test.go`** is in `package smux` (not `smux_test`) specifically for **white-box access to unexported** symbols: `waitRead`, `fin()`, `pushBytes`, `peerWindow`, `incr`, etc. The other `*_test.go` files use `package smux_test` (black-box) or `package smux`.
 - **Representative tests**: `TestEcho` (echo round-trip), `TestParallel` (1000 concurrent streams × 100 msgs — the goroutine-safety stress test), `TestKeepAliveTimeout`, `TestRandomFrame` (fuzzes the parser with random bytes / bad frames), `TestHalfCloseBasic` / `TestHalfCloseAutoCleanup` (half-close semantics).
 - **Benchmarks**: `BenchmarkMSB`, `BenchmarkAlloc` (alloc.go); `BenchmarkAcceptClose`, `BenchmarkConnSmux`, `BenchmarkConnTCP` (session_test.go — smux vs raw TCP throughput).
-- **Conventions**: no `t.Parallel()` (sequential by design), no `t.Run` subtests, no `testing.Short()` skips, no build tags. Tests are flat function-per-case. Expect timeouts to be real (`TestKeepAliveTimeout` waits ~3s).
+- **Conventions**: no `t.Parallel()` (sequential by design), no `t.Run` subtests, no build tags. Tests are flat function-per-case. `Test8GBTransferV1/V2` skip under `-short`; `TestKeepAliveTimeout` waits ~3s.
 - **Coverage**: no in-repo coverage threshold; CI uploads to codecov. The `go test -bench .` invocation in Travis runs benchmarks as part of the coverage run.
 
 ## Editing checklist

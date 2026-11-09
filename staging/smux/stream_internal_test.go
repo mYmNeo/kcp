@@ -137,7 +137,7 @@ func TestSessionCloseDrainsPendingWriteRequests(t *testing.T) {
 	defer peer.Close()
 
 	sess := newSession(cfg, conn, true)
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		frame := newFrame(byte(cfg.Version), cmdPSH, 1)
 		frame.data = make([]byte, cfg.MaxFrameSize)
 		sess.shaper <- writeRequest{
@@ -193,11 +193,11 @@ type shortWriteBuffersConn struct {
 	net.Conn
 	writeN     int
 	writeErr   error
-	writeCalls int32
+	writeCalls atomic.Int32
 }
 
 func (c *shortWriteBuffersConn) WriteBuffers(v [][]byte) (int, error) {
-	atomic.AddInt32(&c.writeCalls, 1)
+	c.writeCalls.Add(1)
 	total := 0
 	for _, b := range v {
 		total += len(b)
@@ -236,7 +236,7 @@ func TestSocketWriteErrorDrainsPendingWriteRequests(t *testing.T) {
 		t.Fatal("sendLoop did not start writing")
 	}
 
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		frame := newFrame(byte(cfg.Version), cmdPSH, 1)
 		frame.data = make([]byte, cfg.MaxFrameSize)
 		sess.shaper <- writeRequest{
@@ -275,7 +275,7 @@ func TestWriteFrameInternalShortWriteReturnsError(t *testing.T) {
 
 	frame := newFrame(byte(cfg.Version), cmdPSH, 1)
 	frame.data = []byte("payload")
-	n, err := sess.writeFrameInternal(frame, nil, CLSDATA)
+	n, err := writeFrameInternal[struct{}](sess, frame, nil, CLSDATA)
 	if err != io.ErrShortWrite {
 		t.Fatalf("writeFrameInternal error = %v; want %v", err, io.ErrShortWrite)
 	}
@@ -305,14 +305,14 @@ func TestWriteFrameInternalShortWriteFromWriteBuffersReturnsError(t *testing.T) 
 
 	frame := newFrame(byte(cfg.Version), cmdPSH, 1)
 	frame.data = []byte("payload")
-	n, err := sess.writeFrameInternal(frame, nil, CLSDATA)
+	n, err := writeFrameInternal[struct{}](sess, frame, nil, CLSDATA)
 	if err != io.ErrShortWrite {
 		t.Fatalf("writeFrameInternal error = %v; want %v", err, io.ErrShortWrite)
 	}
 	if n < 0 || n > len(frame.data) {
 		t.Fatalf("writeFrameInternal n = %d; want within [0,%d]", n, len(frame.data))
 	}
-	if calls := atomic.LoadInt32(&wrapped.writeCalls); calls == 0 {
+	if calls := wrapped.writeCalls.Load(); calls == 0 {
 		t.Fatal("WriteBuffers was not used")
 	}
 
@@ -340,7 +340,7 @@ func TestWriteFrameInternalWriteBuffersErrorPreserved(t *testing.T) {
 
 	frame := newFrame(byte(cfg.Version), cmdPSH, 1)
 	frame.data = []byte("payload")
-	if _, err := sess.writeFrameInternal(frame, nil, CLSDATA); err != wantErr {
+	if _, err := writeFrameInternal[struct{}](sess, frame, nil, CLSDATA); err != wantErr {
 		t.Fatalf("writeFrameInternal error = %v; want %v", err, wantErr)
 	}
 }
@@ -368,7 +368,7 @@ func TestNotifyWriteErrorDoesNotWaitForWriteAdmissionLock(t *testing.T) {
 	default:
 		t.Fatal("write error notification did not close the error channel")
 	}
-	if got := sess.socketWriteError.Load(); got != writeErr {
+	if got := sess.socketWriteError; got != writeErr {
 		t.Fatalf("stored write error = %v; want %v", got, writeErr)
 	}
 }
@@ -412,6 +412,19 @@ func TestDiscardPendingWritesSignalsWaitingWriters(t *testing.T) {
 	}
 }
 
+// stopTimerDrain stops the supplied timer and drains its channel if needed.
+func stopTimerDrain(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
 func TestWriteFrameInternalDoesNotTimeoutWhenPendingWriteDiscarded(t *testing.T) {
 	cfg := DefaultConfig()
 	sess := &Session{
@@ -429,7 +442,7 @@ func TestWriteFrameInternalDoesNotTimeoutWhenPendingWriteDiscarded(t *testing.T)
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := sess.writeFrameInternal(newFrame(byte(cfg.Version), cmdPSH, 1), deadline.C, CLSDATA)
+		_, err := writeFrameInternal(sess, newFrame(byte(cfg.Version), cmdPSH, 1), deadline.C, CLSDATA)
 		done <- err
 	}()
 
@@ -504,7 +517,7 @@ func TestRecvLoopDoesNotAddStreamAfterSessionClose(t *testing.T) {
 	// Closed flag only. recvLoop calls Session.Close on the following read
 	// error, and that Close is what shuts die. Closing die here would panic
 	// when Close runs dieOnce.
-	atomic.StoreInt32(&sess.closed, 1)
+	sess.closed.Store(1)
 	sess.streamLock.Unlock()
 	peer.Close()
 
@@ -541,7 +554,7 @@ func newUnitTestStream() *stream {
 
 func TestStreamWaitReadTimeout(t *testing.T) {
 	s := newUnitTestStream()
-	s.readDeadline.Store(time.Now().Add(20 * time.Millisecond))
+	s.readDeadline.Set(time.Now().Add(20 * time.Millisecond))
 	if err := s.waitRead(); err != ErrTimeout {
 		t.Fatalf("expected ErrTimeout, got %v", err)
 	}
@@ -613,7 +626,7 @@ func TestStreamRecycleTokens(t *testing.T) {
 
 func TestStreamRecycleTokensShrinksBufferRing(t *testing.T) {
 	s := newUnitTestStream()
-	for i := 0; i < defaultBufferRingCapacity*2; i++ {
+	for i := range defaultBufferRingCapacity * 2 {
 		buf := defaultAllocator.Get(1)
 		(*buf)[0] = byte(i)
 		s.pushBytes(buf)
@@ -634,7 +647,7 @@ func TestStreamUpdateNotifiesWriter(t *testing.T) {
 	s := newUnitTestStream()
 	s.update(7, 9)
 
-	if got := atomic.LoadUint32(&s.peerConsumed); got != 7 {
+	if got := s.peerConsumed.Load(); got != 7 {
 		t.Fatalf("peerConsumed mismatch: %d", got)
 	}
 	if got := atomic.LoadUint32(&s.peerWindow); got != 9 {
@@ -691,7 +704,7 @@ func TestSendWindowUpdateTimeout(t *testing.T) {
 		die:                make(chan struct{}),
 	}
 	st := newStream(1, cfg.MaxFrameSize, sess)
-	st.readDeadline.Store(time.Now().Add(-time.Second))
+	st.readDeadline.Set(time.Now().Add(-time.Second))
 
 	if err := st.sendWindowUpdate(1); err != ErrTimeout {
 		t.Fatalf("expected ErrTimeout, got %v", err)
@@ -744,8 +757,8 @@ func TestWriteV2ClosedPipe(t *testing.T) {
 
 func TestWriteV2ConsumedError(t *testing.T) {
 	s := newUnitTestStreamV2()
-	atomic.StoreUint32(&s.peerConsumed, 10)
-	atomic.StoreUint32(&s.numWritten, 0)
+	s.peerConsumed.Store(10)
+	s.numWritten.Store(0)
 	atomic.StoreUint32(&s.peerWindow, 0)
 
 	if _, err := s.writeV2([]byte("x")); err != ErrConsumed {
@@ -756,9 +769,83 @@ func TestWriteV2ConsumedError(t *testing.T) {
 func TestWriteV2TimeoutWhenWindowZero(t *testing.T) {
 	s := newUnitTestStreamV2()
 	atomic.StoreUint32(&s.peerWindow, 0)
-	s.writeDeadline.Store(time.Now().Add(-time.Second))
+	s.writeDeadline.Set(time.Now().Add(-time.Second))
 
 	if _, err := s.writeV2([]byte("data")); err != ErrTimeout {
 		t.Fatalf("expected ErrTimeout, got %v", err)
+	}
+}
+
+func TestWriteV2CounterWraparound(t *testing.T) {
+	config := DefaultConfig()
+	config.Version = 2
+	clientConn, serverConn := net.Pipe()
+	clientSession, err := Client(clientConn, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	serverSession, err := Server(serverConn, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+
+	clientStream, err := clientSession.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverStream, err := serverSession.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const transferSize = 512 << 10
+	// Model an existing transfer just below 4 GiB, then send through the wrap.
+	start := ^uint32(0) - 1023
+	clientStream.numWritten.Store(start)
+	clientStream.peerConsumed.Store(start)
+	atomic.StoreUint32(&serverStream.numRead, start)
+
+	payload := bytes.Repeat([]byte{0x5a}, transferSize)
+	writeDone := make(chan error, 1)
+	go func() {
+		n, err := clientStream.Write(payload)
+		if err == nil && n != len(payload) {
+			err = io.ErrShortWrite
+		}
+		writeDone <- err
+	}()
+
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(serverStream, received); err != nil {
+		t.Fatal("read across counter wraparound:", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal("write across counter wraparound:", err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("payload changed across counter wraparound")
+	}
+
+	want := start + uint32(transferSize)
+	if want >= start {
+		t.Fatal("test transfer did not cross the uint32 boundary")
+	}
+	if got := clientStream.numWritten.Load(); got != want {
+		t.Fatalf("numWritten = %d; want %d", got, want)
+	}
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		if got := clientStream.peerConsumed.Load(); got == want {
+			break
+		}
+		select {
+		case <-clientStream.chUpdate:
+		case <-timer.C:
+			t.Fatalf("peerConsumed = %d; want %d", clientStream.peerConsumed.Load(), want)
+		}
 	}
 }
