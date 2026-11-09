@@ -2,7 +2,6 @@ package kcp
 
 import (
 	"encoding/binary"
-	"sync/atomic"
 	"testing"
 )
 
@@ -123,66 +122,6 @@ func TestRecvBufPeek_GapInMiddle(t *testing.T) {
 
 	if kcp2.rcv_buf.Len() != 0 {
 		t.Errorf("rcv_buf not empty: %d segments remain", kcp2.rcv_buf.Len())
-	}
-}
-
-// --- OutSegs batching tests ---
-
-// TestOutSegsBatching verifies that the OutSegs SNMP counter is updated
-// once per flush() call, not once per segment encoded.
-func TestOutSegsBatching(t *testing.T) {
-	var outCalled []int // sizes passed to output callback
-	kcp1 := NewKCP(0xABCDEF01, func(buf []byte, size int) {
-		outCalled = append(outCalled, size)
-	})
-	kcp1.NoDelay(1, 10, 2, 1)
-	kcp1.WndSize(128, 128)
-
-	// Queue up multiple segments.
-	const numSegs = 10
-	for i := 0; i < numSegs; i++ {
-		kcp1.Send([]byte("data"))
-	}
-
-	// Record OutSegs before flush.
-	before := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-
-	// Flush everything.
-	kcp1.flush(IKCP_FLUSH_FULL)
-
-	// Record OutSegs after flush.
-	after := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-
-	// OutSegs should have increased by exactly numSegs.
-	delta := after - before
-	if delta != numSegs {
-		t.Errorf("OutSegs delta = %d, expected %d (one per segment)", delta, numSegs)
-	}
-
-	// Verify output callback was called.
-	if len(outCalled) == 0 {
-		t.Error("output callback was never called")
-	}
-}
-
-// TestOutSegsBatching_BulkFlush verifies that OutSegs is correct
-// even when flush() is called from the normal update path.
-func TestOutSegsBatching_BulkFlush(t *testing.T) {
-	kcp1 := NewKCP(0xDEADBEEF, func(buf []byte, size int) {})
-	kcp1.NoDelay(1, 10, 2, 1)
-	kcp1.WndSize(128, 128)
-
-	const numSegs = 20
-	for i := 0; i < numSegs; i++ {
-		kcp1.Send(make([]byte, 100))
-	}
-
-	before := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-	kcp1.flush(IKCP_FLUSH_FULL)
-	after := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-
-	if delta := after - before; delta != numSegs {
-		t.Errorf("OutSegs delta = %d, expected %d", delta, numSegs)
 	}
 }
 

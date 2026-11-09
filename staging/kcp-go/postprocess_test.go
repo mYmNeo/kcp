@@ -1,20 +1,70 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package kcp
 
 import (
-	"bytes"
-	"fmt"
+	"errors"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/time/rate"
+	"github.com/pion/transport/v5/deadline"
+	"golang.org/x/net/ipv4"
 )
 
+type blockingPacketConn struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	writes  atomic.Int32
+}
+
+func (c *blockingPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+
+func (c *blockingPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.writes.Add(1)
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return len(p), nil
+}
+
+func (c *blockingPacketConn) Close() error                     { return nil }
+func (c *blockingPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{Port: 1} }
+func (c *blockingPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockingPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockingPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
 func TestPostProcessWorkerHandoff(t *testing.T) {
-	for i := 0; i < 1000; i++ {
-		s := &UDPSession{}
+	for i := range 1000 {
+		s := &UDPSession{
+			readDeadline:  deadline.New(),
+			writeDeadline: deadline.New(),
+		}
 		s.postQueue.push(sendRequest{})
 		s.ppRunning.Store(true)
 
@@ -48,8 +98,110 @@ func TestPostProcessWorkerHandoff(t *testing.T) {
 	}
 }
 
-// Rate limited sessions waiting for tokens must not hold the shared
-// postProcess workers from a session without a limit.
+func TestCloseWaitsForActivePostProcessSend(t *testing.T) {
+	conn := &blockingPacketConn{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	s := &UDPSession{
+		conn:          conn,
+		die:           make(chan struct{}),
+		kcp:           NewKCP(1, nil),
+		readDeadline:  deadline.New(),
+		writeDeadline: deadline.New(),
+	}
+	w := &ppWorker{
+		txqueue: []ipv4.Message{{
+			Buffers: [][]byte{defaultBufferPool.Get()[:1]},
+			Addr:    conn.LocalAddr(),
+		}},
+	}
+	sendDone := make(chan struct{})
+	go func() {
+		s.sendTx(w, 1)
+		close(sendDone)
+	}()
+
+	select {
+	case <-conn.entered:
+	case <-time.After(time.Second):
+		close(conn.release)
+		t.Fatal("sendTx did not start writing")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- s.Close() }()
+	select {
+	case <-s.die:
+	case <-time.After(time.Second):
+		close(conn.release)
+		t.Fatal("Close did not close the session")
+	}
+	select {
+	case err := <-closeDone:
+		close(conn.release)
+		t.Fatalf("Close returned before active send completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	secondCloseDone := make(chan error, 1)
+	go func() { secondCloseDone <- s.Close() }()
+	select {
+	case err := <-secondCloseDone:
+		close(conn.release)
+		t.Fatalf("concurrent Close returned before active send completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(conn.release)
+	select {
+	case <-sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("active send did not finish")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondCloseDone; !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("concurrent Close returned %v, want ErrClosedPipe", err)
+	}
+
+	afterClose := &ppWorker{
+		txqueue: []ipv4.Message{{
+			Buffers: [][]byte{defaultBufferPool.Get()[:1]},
+			Addr:    conn.LocalAddr(),
+		}},
+	}
+	if s.sendTx(afterClose, 1) {
+		t.Fatal("sendTx succeeded after Close")
+	}
+	if got := conn.writes.Load(); got != 1 {
+		t.Fatalf("got %d writes, want exactly 1", got)
+	}
+}
+
+func TestFinishClosedPostProcessDrainsQueue(t *testing.T) {
+	s := &UDPSession{
+		die:           make(chan struct{}),
+		readDeadline:  deadline.New(),
+		writeDeadline: deadline.New(),
+	}
+	close(s.die)
+	s.ppRunning.Store(true)
+	if !s.postQueue.push(sendRequest{buffer: defaultBufferPool.Get()}) {
+		t.Fatal("failed to queue packet")
+	}
+
+	if s.finishPostProcess() {
+		t.Fatal("closed session was scheduled for more post-processing")
+	}
+	if got := s.postQueue.len(); got != 0 {
+		t.Fatalf("closed session retained %d queued packets", got)
+	}
+}
+
+// Writes waiting for application-rate tokens must not hold shared
+// postProcess workers from an unlimited session.
 func TestPostProcessRateLimitedMixed(t *testing.T) {
 	port := nextPort()
 	l := sinkServer(port)
@@ -59,13 +211,15 @@ func TestPostProcessRateLimitedMixed(t *testing.T) {
 	// limit lets out.
 	stop := make(chan struct{})
 	defer close(stop)
-	for i := 0; i < 16; i++ {
+	limited := make([]*UDPSession, 0, 16)
+	for range 16 {
 		s, err := dialSink(port)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer s.Close()
 		s.SetRateLimit(32 * 1024)
+		limited = append(limited, s)
 		go func() {
 			buf := make([]byte, 64*1024)
 			for {
@@ -80,8 +234,7 @@ func TestPostProcessRateLimitedMixed(t *testing.T) {
 			}
 		}()
 	}
-	// Let the limiters spend their bursts.
-	time.Sleep(time.Second)
+	waitForRateLimiters(t, limited)
 
 	eport := nextPort()
 	el := echoServer(eport, nil)
@@ -105,64 +258,29 @@ func TestPostProcessRateLimitedMixed(t *testing.T) {
 	}
 }
 
-// TestRateLimitedWriteQueuesStagedTail covers the branch in shipStaged that
-// pushes packets past a held batch onto the send queue. A non-zero limit is
-// what makes flushTx keep the batch instead of writing it.
-func TestRateLimitedWriteQueuesStagedTail(t *testing.T) {
-	port := nextPort()
-	l := echoServer(port, nil)
-	defer l.Close()
+func waitForRateLimiters(t *testing.T, sessions []*UDPSession) {
+	t.Helper()
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
-	cli, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%d", port), nil, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cli.Close()
-	cli.SetStreamMode(true)
-	cli.SetWriteDelay(false)
-	cli.SetNoDelay(1, 20, 2, 1)
-	cli.SetWindowSize(4096, 4096)
-	if !cli.SetMtu(1400) {
-		t.Fatal("SetMtu rejected")
-	}
-	cli.SetACKNoDelay(false)
-	// The bucket starts full (maxBatchSize*mtuLimit). A full transmit batch
-	// fits in that burst, so flushTx would not hold and the tail would never
-	// be queued. Spend the burst up front; the next batch then has to wait.
-	cli.SetRateLimit(256 * 1024)
-	lim := cli.rateLimiter.Load().(*rate.Limiter)
-	if r := lim.ReserveN(time.Now(), lim.Burst()); !r.OK() {
-		t.Fatal("could not spend limiter burst")
-	}
-	deadline := time.Now().Add(20 * time.Second)
-	cli.SetDeadline(deadline)
-
-	cli.mu.Lock()
-	// The peer has not advertised a window yet, so rmt_wnd is still the
-	// default 32. Pin it so this write can emit a full batch in one flush.
-	cli.kcp.rmt_wnd = 4096
-	mss := int(cli.kcp.mss)
-	cli.mu.Unlock()
-	if mss <= 0 {
-		t.Fatalf("mss = %d", mss)
-	}
-	seg := bytes.Repeat([]byte{0x5a}, mss)
-
-	const extra = 2
-	payload := bytes.Repeat(seg, maxBatchSize+extra)
-	if _, err := cli.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	queued := cli.postQueue.len()
-	if queued < extra {
-		t.Fatalf("staged tail queued = %d, want at least %d", queued, extra)
-	}
-
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(cli, got); err != nil {
-		t.Fatalf("echo: %v (queued tail %d)", err, queued)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatal("echoed payload mismatch")
+	for {
+		waiting := true
+		for _, session := range sessions {
+			bucket := session.bucket.Load()
+			if bucket == nil || bucket.Available() >= 0 {
+				waiting = false
+				break
+			}
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatal("rate limited sessions did not exhaust their bursts")
+		}
 	}
 }

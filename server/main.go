@@ -106,7 +106,7 @@ func main() {
 		cli.IntFlag{
 			Name:  "ratelimit",
 			Value: 0,
-			Usage: "set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing.",
+			Usage: "limit application bytes accepted per second for a single KCP connection, excluding protocol overhead and retransmissions; 0 to disable",
 		},
 		cli.IntFlag{
 			Name:  "sndwnd",

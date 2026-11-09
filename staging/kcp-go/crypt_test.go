@@ -135,14 +135,16 @@ func TestSalsa20(t *testing.T) {
 }
 
 func cryptTest(t *testing.T, bc BlockCrypt) {
-	data := make([]byte, mtuLimit)
-	io.ReadFull(rand.Reader, data)
-	dec := make([]byte, mtuLimit)
-	enc := make([]byte, mtuLimit)
+	data := make([]byte, maxPacketSize)
+	if _, err := io.ReadFull(rand.Reader, data); err != nil {
+		t.Fatal(err)
+	}
+	dec := make([]byte, maxPacketSize)
+	enc := make([]byte, maxPacketSize)
 	bc.Encrypt(enc, data)
 	bc.Decrypt(dec, enc)
 	if !bytes.Equal(data, dec) {
-		t.Fail()
+		t.Fatal("decrypt did not restore the plaintext")
 	}
 }
 
@@ -171,14 +173,16 @@ func testAEAD(t *testing.T, bc BlockCrypt) {
 
 	nonceSize := aead.NonceSize()
 
-	size := mtuLimit - cryptHeaderSize - aead.Overhead()
+	size := maxPacketSize - cryptHeaderSize - aead.Overhead()
 	data := make([]byte, size)
-	io.ReadFull(rand.Reader, data)
+	if _, err := io.ReadFull(rand.Reader, data); err != nil {
+		t.Fatal(err)
+	}
 
 	// If the packet cannot accommodate the AEAD overhead, Open and Seal will
 	// allocate a new slice internally. Ensure this does not happen for
 	// packets sized to the MTU.
-	packet := make([]byte, mtuLimit)
+	packet := make([]byte, maxPacketSize)
 
 	// Seal
 	dst := packet[:nonceSize]
@@ -208,7 +212,54 @@ func testAEAD(t *testing.T, bc BlockCrypt) {
 	}
 
 	if !bytes.Equal(data, decrypted[nonceSize:]) {
-		t.Fail()
+		t.Fatal("Open did not restore the plaintext")
+	}
+}
+
+func TestAESGCMRejectsTamperedInput(t *testing.T) {
+	block, err := NewAESGCMCrypt(pass[:16])
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead := block.(*aeadCrypt)
+
+	nonce := bytes.Repeat([]byte{1}, aead.NonceSize())
+	plaintext := []byte("authenticated payload")
+	packet := make([]byte, aead.NonceSize(), aead.NonceSize()+len(plaintext)+aead.Overhead())
+	copy(packet, nonce)
+	sealed := aead.Seal(packet, nonce, plaintext, nil)
+	ciphertext := append([]byte(nil), sealed[aead.NonceSize():]...)
+
+	tests := []struct {
+		name       string
+		nonce      []byte
+		ciphertext []byte
+	}{
+		{
+			name:       "ciphertext",
+			nonce:      nonce,
+			ciphertext: append([]byte(nil), ciphertext...),
+		},
+		{
+			name:       "nonce",
+			nonce:      append([]byte(nil), nonce...),
+			ciphertext: ciphertext,
+		},
+	}
+	tests[0].ciphertext[0] ^= 1
+	tests[1].nonce[0] ^= 1
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := make([]byte, 0, len(plaintext))
+			got, err := aead.Open(dst, tt.nonce, tt.ciphertext, nil)
+			if err == nil {
+				t.Fatal("Open succeeded with tampered input")
+			}
+			if len(got) != 0 {
+				t.Fatalf("Open returned %d plaintext bytes after authentication failure", len(got))
+			}
+		})
 	}
 }
 
@@ -332,10 +383,10 @@ func BenchmarkSalsa20(b *testing.B) {
 }
 
 func benchCrypt(b *testing.B, bc BlockCrypt) {
-	data := make([]byte, mtuLimit)
+	data := make([]byte, maxPacketSize)
 	io.ReadFull(rand.Reader, data)
-	dec := make([]byte, mtuLimit)
-	enc := make([]byte, mtuLimit)
+	dec := make([]byte, maxPacketSize)
+	enc := make([]byte, maxPacketSize)
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(enc) * 2))
@@ -361,7 +412,7 @@ func BenchmarkCFB_AES_128_CRC32(b *testing.B) {
 		return
 	}
 
-	data := make([]byte, 1400, mtuLimit)
+	data := make([]byte, 1400, maxPacketSize)
 	b.SetBytes(1400)
 
 	for b.Loop() {
@@ -382,7 +433,7 @@ func BenchmarkAEAD_AES_128_GCM(b *testing.B) {
 		panic(err)
 	}
 
-	data := make([]byte, 1400, mtuLimit)
+	data := make([]byte, 1400, maxPacketSize)
 	b.SetBytes(1400)
 
 	nonce := data[:aead.NonceSize()]
@@ -400,7 +451,7 @@ func BenchmarkCFB_Salsa20_CRC32(b *testing.B) {
 		return
 	}
 
-	data := make([]byte, 1400, mtuLimit)
+	data := make([]byte, 1400, maxPacketSize)
 	b.SetBytes(1400)
 
 	for b.Loop() {
@@ -416,7 +467,7 @@ func BenchmarkAEAD_Chacha20_Poly1035(b *testing.B) {
 		panic(err)
 	}
 
-	data := make([]byte, 1400, mtuLimit)
+	data := make([]byte, 1400, maxPacketSize)
 	b.SetBytes(1400)
 
 	nonce := data[:aead.NonceSize()]
@@ -451,6 +502,9 @@ func TestCryptErrors(t *testing.T) {
 
 	if _, err := NewAESBlockCrypt(invalidKey); err == nil {
 		t.Error("NewAESBlockCrypt should fail with invalid key")
+	}
+	if _, err := NewAESGCMCrypt(invalidKey); err == nil {
+		t.Error("NewAESGCMCrypt should fail with invalid key")
 	}
 	if _, err := NewTEABlockCrypt(invalidKey); err == nil {
 		t.Error("NewTEABlockCrypt should fail with invalid key")

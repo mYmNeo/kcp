@@ -24,7 +24,6 @@ package kcp
 
 import (
 	"encoding/binary"
-	"sync/atomic"
 	"time"
 )
 
@@ -353,7 +352,7 @@ func (kcp *KCP) recycleSegment(seg *segment) {
 	if seg.data == nil {
 		return
 	}
-	if cap(seg.data) == mtuLimit && len(kcp.segFree) < cap(kcp.segFree) {
+	if cap(seg.data) == maxPacketSize && len(kcp.segFree) < cap(kcp.segFree) {
 		kcp.segFree = append(kcp.segFree, seg.data[:cap(seg.data)])
 	} else {
 		defaultBufferPool.Put(seg.data)
@@ -768,7 +767,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 				}
 			}
 			if pktType == IKCP_PACKET_REGULAR && repeat {
-				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
+				DefaultSnmp.increaseRepeatSegs()
 			}
 			if kcpTrace {
 				kcp.debugLog(IKCP_LOG_IN_PUSH, "conv", conv, "sn", sn, "una", una, "ts", ts, "packettype", pktType, "repeat", repeat)
@@ -791,8 +790,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		inSegs++
 		data = data[length:]
 	}
-	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
-
+	DefaultSnmp.addInSegs(inSegs)
 	// update rtt with the latest ts
 	// ignore the FEC packet
 	if updateRTT != 0 && pktType == IKCP_PACKET_REGULAR {
@@ -900,9 +898,9 @@ func (kcp *KCP) flushOneSend() bool {
 	if kcpTrace {
 		kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", slot.conv, "sn", slot.sn, "frg", slot.frg, "una", slot.una, "ts", slot.ts, "xmit", slot.xmit, "datalen", len(slot.data))
 	}
-	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
 	// Queue-length gauges are published by the periodic full flush. Storing
 	// them here bounced three shared counters on every data packet.
+	DefaultSnmp.increaseOutSegs()
 	return true
 }
 
@@ -1108,6 +1106,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				ptr = kcp.makeSpace(buffer, ptr, need)
 				ptr = segment.encode(ptr)
 				outSegs++
+
 				copy(ptr, segment.data)
 				ptr = ptr[len(segment.data):]
 
@@ -1130,20 +1129,19 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	// --- Phase 6: Update SNMP counters and congestion window ---
 	sum := lostSegs
 	if lostSegs > 0 {
-		atomic.AddUint64(&DefaultSnmp.LostSegs, lostSegs)
+		DefaultSnmp.addLostSegs(lostSegs)
 	}
 	if fastRetransSegs > 0 {
-		atomic.AddUint64(&DefaultSnmp.FastRetransSegs, fastRetransSegs)
+		DefaultSnmp.addFastRetransSegs(fastRetransSegs)
 		sum += fastRetransSegs
 	}
 	if earlyRetransSegs > 0 {
-		atomic.AddUint64(&DefaultSnmp.EarlyRetransSegs, earlyRetransSegs)
+		DefaultSnmp.addEarlyRetransSegs(earlyRetransSegs)
 		sum += earlyRetransSegs
 	}
 	if sum > 0 {
-		atomic.AddUint64(&DefaultSnmp.RetransSegs, sum)
+		DefaultSnmp.addRetransSegs(sum)
 	}
-
 	// cwnd update
 	if kcp.nocwnd == 0 {
 		// Update ssthresh after fast or early retransmit.
@@ -1171,10 +1169,11 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	if size := len(buffer) - len(ptr); size > 0 {
 		kcp.output(buffer, size)
 	}
-	atomic.AddUint64(&DefaultSnmp.OutSegs, outSegs)
-	atomic.StoreUint64(&DefaultSnmp.RingBufferSndQueue, uint64(kcp.snd_queue.Len()))
-	atomic.StoreUint64(&DefaultSnmp.RingBufferRcvQueue, uint64(kcp.rcv_queue.Len()))
-	atomic.StoreUint64(&DefaultSnmp.RingBufferSndBuffer, uint64(kcp.snd_buf.Len()))
+	DefaultSnmp.addOutSegs(outSegs)
+
+	DefaultSnmp.storeRingBufferSndQueue(kcp.snd_queue.Len())
+	DefaultSnmp.storeRingBufferRcvQueue(kcp.rcv_queue.Len())
+	DefaultSnmp.storeRingBufferSndBuffer(kcp.snd_buf.Len())
 	return nextUpdate
 }
 
@@ -1360,4 +1359,18 @@ func (kcp *KCP) SetLogger(mask KCPLogType, logger logoutput_callback) {
 	}
 	kcp.logmask = mask
 	kcp.log = logger
+}
+
+// ResetRTO resets the retransmission timeout (RTO) and resend timestamp
+// for all segments currently in the send buffer.
+//
+// This forces all unacknowledged segments to be eligible for immediate
+// retransmission during the next flush.
+func (kcp *KCP) ResetRTO() {
+	current := currentMs()
+
+	for segment := range kcp.snd_buf.ForEach {
+		segment.rto = kcp.rx_rto
+		segment.resendts = current
+	}
 }

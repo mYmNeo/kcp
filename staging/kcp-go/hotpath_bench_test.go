@@ -125,7 +125,7 @@ func BenchmarkKCPInput(b *testing.B) {
 	pkt := hotpathBenchPacket(conv, 0, payload)
 
 	// Pre-warm the buffer pool so the first Input's pool.Get doesn't
-	// allocate a fresh *[mtuLimit]byte and skew the measurement.
+	// allocate a fresh *[maxPacketSize]byte and skew the measurement.
 	warm := defaultBufferPool.Get()
 	defaultBufferPool.Put(warm)
 

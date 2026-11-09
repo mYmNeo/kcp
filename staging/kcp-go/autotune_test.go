@@ -23,101 +23,59 @@
 package kcp
 
 import (
+	"encoding/binary"
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestAutoTune(t *testing.T) {
-
-	// Group1
-	signals := []uint32{0, 0, 0, 0, 0, 0}
-	testGroup(t, 1, signals, -1, -1)
-
-	// Group2
-	signals = []uint32{0, 1, 0, 1, 0, 1}
-	testGroup(t, 2, signals, 1, 1)
-
-	// Group3
-	signals = []uint32{1, 0, 1, 0, 0, 1}
-	testGroup(t, 3, signals, 1, 1)
-
-	// Group4
-	signals = []uint32{1, 0, 0, 0, 0, 1}
-	testGroup(t, 4, signals, 4, -1)
-
-	// Group5
-	signals = []uint32{1, 1, 1, 1, 1, 1}
-	testGroup(t, 5, signals, -1, -1)
-
-	// Group6
-	signals = []uint32{1, 1, 0, 1, 1, 0}
-	testGroup(t, 6, signals, 1, 2)
-
-	// Group7
-	signals = []uint32{0, 1, 1, 1, 0, 1}
-	testGroup(t, 7, signals, 1, 3)
-
-	// Group8
-	signals = []uint32{1, 1, 1, 1, 1, 1}
-	testGroup(t, 8, signals, -1, -1)
-
-	// Group9
-	signals = []uint32{0, 1, 1, 1, 1, 0}
-	testGroup(t, 9, signals, -1, 4)
-
-	// Group10
-	signals = []uint32{0, 0, 1, 1, 0, 0}
-	testGroup(t, 10, signals, -1, 2)
-
-	// Group11
-	signals = []uint32{0, 0, 0, 1, 1, 1}
-	testGroup(t, 11, signals, -1, -1)
-
-	// Group12
-	signals = []uint32{0, 0, 0, 0, 0, 1}
-	testGroup(t, 12, signals, -1, -1)
-
-	// Group13
-	signals = []uint32{1, 0, 0, 0, 0, 1}
-	testGroup(t, 13, signals, 4, -1)
-
-	// Group14
-	signals = []uint32{1, 0, 0, 0, 0, 0}
-	testGroup(t, 14, signals, -1, -1)
-}
-
-func TestAutoTuneEdge(t *testing.T) {
-	// Edge Case0: Empty signals
-	signals := []uint32{}
-	testGroup(t, 0, signals, -1, -1)
-
-	// Edge Case: 1 signal
-	signals = []uint32{1}
-	testGroup(t, 2, signals, -1, -1)
-
-	// Edge Case: 2 signals
-	signals = []uint32{1, 0}
-	testGroup(t, 3, signals, -1, -1)
-
-	// Edge Case: 3 signals
-	signals = []uint32{1, 0, 1}
-	testGroup(t, 4, signals, 1, -1)
-}
-
-func testGroup(t *testing.T, gid int, signals []uint32, expectedFalse, expectedTrue int) {
-	tune := autoTune{}
-	for i, signal := range signals {
-		if signal == 0 {
-			tune.Sample(false, uint32(i))
-		} else {
-			tune.Sample(true, uint32(i))
-		}
+// Auto-tune coverage includes:
+//   - ring-buffer overwrite, pulse-width changes, and sequence-number wraparound;
+//   - exhaustive bounded signal, loss, gap, arrival-order, duplicate, and
+//     conflicting-duplicate patterns;
+//   - FEC decoder reconfiguration across small and boundary shard counts,
+//     convergence after a lost shard, and rejection above the shard limit.
+//
+// The exhaustive matrices cover finite sample windows. They cannot enumerate
+// an unbounded packet stream, so focused tests cover long-running state changes.
+func logAutoTunePattern(t *testing.T, tune *autoTune) {
+	t.Helper()
+	if tune.count == 0 {
+		t.Log("pattern: <empty>")
+		return
 	}
 
-	t.Log("Group#", gid, signals, tune.FindPeriod(false), tune.FindPeriod(true))
-	assert.Equal(t, expectedTrue, tune.FindPeriod(true))
-	assert.Equal(t, expectedFalse, tune.FindPeriod(false))
+	samples := make([]pulse, tune.count)
+	for i := range tune.count {
+		samples[i] = tune.pulses[(tune.head+i)%maxAutoTuneSamples]
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		return _itimediff(samples[i].seq, samples[j].seq) < 0
+	})
+
+	var pattern strings.Builder
+	for i, sample := range samples {
+		if i > 0 {
+			delta := _itimediff(sample.seq, samples[i-1].seq)
+			switch {
+			case delta == 0:
+				pattern.WriteByte('=')
+			case delta > 1:
+				pattern.WriteString(strings.Repeat(".", int(delta)-1))
+			}
+		}
+		if sample.bit {
+			pattern.WriteByte('#')
+		} else {
+			pattern.WriteByte('_')
+		}
+	}
+	t.Logf("pattern: %s (#=data/high, _=parity/low, .=missing, = duplicate sequence)", pattern.String())
 }
 
 func TestAutoTuneOverflow(t *testing.T) {
@@ -173,17 +131,17 @@ func TestAutoTuneRingBufferWrapAround(t *testing.T) {
 	// Test with various periods after buffer wrap-around
 	testCases := []struct {
 		name           string
-		period         int  // period of the signal
-		totalSamples   int  // total samples to generate (should exceed maxAutoTuneSamples)
-		expectedPeriod int  // expected period shown in diagnostic output
-		bit            bool // which bit's period to find
+		period         int
+		totalSamples   int
+		expectedPeriod int
+		bit            bool
 	}{
-		{"Period3_2xBuffer", 3, maxAutoTuneSamples * 2, 3, true},
-		{"Period5_3xBuffer", 5, maxAutoTuneSamples * 3, 5, true},
-		{"Period7_4xBuffer", 7, maxAutoTuneSamples * 4, 7, true},
-		{"Period10_2xBuffer", 10, maxAutoTuneSamples * 2, 10, true},
-		{"Period3_2xBuffer_False", 3, maxAutoTuneSamples * 2, 3, false},
-		{"Period5_3xBuffer_False", 5, maxAutoTuneSamples * 3, 5, false},
+		{"Period3_2xBuffer", 3, maxAutoTuneSamples * 2, 1, true},
+		{"Period5_3xBuffer", 5, maxAutoTuneSamples * 3, 2, true},
+		{"Period7_4xBuffer", 7, maxAutoTuneSamples * 4, 3, true},
+		{"Period10_2xBuffer", 10, maxAutoTuneSamples * 2, 5, true},
+		{"Period3_2xBuffer_False", 3, maxAutoTuneSamples * 2, 2, false},
+		{"Period5_3xBuffer_False", 5, maxAutoTuneSamples * 3, 3, false},
 	}
 
 	for _, tc := range testCases {
@@ -210,9 +168,7 @@ func TestAutoTuneRingBufferWrapAround(t *testing.T) {
 			t.Logf("Period=%d, TotalSamples=%d, Found=%d, Expected=%d",
 				tc.period, tc.totalSamples, foundPeriod, tc.expectedPeriod)
 
-			// This test checks for a valid result; exact periods are checked by
-			// TestAutoTuneExactPeriodAfterWrap.
-			assert.True(t, foundPeriod > 0, "Should find a valid period")
+			assert.Equal(t, tc.expectedPeriod, foundPeriod)
 		})
 	}
 }
@@ -287,9 +243,8 @@ func TestAutoTuneVariousPeriodsFull(t *testing.T) {
 			t.Logf("Period=%d, TrueDuration=%d, FoundTrue=%d, FoundFalse=%d",
 				period, trueDuration, periodTrue, periodFalse)
 
-			// Should find valid periods
-			assert.True(t, periodTrue > 0 || periodFalse > 0,
-				"Should find at least one valid period")
+			assert.Equal(t, trueDuration, periodTrue)
+			assert.Equal(t, period-trueDuration, periodFalse)
 		})
 	}
 }
@@ -309,7 +264,7 @@ func TestAutoTuneContinuousOverwrite(t *testing.T) {
 
 	p1 := tune.FindPeriod(true)
 	t.Logf("Phase 1: Period 4 signal, found period=%d", p1)
-	assert.True(t, p1 > 0, "Should find period in phase 1")
+	assert.Equal(t, 2, p1, "Should find the data-shard width in phase 1")
 
 	// Second phase: continue with period 6 signal
 	// After enough samples, the old period 4 data should be overwritten
@@ -322,7 +277,7 @@ func TestAutoTuneContinuousOverwrite(t *testing.T) {
 
 	p2 := tune.FindPeriod(true)
 	t.Logf("Phase 2: Period 6 signal, found period=%d", p2)
-	assert.True(t, p2 > 0, "Should find period in phase 2")
+	assert.Equal(t, 3, p2, "Should find the data-shard width in phase 2")
 
 	// Third phase: continue with period 8 signal
 	period3 := 8
@@ -334,7 +289,7 @@ func TestAutoTuneContinuousOverwrite(t *testing.T) {
 
 	p3 := tune.FindPeriod(true)
 	t.Logf("Phase 3: Period 8 signal, found period=%d", p3)
-	assert.True(t, p3 > 0, "Should find period in phase 3")
+	assert.Equal(t, 4, p3, "Should find the data-shard width in phase 3")
 }
 
 // TestAutoTunePeriodChangeAfterOverwrite tests that when signal pattern changes,
@@ -571,12 +526,580 @@ func TestAutoTuneSequenceWrapAround(t *testing.T) {
 		tune.Sample(bit, startSeq+uint32(i))
 	}
 
-	// Note: With sequence wrap-around, FindPeriod might return -1
-	// because it checks for continuous sequences (lastPulse.seq+1 == sorted[idx].seq)
-	// This is expected behavior - the test documents this edge case
 	periodTrue := tune.FindPeriod(true)
 	periodFalse := tune.FindPeriod(false)
 
 	t.Logf("Sequence wrap-around test: FoundTrue=%d, FoundFalse=%d", periodTrue, periodFalse)
-	// We don't assert specific values here as this is an edge case documentation
+	assert.Equal(t, 2, periodTrue)
+	assert.Equal(t, 2, periodFalse)
+}
+
+func TestAutoTuneWithMissingAndDuplicateSamples(t *testing.T) {
+	tune := autoTune{}
+	for seq := range uint32(20) {
+		if seq == 1 || seq == 6 || seq == 9 {
+			continue
+		}
+		bit := seq%5 < 3
+		tune.Sample(bit, seq)
+		if seq == 5 {
+			tune.Sample(bit, seq)
+		}
+	}
+
+	assert.Equal(t, 3, tune.FindPeriod(true))
+	assert.Equal(t, 2, tune.FindPeriod(false))
+}
+
+func TestAutoTuneFindsPulseAfterMissingBoundary(t *testing.T) {
+	tests := []struct {
+		name        string
+		missingSeqs []uint32
+		wantData    int
+		wantParity  int
+	}{
+		{
+			name:        "missing sample inside pulse",
+			missingSeqs: []uint32{1, 7},
+			wantData:    3,
+			wantParity:  2,
+		},
+		{
+			name:        "missing first pulse end boundary",
+			missingSeqs: []uint32{3},
+			wantData:    3,
+			wantParity:  2,
+		},
+		{
+			name:        "missing first pulse start boundary",
+			missingSeqs: []uint32{5},
+			wantData:    3,
+			wantParity:  2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tune := autoTune{}
+			for seq := range uint32(30) {
+				missing := slices.Contains(tt.missingSeqs, seq)
+				if missing {
+					continue
+				}
+				tune.Sample(seq%5 < 3, seq)
+			}
+
+			assert.Equal(t, tt.wantData, tune.FindPeriod(true))
+			assert.Equal(t, tt.wantParity, tune.FindPeriod(false))
+		})
+	}
+}
+
+func TestAutoTuneDiscardsConflictingDuplicateSequence(t *testing.T) {
+	tune := autoTune{}
+	for seq := range uint32(30) {
+		bit := seq%5 < 3
+		tune.Sample(bit, seq)
+		tune.Sample(bit, seq)
+		if seq == 5 || seq == 10 {
+			tune.Sample(!bit, seq)
+		}
+	}
+
+	assert.Equal(t, 3, tune.FindPeriod(true))
+	assert.Equal(t, 2, tune.FindPeriod(false))
+}
+
+func TestAutoTuneDoesNotInferPulseAcrossMissingBoundary(t *testing.T) {
+	tune := autoTune{}
+	for seq, bit := range []bool{false, true, true, false, false} {
+		if seq == 1 || seq == 4 {
+			continue
+		}
+		tune.Sample(bit, uint32(seq*2))
+	}
+
+	assert.Equal(t, -1, tune.FindPeriod(true))
+	assert.Equal(t, -1, tune.FindPeriod(false))
+}
+
+func TestAutoTuneDoesNotInferPulseAcrossInternalGap(t *testing.T) {
+	tune := autoTune{}
+	tune.Sample(false, 0)
+	tune.Sample(true, 1)
+	// Sequence 2 is a missing parity shard. Treating the data samples at
+	// sequences 1 and 3 as one pulse would incorrectly infer a width of 3.
+	tune.Sample(true, 3)
+	tune.Sample(false, 4)
+
+	assert.Equal(t, -1, tune.FindPeriod(true))
+}
+
+func TestAutoTuneExhaustiveEightSampleSignalAndLossPatterns(t *testing.T) {
+	const windowSize = 8
+	const patternCount = 1 << windowSize
+
+	startSeqs := []uint32{
+		0,
+		^uint32(0) - uint32(windowSize) + 1,
+	}
+
+	for _, startSeq := range startSeqs {
+		for signalPattern := range patternCount {
+			for receivedPattern := range patternCount {
+				for _, reverse := range []bool{false, true} {
+					tune := autoTune{}
+					for offset := range windowSize {
+						i := offset
+						if reverse {
+							i = windowSize - 1 - offset
+						}
+						if receivedPattern&(1<<i) != 0 {
+							tune.Sample(signalPattern&(1<<i) != 0, startSeq+uint32(i))
+						}
+					}
+
+					for _, bit := range []bool{false, true} {
+						got := tune.FindPeriod(bit)
+						want := completePulsePeriod(signalPattern, receivedPattern, windowSize, bit)
+						if got != want {
+							t.Fatalf(
+								"start=%d reverse=%t signals=%08b received=%08b bit=%t: got period %d, want %d",
+								startSeq, reverse, signalPattern, receivedPattern, bit, got, want,
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestAutoTuneExhaustiveEightSampleGapPatterns(t *testing.T) {
+	const (
+		sampleCount = 8
+		signalCount = 1 << sampleCount
+		gapCount    = 1 << (sampleCount - 1)
+	)
+
+	startSeqs := []uint32{
+		0,
+		^uint32(0) - uint32(2*(sampleCount-1)) + 1,
+	}
+
+	for _, startSeq := range startSeqs {
+		for signalPattern := range signalCount {
+			for gapPattern := range gapCount {
+				samples := make([]pulse, sampleCount)
+				samples[0] = pulse{
+					bit: signalPattern&1 != 0,
+					seq: startSeq,
+				}
+				for i := 1; i < sampleCount; i++ {
+					step := uint32(1)
+					if gapPattern&(1<<(i-1)) != 0 {
+						// FindPeriod only distinguishes adjacent sequence
+						// numbers from any gap, so 2 represents all gaps.
+						step = 2
+					}
+					samples[i] = pulse{
+						bit: signalPattern&(1<<i) != 0,
+						seq: samples[i-1].seq + step,
+					}
+				}
+
+				for _, reverse := range []bool{false, true} {
+					tune := autoTune{}
+					for offset := range sampleCount {
+						i := offset
+						if reverse {
+							i = sampleCount - 1 - offset
+						}
+						tune.Sample(samples[i].bit, samples[i].seq)
+					}
+
+					for _, bit := range []bool{false, true} {
+						got := tune.FindPeriod(bit)
+						want := completePulsePeriodForSamples(samples, bit)
+						if got != want {
+							t.Fatalf(
+								"start=%d reverse=%t signals=%08b gaps=%07b bit=%t: got period %d, want %d",
+								startSeq, reverse, signalPattern, gapPattern, bit, got, want,
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestAutoTuneExhaustiveArrivalOrders(t *testing.T) {
+	const (
+		windowSize   = 5
+		patternCount = 1 << windowSize
+	)
+
+	startSeqs := []uint32{
+		0,
+		^uint32(0) - uint32(windowSize) + 1,
+	}
+
+	for _, startSeq := range startSeqs {
+		for signalPattern := range patternCount {
+			for receivedPattern := range patternCount {
+				indices := make([]int, 0, windowSize)
+				for i := range windowSize {
+					if receivedPattern&(1<<i) != 0 {
+						indices = append(indices, i)
+					}
+				}
+
+				forEachPermutation(indices, func(order []int) {
+					tune := autoTune{}
+					for _, i := range order {
+						tune.Sample(signalPattern&(1<<i) != 0, startSeq+uint32(i))
+					}
+
+					for _, bit := range []bool{false, true} {
+						got := tune.FindPeriod(bit)
+						want := completePulsePeriod(signalPattern, receivedPattern, windowSize, bit)
+						if got != want {
+							t.Fatalf(
+								"start=%d signals=%05b received=%05b order=%v bit=%t: got period %d, want %d",
+								startSeq, signalPattern, receivedPattern, order, bit, got, want,
+							)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAutoTuneExhaustiveDuplicatePatterns(t *testing.T) {
+	const (
+		windowSize       = 5
+		signalCount      = 1 << windowSize
+		sampleStateCount = 1 << (2 * windowSize)
+	)
+
+	startSeqs := []uint32{
+		0,
+		^uint32(0) - uint32(windowSize) + 1,
+	}
+
+	for _, startSeq := range startSeqs {
+		for signalPattern := range signalCount {
+			for sampleStates := range sampleStateCount {
+				receivedPattern := 0
+				for i := range windowSize {
+					state := sampleStates >> (2 * i) & 3
+					if state == 1 || state == 2 {
+						receivedPattern |= 1 << i
+					}
+				}
+
+				for _, reverse := range []bool{false, true} {
+					tune := autoTune{}
+					for offset := range windowSize {
+						i := offset
+						if reverse {
+							i = windowSize - 1 - offset
+						}
+
+						state := sampleStates >> (2 * i) & 3
+						bit := signalPattern&(1<<i) != 0
+						seq := startSeq + uint32(i)
+						switch state {
+						case 1:
+							tune.Sample(bit, seq)
+						case 2:
+							tune.Sample(bit, seq)
+							tune.Sample(bit, seq)
+						case 3:
+							tune.Sample(bit, seq)
+							tune.Sample(!bit, seq)
+						}
+					}
+
+					for _, bit := range []bool{false, true} {
+						got := tune.FindPeriod(bit)
+						want := completePulsePeriod(signalPattern, receivedPattern, windowSize, bit)
+						if got != want {
+							t.Fatalf(
+								"start=%d reverse=%t signals=%05b states=%010b bit=%t: got period %d, want %d",
+								startSeq, reverse, signalPattern, sampleStates, bit, got, want,
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func forEachPermutation(values []int, fn func([]int)) {
+	var permute func(int)
+	permute = func(index int) {
+		if index == len(values) {
+			fn(values)
+			return
+		}
+
+		for i := index; i < len(values); i++ {
+			values[index], values[i] = values[i], values[index]
+			permute(index + 1)
+			values[index], values[i] = values[i], values[index]
+		}
+	}
+	permute(0)
+}
+
+func completePulsePeriod(signalPattern, receivedPattern, windowSize int, bit bool) int {
+	bitAt := func(i int) bool {
+		return signalPattern&(1<<i) != 0
+	}
+	receivedAt := func(i int) bool {
+		return receivedPattern&(1<<i) != 0
+	}
+
+	for left := 1; left < windowSize; left++ {
+		if !receivedAt(left-1) || !receivedAt(left) ||
+			bitAt(left-1) == bit || bitAt(left) != bit {
+			continue
+		}
+
+		for right := left + 1; right < windowSize; right++ {
+			if !receivedAt(right) {
+				break
+			}
+			if bitAt(right) != bit {
+				return right - left
+			}
+		}
+	}
+
+	return -1
+}
+
+func completePulsePeriodForSamples(samples []pulse, bit bool) int {
+	for left := 1; left < len(samples); left++ {
+		if samples[left-1].bit == bit || samples[left].bit != bit ||
+			samples[left-1].seq+1 != samples[left].seq {
+			continue
+		}
+
+		for right := left + 1; right < len(samples); right++ {
+			if samples[right-1].seq+1 != samples[right].seq {
+				break
+			}
+			if samples[right].bit != bit {
+				return int(_itimediff(samples[right].seq, samples[left].seq))
+			}
+		}
+	}
+
+	return -1
+}
+
+func TestFECDecoderAutoTunesConfigurationMatrix(t *testing.T) {
+	scenarios := []struct {
+		name      string
+		missing   bool
+		duplicate bool
+	}{
+		{name: "clean"},
+		{name: "duplicate_data", duplicate: true},
+		{name: "missing_shard", missing: true},
+		{name: "missing_and_duplicate", missing: true, duplicate: true},
+	}
+	configurations := make([]struct {
+		dataShards   int
+		parityShards int
+	}, 0, 272)
+	for dataShards := 1; dataShards <= 16; dataShards++ {
+		for parityShards := 1; parityShards <= 16; parityShards++ {
+			configurations = append(configurations, struct {
+				dataShards   int
+				parityShards int
+			}{dataShards, parityShards})
+		}
+	}
+	configurations = append(configurations,
+		struct {
+			dataShards   int
+			parityShards int
+		}{32, 1},
+		struct {
+			dataShards   int
+			parityShards int
+		}{1, 32},
+		struct {
+			dataShards   int
+			parityShards int
+		}{127, 1},
+		struct {
+			dataShards   int
+			parityShards int
+		}{1, 127},
+		struct {
+			dataShards   int
+			parityShards int
+		}{255, 1},
+		struct {
+			dataShards   int
+			parityShards int
+		}{1, 255},
+	)
+
+	for _, tc := range configurations {
+		for _, scenario := range scenarios {
+			t.Run(
+				fmt.Sprintf("%d-data-%d-parity/%s", tc.dataShards, tc.parityShards, scenario.name),
+				func(t *testing.T) {
+					encoder := newFECEncoder(tc.dataShards, tc.parityShards, 0)
+					decoder := newFECDecoder(2, 2)
+					if encoder == nil || decoder == nil {
+						t.Fatal("failed to create FEC encoder or decoder")
+					}
+					t.Cleanup(func() {
+						logAutoTunePattern(t, &decoder.autoTune)
+					})
+
+					dropDataShard, dropParityShard, duplicateDataShard := -1, -1, -1
+					if scenario.missing {
+						if tc.dataShards > 1 {
+							dropDataShard = 1
+						} else {
+							dropParityShard = min(1, tc.parityShards-1)
+						}
+					}
+					if scenario.duplicate {
+						duplicateDataShard = tc.dataShards - 1
+						if duplicateDataShard == dropDataShard {
+							duplicateDataShard = 0
+						}
+					}
+					feedFECGroupWithMutations(t, encoder, decoder, dropDataShard, dropParityShard, duplicateDataShard)
+					if scenario.missing || scenario.duplicate {
+						t.Log("pattern after injected anomalies:")
+						logAutoTunePattern(t, &decoder.autoTune)
+					}
+					feedFECGroup(t, encoder, decoder, -1)
+					if scenario.missing {
+						// A 1-data/1-parity configuration needs another data
+						// edge after the recovered parity pulse.
+						feedFECGroup(t, encoder, decoder, -1)
+					}
+
+					if decoder.dataShards != tc.dataShards || decoder.parityShards != tc.parityShards {
+						t.Fatalf(
+							"auto-tuned to %d data/%d parity, want %d data/%d parity",
+							decoder.dataShards, decoder.parityShards, tc.dataShards, tc.parityShards,
+						)
+					}
+				},
+			)
+		}
+	}
+}
+
+func TestFECDecoderAutoTunesAfterIncompleteGroup(t *testing.T) {
+	encoder := newFECEncoder(4, 2, 0)
+	decoder := newFECDecoder(1, 1)
+	if encoder == nil || decoder == nil {
+		t.Fatal("failed to create FEC encoder or decoder")
+	}
+
+	// Drop a data shard from the first group. The decoder must ignore its
+	// ambiguous pulse and tune from the following complete group.
+	feedFECGroup(t, encoder, decoder, 2)
+	feedFECGroup(t, encoder, decoder, -1)
+
+	if decoder.dataShards != 4 || decoder.parityShards != 2 {
+		t.Fatalf(
+			"auto-tuned to %d data/%d parity, want 4 data/2 parity",
+			decoder.dataShards, decoder.parityShards,
+		)
+	}
+}
+
+func TestFECDecoderRejectsAutoTuneConfigurationOverShardLimit(t *testing.T) {
+	decoder := newFECDecoder(2, 2)
+	if decoder == nil {
+		t.Fatal("failed to create FEC decoder")
+	}
+
+	decoder.autoTune.Sample(false, 0)
+	for seq := uint32(1); seq <= 256; seq++ {
+		decoder.autoTune.Sample(true, seq)
+	}
+	decoder.autoTune.Sample(false, 257)
+
+	packet := make([]byte, fecHeaderSize)
+	binary.LittleEndian.PutUint32(packet, 258)
+	binary.LittleEndian.PutUint16(packet[4:], typeData)
+	decoder.decode(packet)
+
+	if decoder.dataShards != 2 || decoder.parityShards != 2 {
+		t.Fatalf(
+			"accepted invalid auto-tuned configuration %d data/%d parity",
+			decoder.dataShards, decoder.parityShards,
+		)
+	}
+}
+
+func feedFECGroup(t *testing.T, encoder *fecEncoder, decoder *fecDecoder, dropDataShard int) {
+	feedFECGroupWithMutations(t, encoder, decoder, dropDataShard, -1, -1)
+}
+
+func feedFECGroupWithDuplicate(t *testing.T, encoder *fecEncoder, decoder *fecDecoder, dropDataShard, duplicateDataShard int) {
+	feedFECGroupWithMutations(t, encoder, decoder, dropDataShard, -1, duplicateDataShard)
+}
+
+func feedFECGroupWithMutations(t *testing.T, encoder *fecEncoder, decoder *fecDecoder, dropDataShard, dropParityShard, duplicateDataShard int) {
+	t.Helper()
+	encoder.tsLatestPacket = time.Now().UnixMilli()
+	for dataShard := range encoder.dataShards {
+		packet := make([]byte, fecHeaderSizePlus2+32)
+		parity := encoder.encode(packet, ^uint32(0))
+		if dataShard != dropDataShard {
+			recycleRecoveredShards(decoder.decode(packet))
+			if dataShard == duplicateDataShard {
+				recycleRecoveredShards(decoder.decode(packet))
+			}
+		}
+		for parityShard, shard := range parity {
+			if parityShard == dropParityShard {
+				continue
+			}
+			recycleRecoveredShards(decoder.decode(fecPacket(shard)))
+		}
+	}
+}
+
+func recycleRecoveredShards(shards [][]byte) {
+	for _, shard := range shards {
+		defaultBufferPool.Put(shard)
+	}
+}
+
+func TestAutoTuneSupports256Shards(t *testing.T) {
+	decoder := newFECDecoder(1, 1)
+	if decoder == nil {
+		t.Fatal("failed to create decoder")
+	}
+
+	for seq := range uint32(257) {
+		decoder.autoTune.Sample(seq > 0 && seq < 256, seq)
+	}
+	packet := make([]byte, fecHeaderSize)
+	binary.LittleEndian.PutUint32(packet, 257)
+	binary.LittleEndian.PutUint16(packet[4:], typeData)
+	decoder.decode(packet)
+
+	assert.Equal(t, 255, decoder.dataShards)
+	assert.Equal(t, 1, decoder.parityShards)
+	assert.Equal(t, 256, decoder.shardSize)
 }

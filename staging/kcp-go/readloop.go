@@ -24,7 +24,6 @@ package kcp
 
 import (
 	"net"
-	"sync/atomic"
 
 	"github.com/pkg/errors"
 )
@@ -41,7 +40,7 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 
 // defaultReadLoop is the standard procedure for reading from a connection
 func (s *UDPSession) defaultReadLoop() {
-	buf := make([]byte, mtuLimit)
+	buf := make([]byte, maxPacketSize)
 
 	var src *net.UDPAddr
 	var srcStr string
@@ -73,11 +72,11 @@ func (s *UDPSession) defaultReadLoop() {
 		} else if src != nil {
 			udp, ok := addr.(*net.UDPAddr)
 			if !ok || !sameUDPAddr(src, udp) {
-				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+				DefaultSnmp.increaseInErrs()
 				continue
 			}
 		} else if addr.String() != srcStr {
-			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			DefaultSnmp.increaseInErrs()
 			continue
 		}
 
@@ -87,7 +86,7 @@ func (s *UDPSession) defaultReadLoop() {
 
 // defaultReadLoop is the standard procedure for reading and accepting connections on a listener
 func (l *Listener) defaultMonitor() {
-	buf := make([]byte, mtuLimit)
+	buf := make([]byte, maxPacketSize)
 	for {
 		n, from, err := l.conn.ReadFrom(buf)
 		if err != nil {
@@ -133,11 +132,11 @@ func (s *UDPSession) pushedPacket(b []byte, addr net.Addr, err error) {
 	}
 	if udp, ok := src.(*net.UDPAddr); ok {
 		if a, ok := addr.(*net.UDPAddr); !ok || !sameUDPAddr(udp, a) {
-			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			DefaultSnmp.increaseInErrs()
 			return
 		}
 	} else if addr.String() != src.String() {
-		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+		DefaultSnmp.increaseInErrs()
 		return
 	}
 	s.packetInput(b)

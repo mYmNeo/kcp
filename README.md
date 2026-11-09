@@ -214,7 +214,7 @@ GLOBAL OPTIONS:
    --autoexpire value               set auto expiration time(in seconds) for a single UDP connection, 0 to disable (default: 0)
    --scavengettl value              set how long an expired connection can live (in seconds) (default: 600)
    --mtu value                      set maximum transmission unit for UDP packets (default: 1350)
-   --ratelimit value                set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing. (default: 0)
+   --ratelimit value                limit application bytes accepted per second for a single KCP connection, excluding protocol overhead and retransmissions; 0 to disable (default: 0)
    --sndwnd value                   set send window size(num of packets) (default: 128)
    --rcvwnd value                   set receive window size(num of packets) (default: 512)
    --datashard value, --ds value    set reed-solomon erasure coding - datashard (default: 10)
@@ -257,7 +257,7 @@ GLOBAL OPTIONS:
    --crypt value                    sm4, tea, aes-128, aes-128-gcm, aes-192, blowfish, twofish, cast5, 3des, xtea, salsa20 (default: "aes-128-gcm")
    --mode value                     profiles: fast3, fast2, fast, normal, manual (default: "fast")
    --mtu value                      set maximum transmission unit for UDP packets (default: 1350)
-   --ratelimit value                set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing. (default: 0)
+   --ratelimit value                limit application bytes accepted per second for a single KCP connection, excluding protocol overhead and retransmissions; 0 to disable (default: 0)
    --sndwnd value                   set send window size(num of packets) (default: 1024)
    --rcvwnd value                   set receive window size(num of packets) (default: 1024)
    --datashard value, --ds value    set reed-solomon erasure coding - datashard (default: 10)
@@ -310,25 +310,13 @@ Each new kcptun UDP/KCP session uses one randomly selected port from the range; 
 - Valid ranges are `1–65535` with `min <= max`.
 - Single-port usage still works: `IP:29900` (no hyphen).
 
-### Rate Limit and Pacing
+### Application Write Rate Limit
 
-kcptun supports userspace packet pacing to smooth out data transmission.
+Use `--ratelimit <bytes-per-second>` to limit how quickly each KCP connection accepts application data. For example, `--ratelimit 1048576` limits accepted application writes to 1 MiB/s. The default is `0` (unlimited).
 
-**Why use it?**
+This is an application-byte limit, **not a wire-speed cap or packet pacer**. KCP/FEC/encryption headers, FEC parity, retransmissions, out-of-band traffic, and UDP/IP headers are excluded, so actual network throughput can exceed the configured value.
 
-Without pacing, KCP may send data in large bursts (micro-bursts). These sudden spikes can overflow the network interface card (NIC) buffers or the OS kernel's UDP buffer, causing **local packet drops** before the data even leaves your server. This is especially common on high-speed links or restricted environments.
-
-**How to use:**
-
-Use `--ratelimit <value>` to set the maximum outgoing speed (in bytes per second) for a single KCP connection.
-- Example: `--ratelimit 1048576` limits the speed to 1MB/s.
-- Default: `0` (unlimited).
-
-**Benefits:**
-
-1. **Prevents Kernel Drops**: Reduces the risk of `ENOBUFS` errors and kernel-level packet drops.
-2. **Smoother Traffic**: Creates a more consistent flow of packets, which is friendlier to intermediate routers and reduces jitter.
-3. **Bandwidth Control**: Useful for limiting upload speed on asymmetric networks (e.g., ADSL/Cable).
+The token bucket has a one-second capacity, allowing an initial burst before writes are throttled. A throttled write is interruptible by its write deadline, socket errors, or connection closure.
 
 ### Forward Error Correction
 
@@ -439,7 +427,7 @@ Available ciphers: sm4, tea, aes-128, aes-128-gcm (recommended), aes-192, blowfi
 Routers and mobile devices are susceptible to memory constraints. Setting the GOGC environment variable (e.g., GOGC=20) will cause the garbage collector to recycle memory more aggressively.
 Reference: https://blog.golang.org/go15gc
 
-Primary memory allocation is performed using a global buffer pool *xmit.Buf* in kcp-go. When bytes need to be allocated, they are obtained from this pool, and a *fixed-capacity* 1500-byte buffer (mtuLimit) is returned. The *rx queue*, *tx queue*, and *fec queue* all receive bytes from this pool and return them after use to prevent *unnecessary zeroing* of bytes. 
+Packet buffers come from kcp-go's global `defaultBufferPool`, backed by `sync.Pool`. Each buffer has a fixed capacity of 1472 bytes (`maxPacketSize`). The receive, transmit, and FEC paths return buffers after use to reduce repeated allocation and zeroing.
 The pool mechanism maintains a *high watermark* for slice objects. These *in-flight* objects from the pool survive periodic garbage collection, while the pool retains the ability to return memory to the runtime when idle. The parameters `-sndwnd`, `-rcvwnd`, `-ds`, and `-ps` affect this *high watermark*; larger values result in greater memory consumption.
 
 The `-smuxbuf` parameter also affects maximum memory consumption and maintains a delicate balance between *concurrency* and *resource usage*. You can increase this value (default 4MB) to boost concurrency if you have many clients to serve and a powerful server. Conversely, you can decrease this value to serve only 1-2 clients if you're running the program on an embedded SoC system with limited memory. (Note that the `-smuxbuf` value is not directly proportional to concurrency; testing is required.)

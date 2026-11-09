@@ -205,7 +205,7 @@ kcp-go uses the same `//go:build linux` / `!linux` split for `readloop*` / `tx*`
 
 ## Runtime/Tooling Preferences
 
-- **Runtime:** Go 1.27.0 at the root. Nested baselines differ (`staging/kcp-go` 1.24, `staging/smux` 1.18) — do not bump those casually. No Node/Bun/npm.
+- **Runtime:** Go 1.27.0 at the root. Nested baselines differ (`staging/kcp-go` 1.26.2, `staging/smux` 1.18) — do not bump those casually. No Node/Bun/npm.
 - **CGO:** not used. `CGO_ENABLED=0` everywhere except `build-release-cgo.sh` (static/external linking for RPM). Platform work is build tags, not cgo.
 - **No formatter/linter config.** `gofmt`/`go vet` locally. Root `.travis.yml` is GOPATH-era goveralls + `exit 0` — **non-gating**. Staging Travis files run real `go test` but target ancient Go.
 - **PGO:** `build.sh` uses `-pgo=auto`. Official release scripts do not.

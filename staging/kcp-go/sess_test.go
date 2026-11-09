@@ -30,20 +30,20 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
+	"math"
 	mrand "math/rand"
 	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
-	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
+	"github.com/juju/ratelimit"
+	"github.com/pion/transport/v5/deadline"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -53,14 +53,6 @@ var (
 	key      = []byte("testkey")
 	pass     = pbkdf2.Key(key, []byte("testsalt"), 4096, 32, sha1.New)
 )
-
-func init() {
-	go func() {
-		log.Println(http.ListenAndServe("0.0.0.0:6060", nil))
-	}()
-
-	log.Println("beginning tests, encryption:salsa20, fec:10/3")
-}
 
 func nextPort() int {
 	port := int(atomic.AddUint32(&baseport, 1))
@@ -286,14 +278,385 @@ func TestTimeout(t *testing.T) {
 
 	buf := make([]byte, 10)
 
-	// timeout
-	cli.SetDeadline(time.Now().Add(time.Second))
-	<-time.After(2 * time.Second)
+	// A past deadline must reject reads immediately.
+	cli.SetDeadline(time.Now().Add(-time.Millisecond))
 	n, err := cli.Read(buf)
 	if n != 0 || err == nil {
-		t.Fail()
-		return
+		t.Fatalf("Read() = %d, %v, want 0 and a timeout error", n, err)
 	}
+	if errors.Cause(err) != errTimeout {
+		t.Fatalf("Read() error = %v, want a timeout error", err)
+	}
+}
+
+// An empty write must not flush, since some callers probe the conn with it.
+func TestEmptyWriteDoesNotFlush(t *testing.T) {
+	var outputs atomic.Int64
+	s := new(UDPSession)
+	s.die = make(chan struct{})
+	s.chSocketWriteError = make(chan struct{})
+	s.kcp = NewKCP(1, func([]byte, int) { outputs.Add(1) })
+	// A queued segment that any flush would send.
+	s.kcp.Send([]byte("x"))
+	before := outputs.Load()
+	for range 10 {
+		if n, err := s.Write(nil); n != 0 || err != nil {
+			t.Fatalf("Write(nil) = %d, %v", n, err)
+		}
+	}
+	if got := outputs.Load(); got != before {
+		t.Fatalf("Write(nil) flushed %d times", got-before)
+	}
+	close(s.die)
+	if _, err := s.Write(nil); err == nil {
+		t.Fatal("Write(nil) on a closed session returned no error")
+	}
+}
+
+// A write that does not block must not pay for its deadline timer.
+func TestWriteWithDeadlineDoesNotAllocate(t *testing.T) {
+	l := sinkServer(0)
+	defer l.Close()
+	cli, err := dialSink(l.Addr().(*net.UDPAddr).Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	buf := make([]byte, 64)
+	write := func() {
+		if _, err := cli.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cli.SetWriteDeadline(time.Time{})
+	without := testing.AllocsPerRun(100, write)
+	cli.SetWriteDeadline(time.Now().Add(time.Minute))
+	with := testing.AllocsPerRun(100, write)
+	if with > without {
+		t.Fatalf("Write made %v allocations with a deadline and %v without", with, without)
+	}
+}
+
+func TestWriteRateLimitWaitsAndAcceptsLargeWrites(t *testing.T) {
+	bucket := ratelimit.NewBucketWithRate(100, 2)
+	if n := bucket.Available(); n != 2 {
+		t.Fatalf("bucket started with %d tokens, want 2", n)
+	}
+	s := newRateLimitTestSession(bucket)
+
+	start := time.Now()
+	n, err := s.Write([]byte("12345"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("Write returned %d bytes, want 5", n)
+	}
+	// rate=100/s, capacity=2: the first 2 bytes use the initial burst,
+	// the remaining 3 need 3 * 10ms = 30ms.
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
+		t.Fatalf("Write returned after %v, want it to wait for rate tokens", elapsed)
+	}
+}
+
+func TestWriteRateLimitCloseInterruptsWait(t *testing.T) {
+	s := newRateLimitTestSession(ratelimit.NewBucketWithRate(1, 1))
+	payload := []byte("rate-limited")
+	type writeResult struct {
+		n   int
+		err error
+	}
+	done := make(chan writeResult, 1)
+	go func() {
+		n, err := s.Write(payload)
+		done <- writeResult{n, err}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(s.die)
+	select {
+	case result := <-done:
+		if result.n != len(payload) {
+			t.Fatalf("interrupted Write returned %d bytes, want %d", result.n, len(payload))
+		}
+		if !errors.Is(result.err, io.ErrClosedPipe) {
+			t.Fatalf("interrupted Write returned %v, want closed pipe", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not interrupt rate-limited Write")
+	}
+}
+
+func TestWriteRateLimitEndToEndThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skipf("skipping %s in short mode.", t.Name())
+	}
+
+	const (
+		targetRate  = 1_000_000
+		duration    = 12 * time.Second
+		warmupTicks = 2
+	)
+
+	l, err := listenSink(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	var received atomic.Int64
+	accepted := make(chan error, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			accepted <- err
+			return
+		}
+
+		sess := conn.(*UDPSession)
+		sess.SetStreamMode(true)
+		sess.SetWindowSize(1024, 1024)
+		sess.SetNoDelay(1, 10, 2, 1)
+		sess.SetReadDeadline(time.Now().Add(30 * time.Second))
+		accepted <- nil
+
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := sess.Read(buf)
+			if n > 0 {
+				received.Add(int64(n))
+			}
+			if err != nil {
+				readErr <- err
+				return
+			}
+		}
+	}()
+
+	client, err := DialWithOptions(l.Addr().String(), nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetStreamMode(true)
+	client.SetWindowSize(1024, 1024)
+	client.SetNoDelay(1, 10, 2, 1)
+	client.SetMtu(1400)
+	client.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	client.SetRateLimit(targetRate)
+
+	stopWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	writerErr := make(chan error, 1)
+	go func() {
+		defer close(writerDone)
+		payload := make([]byte, 64*1024)
+		for {
+			select {
+			case <-stopWriter:
+				return
+			default:
+			}
+			if _, err := client.Write(payload); err != nil {
+				select {
+				case <-stopWriter:
+					return
+				default:
+					writerErr <- err
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopWriter)
+		_ = client.Close()
+		<-writerDone
+	}()
+
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("listener Accept failed: %v", err)
+		}
+	case err := <-writerErr:
+		t.Fatalf("limited Write failed before the receiver accepted: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiver did not accept the KCP session")
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var samples []float64
+	lastAt := time.Now()
+	lastBytes := received.Load()
+	for tick := range int(duration / time.Second) {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			currentBytes := received.Load()
+			rate := float64(currentBytes-lastBytes) / now.Sub(lastAt).Seconds()
+			lastAt, lastBytes = now, currentBytes
+			if tick >= warmupTicks {
+				samples = append(samples, rate)
+			}
+		case err := <-writerErr:
+			t.Fatalf("limited Write failed: %v", err)
+		case err := <-readErr:
+			t.Fatalf("receiver Read failed: %v", err)
+		}
+	}
+
+	var mean float64
+	for _, sample := range samples {
+		mean += sample
+	}
+	mean /= float64(len(samples))
+	if mean < targetRate*0.9 || mean > targetRate*1.1 {
+		t.Fatalf("mean receive rate = %.0f B/s, want %d ±10%%; samples: %v", mean, targetRate, samples)
+	}
+
+	var squaredDiffs float64
+	for _, sample := range samples {
+		diff := sample - mean
+		squaredDiffs += diff * diff
+	}
+	stddev := math.Sqrt(squaredDiffs / float64(len(samples)-1))
+	inRange := 0
+	for _, sample := range samples {
+		if sample >= mean-2*stddev && sample <= mean+2*stddev {
+			inRange++
+		}
+	}
+	requiredInRange := int(math.Ceil(0.95 * float64(len(samples))))
+	if inRange < requiredInRange {
+		t.Fatalf("%d/%d receive-rate samples fell within mean ±2σ (mean %.0f, σ %.0f); samples: %v",
+			inRange, len(samples), mean, stddev, samples)
+	}
+	t.Logf("receive rate: mean %.0f B/s, σ %.0f B/s; %d/%d samples within mean ±2σ",
+		mean, stddev, inRange, len(samples))
+}
+
+func TestWriteDeadlineExpiresWhileWaitingForWriteGate(t *testing.T) {
+	s := newRateLimitTestSession(nil)
+	<-s.writeGate
+	deadline := time.Now().Add(20 * time.Millisecond)
+	s.SetWriteDeadline(deadline)
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := s.Write([]byte("x"))
+		writeDone <- err
+	}()
+
+	<-s.writeDeadline.Done()
+	s.writeGate <- struct{}{}
+	select {
+	case err := <-writeDone:
+		if !errors.Is(err, errTimeout) {
+			t.Fatalf("Write returned %v, want timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not unblock after the gate was released")
+	}
+	if got := s.kcp.WaitSnd(); got != 0 {
+		t.Fatalf("expired Write queued %d KCP segments", got)
+	}
+}
+
+func waitForDeadlineCollection(t *testing.T, deadlines ...weak.Pointer[deadline.Deadline]) {
+	t.Helper()
+
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	retry := time.NewTicker(10 * time.Millisecond)
+	defer retry.Stop()
+
+	for {
+		runtime.GC()
+
+		collected := true
+		for _, d := range deadlines {
+			if d.Value() != nil {
+				collected = false
+				break
+			}
+		}
+		if collected {
+			return
+		}
+
+		select {
+		case <-timeout.C:
+			t.Fatal("deadline objects remained reachable after GC")
+		case <-retry.C:
+		}
+	}
+}
+
+func TestCloseStopsSessionDeadlineTimers(t *testing.T) {
+	s, err := DialWithOptions("127.0.0.1:9", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rd := weak.Make(s.readDeadline)
+	if err := s.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	wd := weak.Make(s.writeDeadline)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = nil
+
+	waitForDeadlineCollection(t, rd, wd)
+
+	if rd.Value() != nil {
+		t.Fatal("read deadline reachable after object unreachable")
+	}
+	if wd.Value() != nil {
+		t.Fatal("write deadline reachable after object unreachable")
+	}
+}
+
+func TestCloseStopsListenerDeadlineTimer(t *testing.T) {
+	l, err := ListenWithOptions("127.0.0.1:0", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := weak.Make(l.acceptDeadline)
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l = nil
+
+	waitForDeadlineCollection(t, deadline)
+
+	if deadline.Value() != nil {
+		t.Fatal("accept deadline reachable after object unreachable")
+	}
+}
+
+func newRateLimitTestSession(bucket *ratelimit.Bucket) *UDPSession {
+	s := &UDPSession{
+		readDeadline:       deadline.New(),
+		writeDeadline:      deadline.New(),
+		die:                make(chan struct{}),
+		writeGate:          make(chan struct{}, 1),
+		chWriteEvent:       make(chan struct{}, 1),
+		chSocketWriteError: make(chan struct{}),
+		kcp:                NewKCP(1, func([]byte, int) {}),
+	}
+	s.writeGate <- struct{}{}
+	s.SetBucket(bucket)
+	return s
 }
 
 func TestCFBSendRecv(t *testing.T) {
@@ -363,6 +726,10 @@ func TestPlainTextSendRecv(t *testing.T) {
 }
 
 func Test1GBEcho(t *testing.T) {
+	if testing.Short() {
+		t.Skipf("skipping %s in short mode.", t.Name())
+	}
+
 	port := nextPort()
 	l := echoServer(port, nil)
 	defer l.Close()
@@ -377,6 +744,10 @@ func Test1GBEcho(t *testing.T) {
 }
 
 func Test6GBEcho(t *testing.T) {
+	if testing.Short() {
+		t.Skipf("skipping %s in short mode.", t.Name())
+	}
+
 	port := nextPort()
 	l := echoServer(port, nil)
 	defer l.Close()
@@ -493,10 +864,11 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 	// Writer goroutine
 	go func() {
 		r := mrand.New(writerSrc)
+		lenRand := mrand.New(mrand.NewSource(seed + 1))
 		lastPrint := 0
 		v := make([][]byte, 2)
 		for bytesSent < N {
-			length1 := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+			length1 := lenRand.Intn(1<<20) + 1 // Random length between 1 and 1MB
 			if bytesSent+int64(length1) > N {
 				length1 = int(N - bytesSent)
 			}
@@ -506,7 +878,7 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 				sndbuf1[i] = byte(r.Int())
 			}
 
-			length2 := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+			length2 := lenRand.Intn(1<<20) + 1 // Random length between 1 and 1MB
 			if bytesSent+int64(length2) > N {
 				length2 = int(N - bytesSent)
 			}
@@ -540,9 +912,10 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 
 	// Reader goroutine
 	r := mrand.New(readerSrc)
+	lenRand := mrand.New(mrand.NewSource(seed + 2))
 	lastPrint := 0
 	for bytesReceived < N {
-		length := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+		length := lenRand.Intn(1<<20) + 1 // Random length between 1 and 1MB
 		if bytesReceived+int64(length) > N {
 			length = int(N - bytesReceived)
 		}
@@ -809,14 +1182,6 @@ func sink_tester(cli *UDPSession, msglen, msgcount int) error {
 	return nil
 }
 
-func TestSNMP(t *testing.T) {
-	t.Log(DefaultSnmp.Copy())
-	t.Log(DefaultSnmp.Header())
-	t.Log(DefaultSnmp.ToSlice())
-	DefaultSnmp.Reset()
-	t.Log(DefaultSnmp.ToSlice())
-}
-
 func TestListenerClose(t *testing.T) {
 	port := nextPort()
 	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), nil, 10, 3)
@@ -825,13 +1190,11 @@ func TestListenerClose(t *testing.T) {
 		return
 	}
 	defer l.Close()
-	l.SetReadDeadline(time.Now().Add(time.Second))
-	l.SetWriteDeadline(time.Now().Add(time.Second))
-	l.SetDeadline(time.Now().Add(time.Second))
-	time.Sleep(2 * time.Second)
+	l.SetReadDeadline(time.Now().Add(-time.Millisecond))
+	l.SetWriteDeadline(time.Now().Add(-time.Millisecond))
+	l.SetDeadline(time.Now().Add(-time.Millisecond))
 	if _, err := l.Accept(); err == nil {
-		t.Fail()
-		return
+		t.Fatal("Accept succeeded with an expired deadline")
 	}
 
 	l.Close()
@@ -948,8 +1311,12 @@ func TestReliability(t *testing.T) {
 	msg := make([]byte, 128)
 
 	for range N {
-		io.ReadFull(rand.Reader, msg)
-		cli.Write([]byte(msg))
+		if _, err := io.ReadFull(rand.Reader, msg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cli.Write(msg); err != nil {
+			t.Fatal(err)
+		}
 
 		n, err := io.ReadFull(cli, buf)
 		if err != nil {
@@ -1003,8 +1370,15 @@ func TestControl(t *testing.T) {
 }
 
 func TestSessionReadAfterClosed(t *testing.T) {
-	us, _ := net.ListenPacket("udp", "127.0.0.1:0")
-	uc, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	us, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		_ = us.Close()
+		t.Fatal(err)
+	}
 	defer us.Close()
 	defer uc.Close()
 
@@ -1023,39 +1397,41 @@ func TestSessionReadAfterClosed(t *testing.T) {
 	}
 
 	check := func(c1, c2 *UDPSession) {
-		done := make(chan struct{}, 1)
+		done := make(chan error, 1)
 		go func() {
 			rid, err := knockDoor(c2, "4321")
-			done <- struct{}{}
 			if err != nil {
-				panic(err)
+				done <- err
+				return
 			}
-
 			if rid != "1234" {
-				panic("mismatch id")
+				done <- fmt.Errorf("server received %q, want %q", rid, "1234")
+				return
 			}
+			done <- nil
 		}()
 
 		rid, err := knockDoor(c1, "1234")
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
-
 		if rid != "4321" {
-			panic("mismatch id")
+			t.Fatalf("client received %q, want %q", rid, "4321")
 		}
-		<-done
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	c1, err := NewConn3(0, uc.LocalAddr(), nil, 0, 0, us)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	defer c1.Close()
 
 	c2, err := NewConn3(0, us.LocalAddr(), nil, 0, 0, uc)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	defer c2.Close()
 
@@ -1066,13 +1442,13 @@ func TestSessionReadAfterClosed(t *testing.T) {
 
 	c1, err = NewConn3(4321, uc.LocalAddr(), nil, 0, 0, us)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	defer c1.Close()
 
 	c2, err = NewConn3(4321, us.LocalAddr(), nil, 0, 0, uc)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	defer c2.Close()
 
@@ -1127,8 +1503,12 @@ func TestSetMTU(t *testing.T) {
 	cli.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
 
 	sendBytes := make([]byte, 1500)
-	rand.Read(sendBytes)
-	cli.Write(sendBytes)
+	if _, err := rand.Read(sendBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.Write(sendBytes); err != nil {
+		t.Fatal(err)
+	}
 
 	buf := make([]byte, 1500)
 
@@ -1348,11 +1728,117 @@ func TestListenDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("Dialed")
-	conn.Write([]byte("hello"))
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
 	t.Log("Wrote data")
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("server did not accept the connection")
+	}
 	conn.Close()
-	<-ch
+}
+
+// oobTestObserver serializes callback results and retains the first error for cleanup.
+type oobTestObserver struct {
+	mu       sync.Mutex
+	stopped  bool
+	err      error
+	errCh    chan error
+	first    chan struct{}
+	counts   []atomic.Int32
+	received chan int
+}
+
+// newOOBTestObserver creates an observer for payload lengths below count.
+func newOOBTestObserver(count int) *oobTestObserver {
+	return &oobTestObserver{
+		errCh: make(chan error, 1), first: make(chan struct{}),
+		counts: make([]atomic.Int32, count), received: make(chan int, count),
+	}
+}
+
+// record runs a callback under the observer lock and retains its first error.
+func (o *oobTestObserver) record(f func() error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.stopped {
+		return
+	}
+	if err := f(); err != nil && o.err == nil {
+		o.err = err
+		o.errCh <- err
+	}
+}
+
+// receive validates an OOB payload and signals each newly received length.
+func (o *oobTestObserver) receive(buf []byte) {
+	o.record(func() error {
+		if len(buf) >= len(o.counts) {
+			return fmt.Errorf("unexpected OOB payload length %d", len(buf))
+		}
+		for i, b := range buf {
+			if b != byte(i) {
+				return fmt.Errorf("OOB payload mismatch at offset %d: expected %d, got %d", i, byte(i), b)
+			}
+		}
+		if o.counts[len(buf)].Add(1) == 1 {
+			o.received <- len(buf)
+		}
+		select {
+		case <-o.first:
+		default:
+			close(o.first)
+		}
+		return nil
+	})
+}
+
+// stop disables further observation and returns the first recorded error.
+func (o *oobTestObserver) stop() error {
+	// Wait for any active callback and ignore callbacks that arrive after cleanup starts.
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.stopped = true
+	return o.err
+}
+
+// startOOBTestServer accepts one session, installs its OOB handler, and cleans it up.
+func startOOBTestServer(t *testing.T, l net.Listener, handler func(*UDPSession, []byte)) {
+	t.Helper()
+	type acceptResult struct {
+		session *UDPSession
+		err     error
+	}
+	accepted := make(chan acceptResult, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := l.Accept()
+		if err != nil {
+			accepted <- acceptResult{err: err}
+			return
+		}
+		sess := conn.(*UDPSession)
+		err = sess.SetOOBHandler(func(buf []byte) { handler(sess, buf) })
+		accepted <- acceptResult{session: sess, err: err}
+		if err == nil {
+			handleEcho(sess)
+		}
+	}()
+	t.Cleanup(func() {
+		// Closing the listener unblocks Accept, but accepted sessions need separate cleanup.
+		l.Close()
+		result := <-accepted
+		if result.session != nil {
+			result.session.Close()
+		}
+		<-done
+		if result.err != nil && result.session != nil {
+			t.Errorf("server failed to register OOB handler: %v", result.err)
+		}
+	})
 }
 
 // TestOOB verifies the end-to-end transmission and reception of OOB (Out-Of-Band) data:
@@ -1369,38 +1855,42 @@ func TestOOB(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	defer l.Close()
-
-	go func() {
-		// Server listens for OOB data and echoes it back
-		kcplistener := l.(*Listener)
-		kcplistener.SetReadBuffer(4 * 1024 * 1024)
-		kcplistener.SetWriteBuffer(4 * 1024 * 1024)
-		for {
-			s, err := l.Accept()
-			if err != nil {
-				return
+	observer := newOOBTestObserver(maxPacketSize)
+	startOOBTestServer(t, l, func(sess *UDPSession, buf []byte) {
+		observer.record(func() error {
+			if err := sess.SendOOB(buf); err != nil {
+				return fmt.Errorf("server failed to echo OOB payload: %w", err)
 			}
-			sess := s.(*UDPSession)
-			sess.SetReadBuffer(4 * 1024 * 1024)
-			sess.SetWriteBuffer(4 * 1024 * 1024)
-			// Register OOB callback, echo back received OOB data immediately
-			sess.SetOOBHandler(func(buf []byte) {
-				if err := sess.SendOOB(buf); err != nil {
-					t.Errorf("server failed to echo OOB payload: %v", err)
-				}
-			})
-			go handleEcho(sess)
-		}
-	}()
+			return nil
+		})
+	})
 
 	block2, _ := NewAESGCMCrypt(pass)
 	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 	}
-	defer cli.Close()
+	t.Cleanup(func() {
+		if err := observer.stop(); err != nil {
+			t.Errorf("OOB callback: %v", err)
+		}
+	})
+	streamStop := make(chan struct{})
+	streamDone := make(chan error, 1)
+	streamRunning := false
+	t.Cleanup(func() {
+		close(streamStop)
+		cli.Close()
+		if streamRunning {
+			if err := <-streamDone; err != nil && !t.Failed() {
+				t.Errorf("stream echo failed: %v", err)
+			}
+		}
+	})
 	cli.SetWriteDelay(false)
+	if err := cli.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	size := cli.GetOOBMaxSize()
 	if size < 1000 {
@@ -1409,65 +1899,40 @@ func TestOOB(t *testing.T) {
 	t.Log("Max OOB size:", size)
 
 	sizePlus1 := size + 1
-	counts := make([]atomic.Int32, sizePlus1)
+	if err := cli.SetOOBHandler(observer.receive); err != nil {
+		t.Fatal(err)
+	}
 
-	// Client registers OOB callback to validate echoed OOB data content and length
-	cli.SetOOBHandler(func(buf []byte) {
-		for i, b := range buf {
-			if b != byte(i) {
-				t.Fatalf(
-					"OOB echo payload mismatch at offset %d: expected %d, got %d",
-					i, byte(i), b,
-				)
-				break
-			}
-		}
-		counts[len(buf)].Add(1)
-	})
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	streamStarted := make(chan struct{})
+	streamRunning = true
 	go func() {
-		defer wg.Done()
-		// Stress test for normal data channel to ensure main channel does not affect OOB
-		randomEchoTest(t, cli, 10*1024*1024)
+		streamDone <- runOOBTestStream(cli, streamStarted, observer.first, streamStop)
 	}()
+	select {
+	case <-streamStarted:
+	case err := <-streamDone:
+		streamDone <- err
+		t.Fatalf("stream did not start: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("stream did not start")
+	}
 
-	go func() {
-		defer wg.Done()
-		// Send OOB data of varying lengths in a loop, content is [0,1,2,...]
-		buf := make([]byte, size)
-		for i := range len(buf) {
-			buf[i] = byte(i)
+	waitForOOBLengths(t, cli, observer, sizePlus1)
+	select {
+	case err := <-streamDone:
+		streamDone <- err
+		if err != nil {
+			t.Fatalf("stream echo failed: %v", err)
 		}
-		for i := range 10 * 1024 * 1024 {
-			if err := cli.SendOOB(buf[:i%sizePlus1]); err != nil {
-				t.Errorf("client failed to send OOB payload: %v", err)
-			}
-			if i%128 == 0 {
-				runtime.Gosched()
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	// Check that all lengths of OOB data are correctly echoed back
-	for i := range counts {
-		if counts[i].Load() == 0 {
-			t.Errorf("missing OOB echo for payload length %d", i)
-		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("stream did not complete")
 	}
 }
 
 // TestOOB_OneSideHandler verifies that OOB data can be received and processed
 // when only the server sets the OOB handler and the client does not.
 //
-// The server OOB handler updates the shared 'counts' slice, which is initialized
-// in the main goroutine and referenced by the handler for each OOB payload length.
-// This test ensures that the server can receive and correctly process OOB packets
-// of all possible lengths, even if the client does not set any OOB handler.
+// The server validates OOB packets of all possible lengths.
 func TestOOB_OneSideHandler(t *testing.T) {
 	port := nextPort()
 	block1, _ := NewAESGCMCrypt(pass)
@@ -1476,90 +1941,142 @@ func TestOOB_OneSideHandler(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	defer l.Close()
-
-	counts := make([]atomic.Int32, mtuLimit)
-	errCh := make(chan error, 1)
-
-	// Get OOB max payload size and initialize the shared counts slice.
-	go func() {
-		// Server sets OOB handler and counts received OOB packets by length.
-		// The handler directly updates the shared 'counts' slice.
-		kcplistener := l.(*Listener)
-		kcplistener.SetReadBuffer(4 * 1024 * 1024)
-		kcplistener.SetWriteBuffer(4 * 1024 * 1024)
-		for {
-			s, err := l.Accept()
-			if err != nil {
-				return
-			}
-			sess := s.(*UDPSession)
-			sess.SetReadBuffer(4 * 1024 * 1024)
-			sess.SetWriteBuffer(4 * 1024 * 1024)
-			// Only the server sets the OOB handler.
-			// The handler references the 'counts' slice from the main goroutine.
-			sess.SetOOBHandler(func(buf []byte) {
-				// Validate OOB payload content and count by length.
-				for i, b := range buf {
-					if b != byte(i) {
-						select {
-						case errCh <- fmt.Errorf("OOB payload mismatch at offset %d: expected %d, got %d", i, byte(i), b):
-						default:
-						}
-					}
-				}
-				counts[len(buf)].Add(1)
-			})
-			go handleEcho(sess)
-		}
-	}()
+	observer := newOOBTestObserver(maxPacketSize)
+	startOOBTestServer(t, l, func(_ *UDPSession, buf []byte) { observer.receive(buf) })
 
 	block2, _ := NewAESGCMCrypt(pass)
 	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 	}
-	defer cli.Close()
+	t.Cleanup(func() { cli.Close() })
+	t.Cleanup(func() {
+		if err := observer.stop(); err != nil {
+			t.Errorf("OOB callback: %v", err)
+		}
+	})
 	cli.SetWriteDelay(false)
 
 	size := cli.GetOOBMaxSize()
 	sizePlus1 := size + 1
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	waitForOOBLengths(t, cli, observer, sizePlus1)
+}
 
+// runOOBTestStream verifies stream echoes before and after the first OOB packet.
+func runOOBTestStream(cli *UDPSession, started chan<- struct{}, firstOOB, stop <-chan struct{}) error {
+	const chunkSize = 32 * 1024
+	const totalSize = 10 * 1024 * 1024
+	payload := make([]byte, chunkSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	echo := make([]byte, chunkSize)
+	for sent := 0; sent < totalSize; sent += chunkSize {
+		n, err := cli.Write(payload)
+		if err != nil {
+			return fmt.Errorf("write stream: %w", err)
+		}
+		if n != len(payload) {
+			return fmt.Errorf("short stream write: %d of %d", n, len(payload))
+		}
+		if _, err := io.ReadFull(cli, echo); err != nil {
+			return fmt.Errorf("read stream echo: %w", err)
+		}
+		if !bytes.Equal(payload, echo) {
+			return fmt.Errorf("stream echo mismatch at offset %d", sent)
+		}
+		if sent == 0 {
+			// Keep the stream unfinished until an OOB packet has been received.
+			close(started)
+			select {
+			case <-firstOOB:
+			case <-stop:
+				return fmt.Errorf("stream stopped before first OOB packet")
+			}
+		}
+	}
+	return nil
+}
+
+// TestOOBTestObserver verifies that late callback errors survive until cleanup.
+func TestOOBTestObserver(t *testing.T) {
+	observer := newOOBTestObserver(1)
+	observer.receive(nil)
+	<-observer.received
+	observer.record(func() error { return fmt.Errorf("late callback error") })
+	<-observer.errCh
+	if err := observer.stop(); err == nil || err.Error() != "late callback error" {
+		t.Fatalf("stop returned %v, want late callback error", err)
+	}
+	observer.record(func() error { t.Error("callback ran after stop"); return nil })
+}
+
+// waitForOOBLengths retries missing payload lengths until all are observed or the test times out.
+func waitForOOBLengths(t *testing.T, cli *UDPSession, observer *oobTestObserver, count int) {
+	t.Helper()
+
+	stop := make(chan struct{})
+	senderDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		// Client does NOT set OOB handler, only sends OOB packets of varying lengths.
-		buf := make([]byte, size)
-		for i := range len(buf) {
+		defer close(senderDone)
+		buf := make([]byte, count-1)
+		for i := range buf {
 			buf[i] = byte(i)
 		}
-		for i := range 10 * 1024 * 1024 {
-			if err := cli.SendOOB(buf[:i%sizePlus1]); err != nil {
-				t.Errorf("client failed to send OOB payload: %v", err)
+		// OOB is best-effort: pace retries to avoid overflowing the send queue.
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
 			}
-			if i%128 == 0 {
-				runtime.Gosched()
+			length := i % count
+			// Retry only lengths that have not yet been validated by the receiver.
+			if observer.counts[length].Load() == 0 {
+				if err := cli.SendOOB(buf[:length]); err != nil {
+					observer.record(func() error { return fmt.Errorf("client failed to send OOB payload: %w", err) })
+					return
+				}
+			}
+			if i%32 == 31 {
+				select {
+				case <-stop:
+					return
+				case <-ticker.C:
+				}
 			}
 		}
 	}()
+	defer func() {
+		close(stop)
+		<-senderDone
+	}()
 
-	wg.Wait()
+	received := make([]bool, count)
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
 
-	// Give the server time to process incoming OOB packets.
-	time.Sleep(500 * time.Millisecond)
-
-	select {
-	case err := <-errCh:
-		t.Fatalf("%v", err)
-	default:
-	}
-
-	// Check that all lengths of OOB data are received by the server.
-	for i := range counts[:sizePlus1] {
-		if counts[i].Load() == 0 {
-			t.Errorf("server missing OOB for payload length %d", i)
+	for remaining := count; remaining > 0; {
+		select {
+		case err := <-observer.errCh:
+			t.Fatal(err)
+		case length := <-observer.received:
+			if length >= count {
+				t.Fatalf("unexpected OOB payload length %d", length)
+			}
+			if !received[length] {
+				received[length] = true
+				remaining--
+			}
+		case <-timeout.C:
+			for length, seen := range received {
+				if !seen {
+					t.Fatalf("missing OOB payload length %d", length)
+				}
+			}
 		}
 	}
 }
@@ -1578,39 +2095,39 @@ func TestSetOOBHandler_Basic(t *testing.T) {
 	if err := sess.SetOOBHandler(nil); err != nil {
 		t.Error("unregister nil callback should not error")
 	}
-	// After setting nil, callbackForOOB should be a dummy handler, and calling it should not panic
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("dummy OOB handler should not panic, got panic: %v", r)
-		}
-	}()
+	// After setting nil, callbackForOOB must hold a nil pointer.
+	// No sentinel empty function any more; absence is represented by nil.
 	if f := sess.callbackForOOB.Load(); f != nil {
-		typeName := reflect.TypeOf(f).String()
-		t.Logf("callbackForOOB type: %s", typeName)
-
-		if cb, ok := f.(OOBCallBackType); ok {
-			cb([]byte("dummy"))
-		} else {
-			t.Errorf("callbackForOOB type assertion failed: got %T", f)
-		}
-	} else {
-		t.Error("callbackForOOB should not be nil after SetOOBHandler(nil)")
+		t.Errorf("callbackForOOB should be nil after SetOOBHandler(nil), got %v", f)
 	}
+
 	called := false
 	cb := func([]byte) { called = true }
 	if err := sess.SetOOBHandler(cb); err != nil {
 		t.Errorf("register callback failed: %v", err)
 	}
-	// Simulate callback invocation
+	// Simulate callback invocation. The loaded pointer is non-nil, and
+	// the function value it points to is guaranteed non-nil because
+	// SetOOBHandler rejected nil above.
 	if f := sess.callbackForOOB.Load(); f != nil {
-		if cb2, ok := f.(OOBCallBackType); ok {
-			cb2([]byte("test"))
-			if !called {
-				t.Error("callback not called as expected")
-			}
-		} else {
-			t.Errorf("callbackForOOB type assertion failed: got %T", f)
+		(*f)([]byte("test"))
+		if !called {
+			t.Error("callback not called as expected")
 		}
+	} else {
+		t.Error("callbackForOOB should not be nil after SetOOBHandler(cb)")
+	}
+
+	// Re-register then unregister, and confirm the previously loaded
+	// pointer is no longer the current callback.
+	if err := sess.SetOOBHandler(cb); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.SetOOBHandler(nil); err != nil {
+		t.Fatal(err)
+	}
+	if sess.callbackForOOB.Load() != nil {
+		t.Error("callback still registered after unregister")
 	}
 }
 
@@ -1640,13 +2157,13 @@ func TestGetOOBMaxSizeConcurrentSetMtu(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 10000; i++ {
+		for i := range 10000 {
 			sess.SetMtu(1200 + i%2*100)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 10000; i++ {
+		for range 10000 {
 			if size := sess.GetOOBMaxSize(); size <= 0 {
 				t.Errorf("invalid OOB maximum size: %d", size)
 				return
@@ -1661,14 +2178,12 @@ func TestSetLoggerConcurrentWithKCPTrace(t *testing.T) {
 	logger := logoutput_callback(func(string, ...any) {})
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 10000; i++ {
+	wg.Go(func() {
+		for range 10000 {
 			sess.SetLogger(IKCP_LOG_ALL, logger)
 		}
-	}()
-	for i := 0; i < 10000; i++ {
+	})
+	for range 10000 {
 		sess.mu.Lock()
 		sess.kcp.debugLog(IKCP_LOG_INPUT, "test")
 		sess.mu.Unlock()

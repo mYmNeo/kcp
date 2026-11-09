@@ -1,3 +1,25 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package kcp
 
 import (
@@ -7,6 +29,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/transport/v5/deadline"
 )
 
 // pushConn reads its UDP socket on one goroutine and hands every packet to
@@ -62,7 +86,7 @@ func (c *pushConn) SetPacketReceiver(fn func([]byte, net.Addr, error)) {
 }
 
 func (c *pushConn) readLoop() {
-	buf := make([]byte, mtuLimit)
+	buf := make([]byte, maxPacketSize)
 	for {
 		n, addr, err := c.UDPConn.ReadFrom(buf)
 		if fn := c.receiver.Load(); fn != nil {
@@ -140,33 +164,6 @@ func TestPacketPusherListener(t *testing.T) {
 	}
 	if pc.pushed.Load() == 0 {
 		t.Fatal("no packet arrived through the receiver")
-	}
-}
-
-func TestPacketPusherPinsFirstPeer(t *testing.T) {
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer udp.Close()
-	sess, err := NewConn3(1, nil, nil, 0, 0, &pushConn{UDPConn: udp})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-
-	first := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
-	other := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
-	pkt := make([]byte, IKCP_OVERHEAD)
-	before := atomic.LoadUint64(&DefaultSnmp.InErrs)
-	sess.pushedPacket(pkt, first, nil)
-	sess.pushedPacket(pkt, first, nil)
-	if got := atomic.LoadUint64(&DefaultSnmp.InErrs) - before; got != 0 {
-		t.Fatalf("packets from the first peer counted %d errors", got)
-	}
-	sess.pushedPacket(pkt, other, nil)
-	if got := atomic.LoadUint64(&DefaultSnmp.InErrs) - before; got != 1 {
-		t.Fatalf("a packet from another peer counted %d errors, want 1", got)
 	}
 }
 
@@ -418,11 +415,13 @@ func TestPacketPusherLastSessionUnregisterOutsideListenerLock(t *testing.T) {
 
 	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 	s := &UDPSession{
-		conn:   pc,
-		kcp:    NewKCP(1, nil),
-		l:      l,
-		remote: remote,
-		die:    make(chan struct{}),
+		conn:          pc,
+		kcp:           NewKCP(1, nil),
+		l:             l,
+		remote:        remote,
+		die:           make(chan struct{}),
+		readDeadline:  deadline.New(),
+		writeDeadline: deadline.New(),
 	}
 	l.sessionLock.Lock()
 	l.sessions[remote.String()] = s

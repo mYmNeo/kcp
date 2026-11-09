@@ -27,47 +27,36 @@ import (
 	"math"
 	"math/rand"
 	"testing"
-	"time"
 )
 
 func TestFECEncodeConsecutive(t *testing.T) {
-	const dataSize = 10
-	const paritySize = 3
-	const payLoad = 1500
+	const (
+		dataShards   = 10
+		parityShards = 3
+		groups       = 10
+		payloadSize  = maxPacketSize
+	)
 
-	encoder := newFECEncoder(dataSize, paritySize, 0)
-	t.Logf("dataSize:%v, paritySize:%v", dataSize, paritySize)
-	group := 0
-	sent := 0
-	for i := range 100 {
-		if i%dataSize == 0 {
-			group++
-		}
-
-		data := make([]byte, payLoad)
-		duration := time.Duration(rand.Int()%300) * time.Millisecond
-		t.Logf("Sleep: %v, packet %v", duration, sent)
-		<-time.After(duration)
-
+	encoder := newFECEncoder(dataShards, parityShards, 0)
+	for i := range groups * dataShards {
+		data := make([]byte, payloadSize)
 		ps := encoder.encode(data, 200)
-		sent++
 
-		if len(ps) > 0 {
-			t.Log("has parity:", len(ps))
-			for idx, p := range ps {
-				seqid := binary.LittleEndian.Uint32(p)
-				expected := uint32((group-1)*(dataSize+paritySize) + dataSize + idx)
-				if seqid != expected {
-					t.Fatalf("expected parity shard:%v actual seqid %v", expected, seqid)
-					return
-				}
+		if (i+1)%dataShards != 0 {
+			if len(ps) != 0 {
+				t.Fatalf("data shard %d produced %d parity shards before its group completed", i, len(ps))
 			}
 			continue
 		}
-
-		if sent%dataSize == 0 {
-			t.Log("no parity:", len(ps))
-			continue
+		if len(ps) != parityShards {
+			t.Fatalf("completed group %d produced %d parity shards, want %d", i/dataShards, len(ps), parityShards)
+		}
+		for idx, p := range ps {
+			seqid := binary.LittleEndian.Uint32(p)
+			expected := uint32((i/dataShards)*(dataShards+parityShards) + dataShards + idx)
+			if seqid != expected {
+				t.Fatalf("parity shard %d of group %d has sequence %d, want %d", idx, i/dataShards, seqid, expected)
+			}
 		}
 	}
 }
@@ -78,12 +67,13 @@ func TestFECDecodeLoss(t *testing.T) {
 	const dataShards = 10
 	const parityShards = 3
 	const groupSize = dataShards + parityShards
-	const payLoad = 1400
+	const payloadSize = 1400
 	decoder := newFECDecoder(dataShards, parityShards)
 	t.Logf("dataSize:%v, paritySize:%v", dataShards, parityShards)
 	sent := 0
 	totalRecovered := 0
 	totalParityLost := 0
+	rnd := rand.New(rand.NewSource(1))
 
 	for group := range 100 {
 		losses := make(map[int]bool)
@@ -91,7 +81,7 @@ func TestFECDecodeLoss(t *testing.T) {
 		lost := 0
 		parityLost := 0
 		for lost < parityShards {
-			pos := rand.Intn(dataShards + parityShards)
+			pos := rnd.Intn(dataShards + parityShards)
 			if !losses[pos] {
 				losses[pos] = true
 				if pos >= dataShards {
@@ -115,7 +105,7 @@ func TestFECDecodeLoss(t *testing.T) {
 				continue
 			}
 
-			pkt := make([]byte, payLoad)
+			pkt := make([]byte, payloadSize)
 			binary.LittleEndian.PutUint32(pkt, uint32(groupSize*group+i))
 			if i%(dataShards+parityShards) >= dataShards {
 				binary.LittleEndian.PutUint16(pkt[4:], typeParity)
@@ -138,6 +128,64 @@ func TestFECDecodeLoss(t *testing.T) {
 	}
 	t.Log("Total recovered packets:", totalRecovered)
 	t.Log("Total parity lost:", totalParityLost)
+}
+
+func TestFECDecoderAutoTuneResetsShardState(t *testing.T) {
+	const (
+		oldDataShards   = 2
+		oldParityShards = 1
+		newDataShards   = 10
+		newParityShards = 3
+	)
+	encoder := newFECEncoder(newDataShards, newParityShards, 0)
+	decoder := newFECDecoder(oldDataShards, oldParityShards)
+	if encoder == nil || decoder == nil {
+		t.Fatal("failed to create FEC encoder or decoder")
+	}
+
+	tuned := false
+	tunedAt := uint32(0)
+	checkPacket := func(packet []byte) {
+		t.Helper()
+		seq := binary.LittleEndian.Uint32(packet)
+		wasTuned := tuned
+		recovered := decoder.decode(fecPacket(packet))
+		for _, shard := range recovered {
+			defaultBufferPool.Put(shard)
+		}
+
+		if !wasTuned && decoder.dataShards == newDataShards && decoder.parityShards == newParityShards {
+			tuned = true
+			tunedAt = seq
+		}
+		if tuned && seq == tunedAt+1 {
+			shardID := decoder.getShardId(seq)
+			if decoder.newestShardId != shardID {
+				t.Errorf("newest shard id = %d, want %d after auto-tune", decoder.newestShardId, shardID)
+			}
+			if _, ok := decoder.shardSet[shardID]; !ok {
+				t.Errorf("new shard set %d was discarded after auto-tune", shardID)
+			}
+		}
+	}
+
+	for range 4 {
+		for range newDataShards {
+			packet := make([]byte, fecHeaderSizePlus2+32)
+			parity := encoder.encode(packet, ^uint32(0))
+			checkPacket(packet)
+			for _, shard := range parity {
+				checkPacket(shard)
+			}
+		}
+	}
+
+	if !tuned {
+		t.Fatal("decoder did not auto-tune to the sender's FEC parameters")
+	}
+	if tunedAt+1 >= uint32(4*(newDataShards+newParityShards)) {
+		t.Fatalf("auto-tune occurred too late: sequence %d", tunedAt)
+	}
 }
 
 func TestFECDecodeVariablePacketSizes(t *testing.T) {
@@ -234,15 +282,15 @@ func TestFECDecodeVariablePacketSizes(t *testing.T) {
 func BenchmarkFECDecode(b *testing.B) {
 	const dataSize = 10
 	const paritySize = 3
-	const payLoad = 1500
+	const payloadSize = maxPacketSize
 	decoder := newFECDecoder(dataSize, paritySize)
 	b.ReportAllocs()
-	b.SetBytes(payLoad)
+	b.SetBytes(payloadSize)
 	for i := 0; b.Loop(); i++ {
 		if rand.Int()%(dataSize+paritySize) == 0 { // random loss
 			continue
 		}
-		pkt := make([]byte, payLoad)
+		pkt := make([]byte, payloadSize)
 		binary.LittleEndian.PutUint32(pkt, uint32(i))
 		if i%(dataSize+paritySize) >= dataSize {
 			binary.LittleEndian.PutUint16(pkt[4:], typeParity)
@@ -256,13 +304,13 @@ func BenchmarkFECDecode(b *testing.B) {
 func BenchmarkFECEncode(b *testing.B) {
 	const dataSize = 10
 	const paritySize = 3
-	const payLoad = 1500
+	const payloadSize = maxPacketSize
 
 	b.ReportAllocs()
-	b.SetBytes(payLoad)
+	b.SetBytes(payloadSize)
 	encoder := newFECEncoder(dataSize, paritySize, 0)
 	for b.Loop() {
-		data := make([]byte, payLoad)
+		data := make([]byte, payloadSize)
 		encoder.encode(data, 200)
 	}
 }
@@ -271,7 +319,7 @@ func TestFECPAWS(t *testing.T) {
 	const dataShards = 10
 	const parityShards = 3
 	const shardSize = dataShards + parityShards
-	const payLoad = 1500
+	const payloadSize = maxPacketSize
 
 	encoder := newFECEncoder(dataShards, parityShards, 0)
 	decoder := newFECDecoder(dataShards, parityShards)
@@ -291,7 +339,7 @@ func TestFECPAWS(t *testing.T) {
 	// Total 'shardSize' packets.
 	// Their seqids should be [paws-shardSize, ..., paws-1]
 	for i := range dataShards {
-		data := make([]byte, payLoad)
+		data := make([]byte, payloadSize)
 		// We can put some recognizable data
 		// Note: fecEncoder writes header at 0-6, and size at 6-8. Payload starts at 8.
 		binary.LittleEndian.PutUint32(data[8:], uint32(i))
@@ -325,7 +373,7 @@ func TestFECPAWS(t *testing.T) {
 	// Their seqids should be [0, ..., shardSize-1]
 	startIdx := len(packets)
 	for i := range dataShards {
-		data := make([]byte, payLoad)
+		data := make([]byte, payloadSize)
 		binary.LittleEndian.PutUint32(data[8:], uint32(i+100)) // Different data
 
 		ps := encoder.encode(data, 200)
@@ -452,7 +500,7 @@ func TestFECRTOAndSkipParity(t *testing.T) {
 	}
 
 	// --- Scenario 2: Timeout case (Time > RTO) ---
-	// Send 2 packets quickly, then sleep, then send 3rd
+	// Send 2 packets quickly, then simulate time passing before the third.
 	t.Log("--- Scenario 2: Timeout case (Time > RTO) ---")
 
 	// Packet 3 (Next data seq should be 5)
@@ -475,8 +523,8 @@ func TestFECRTOAndSkipParity(t *testing.T) {
 		t.Fatalf("Expected seq 6, got %d", seq)
 	}
 
-	// Sleep longer than RTO
-	time.Sleep(time.Duration(rto+20) * time.Millisecond)
+	// Simulate an interval longer than the RTO without waiting in real time.
+	enc.tsLatestPacket -= int64(rto) + 1
 
 	// Packet 5 (Trigger parity check -> should skip)
 	p5 := make([]byte, 100)
@@ -503,6 +551,9 @@ func TestFECRTOAndSkipParity(t *testing.T) {
 
 	p6 := make([]byte, 100)
 	ps = enc.encode(p6, rto)
+	if len(ps) != 0 {
+		t.Fatalf("Expected no parity shards at the start of a new group, got %d", len(ps))
+	}
 	if seq := getSeq(p6); seq != 10 {
 		t.Fatalf("Expected seq 10 after skipped parity, got %d", seq)
 	}

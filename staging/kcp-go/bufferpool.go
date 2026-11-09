@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// # Copyright (c) 2015 xtaci
+// Copyright (c) 2015 xtaci
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -39,14 +39,14 @@ type bufferPool struct {
 }
 
 // newBufferPool creates a system-wide packet buffer pool.
-// Buffers are stored as *[mtuLimit]byte array pointers (8 bytes) so that
+// Buffers are stored as *[maxPacketSize]byte array pointers (8 bytes) so that
 // Put/Get into sync.Pool avoids interface-boxing allocations — the same
 // technique used by bufPairPool below.
 func newBufferPool() *bufferPool {
 	return &bufferPool{
 		xmitBuf: sync.Pool{
 			New: func() any {
-				return new([mtuLimit]byte)
+				return new([maxPacketSize]byte)
 			},
 		},
 	}
@@ -54,22 +54,36 @@ func newBufferPool() *bufferPool {
 
 // Get retrieves a buffer from the pool as a []byte slice.
 func (bp *bufferPool) Get() []byte {
-	arr := bp.xmitBuf.Get().(*[mtuLimit]byte)
+	arr := bp.xmitBuf.Get().(*[maxPacketSize]byte)
 	return arr[:]
 }
 
 // Put returns a buffer to the pool.
-// Invariant: buf must have cap == mtuLimit and be backed by a *[mtuLimit]byte
+// Invariant: buf must have cap == maxPacketSize and be backed by a *[maxPacketSize]byte
 // (as returned by Get). Wrong-sized slices are rejected; converting any other
 // backing array with that capacity would be unsafe.
 func (bp *bufferPool) Put(buf []byte) error {
-	// Only put back buffers whose capacity matches mtuLimit.
-	if cap(buf) != mtuLimit {
+	// Only put back buffers whose capacity matches maxPacketSize.
+	if cap(buf) != maxPacketSize {
 		return errBufferSizeMismatch
 	}
 	// Convert slice back to array pointer — 8 bytes, no boxing allocation.
-	bp.xmitBuf.Put((*[mtuLimit]byte)(buf[:cap(buf)]))
+	bp.xmitBuf.Put((*[maxPacketSize]byte)(buf[:cap(buf)]))
 	return nil
+}
+
+// Puts returns some buffers to the pool.
+func (bp *bufferPool) Puts(buffers [][]byte) {
+	for _, buf := range buffers {
+		bp.Put(buf)
+	}
+}
+
+// PutPkts returns some FEC packets to the pool.
+func (bp *bufferPool) PutPkts(buffers []fecPacket) {
+	for _, buf := range buffers {
+		bp.Put(buf)
+	}
 }
 
 // bufPairPool reduces allocation of [][]byte wrapper slices used in

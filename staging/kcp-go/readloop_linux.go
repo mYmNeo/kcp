@@ -26,7 +26,6 @@ package kcp
 
 import (
 	"net"
-	"sync/atomic"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
@@ -57,7 +56,7 @@ func (s *UDPSession) readLoop() {
 	}
 	msgs := make([]ipv4.Message, batchSize)
 	for k := range msgs {
-		msgs[k].Buffers = [][]byte{make([]byte, mtuLimit)}
+		msgs[k].Buffers = [][]byte{make([]byte, maxPacketSize)}
 	}
 
 	for {
@@ -84,11 +83,11 @@ func (s *UDPSession) readLoop() {
 			} else if src != nil {
 				udp, ok := msg.Addr.(*net.UDPAddr)
 				if !ok || !sameUDPAddr(src, udp) {
-					atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+					DefaultSnmp.increaseInErrs()
 					continue
 				}
 			} else if msg.Addr.String() != srcStr {
-				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+				DefaultSnmp.increaseInErrs()
 				continue
 			}
 
@@ -111,7 +110,7 @@ func (l *Listener) monitor() {
 	// x/net version
 	msgs := make([]ipv4.Message, batchSize)
 	for k := range msgs {
-		msgs[k].Buffers = [][]byte{make([]byte, mtuLimit)}
+		msgs[k].Buffers = [][]byte{make([]byte, maxPacketSize)}
 	}
 
 	for {

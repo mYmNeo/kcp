@@ -1,3 +1,25 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package kcp
 
 import (
@@ -25,19 +47,19 @@ func TestRingSize(t *testing.T) {
 		r.Push(i)
 	}
 
+	rng := rand.New(rand.NewSource(1))
 	for {
-		use := rand.Int() % (left + 1)
+		use := rng.Intn(left + 1)
 		left -= use
 		for range use {
 			if _, ok := r.Pop(); !ok {
-				t.Errorf("Expected to pop value, but got none")
+				t.Fatal("expected to pop value, but got none")
 			}
 		}
 		if r.Len() != left {
-			t.Errorf("Expected length %d after popping, got %d", left, r.Len())
+			t.Fatalf("expected length %d after popping, got %d", left, r.Len())
 		}
 
-		t.Log("use", use, "left", left, "head", r.head, "tail", r.tail, "len", r.Len(), "maxlen", r.MaxLen())
 		if left == 0 {
 			break
 		}
@@ -266,6 +288,29 @@ func TestRingBufferDiscardBoundary(t *testing.T) {
 	r.Push(99)
 	if v, ok := r.Peek(); !ok || *v != 99 {
 		t.Fatalf("expected Peek()=99, got %v (ok=%v)", v, ok)
+	}
+}
+
+func TestRingBufferDiscardNegativeNoop(t *testing.T) {
+	r := NewRingBuffer[int](8)
+	r.Push(1)
+	r.Push(2)
+
+	if got := r.Discard(-1); got != 0 {
+		t.Fatalf("Discard(-1) = %d, want 0", got)
+	}
+	if r.Len() != 2 {
+		t.Fatalf("Len() = %d, want 2", r.Len())
+	}
+	for _, want := range []int{1, 2} {
+		got, ok := r.Pop()
+		if !ok || got != want {
+			t.Fatalf("Pop() = %d, %t, want %d, true", got, ok, want)
+		}
+	}
+
+	if got := r.Discard(-1); got != 0 {
+		t.Fatalf("Discard(-1) on an empty ring = %d, want 0", got)
 	}
 }
 

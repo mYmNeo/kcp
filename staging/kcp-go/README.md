@@ -1,18 +1,16 @@
 <img src="assets/kcp-go.png" alt="kcp-go" height="100px" />
 
 
-[![GoDoc][1]][2] [![Powered][9]][10] [![MIT licensed][11]][12] [![Coverage Status][7]][8] [![Sourcegraph][13]][14]
+[![GoDoc][1]][2] [![Created At][3]][4] [![MIT licensed][11]][12] [![Coverage Status][7]][8]
 
 [1]: https://godoc.org/github.com/xtaci/kcp-go?status.svg
 [2]: https://pkg.go.dev/github.com/xtaci/kcp-go/v5
+[3]: https://img.shields.io/github/created-at/xtaci/kcp-go
+[4]: https://github.com/xtaci/kcp-go
 [7]: https://codecov.io/gh/xtaci/kcp-go/branch/master/graph/badge.svg
 [8]: https://codecov.io/gh/xtaci/kcp-go
-[9]: https://img.shields.io/badge/KCP-Powered-blue.svg
-[10]: https://github.com/skywind3000/kcp
 [11]: https://img.shields.io/badge/license-MIT-blue.svg
 [12]: LICENSE
-[13]: https://sourcegraph.com/github.com/xtaci/kcp-go/-/badge.svg
-[14]: https://sourcegraph.com/github.com/xtaci/kcp-go?badge
 
 
 ## Table of Contents
@@ -168,13 +166,15 @@ The number of clock reads varies with the flush path: KCP samples time while che
 
 ### 3. Memory Management
 
-Many packet buffers are obtained from the package-wide `defaultBufferPool`, which provides buffers with a fixed capacity of 1500 bytes (`mtuLimit`). Buffers are returned to the pool when they are no longer needed, reducing repeated allocations. The pool uses `sync.Pool`, so the Go runtime may discard pooled buffers during garbage collection; reuse and retention are not guaranteed.
+Many packet buffers are obtained from the package-wide `defaultBufferPool`, which provides buffers with a fixed capacity of 1472 bytes (`maxPacketSize`). Buffers are returned to the pool when they are no longer needed, reducing repeated allocations. The pool uses `sync.Pool`, so the Go runtime may discard pooled buffers during garbage collection; reuse and retention are not guaranteed.
 
-### 4. Per-session Outbound Rate Limiting
+### 4. Per-session Application Write Rate Limiting
 
-`UDPSession.SetRateLimit(bytesPerSecond)` configures an independent token-bucket rate limit for that session's outgoing traffic. The limit is measured in bytes per second and counts the UDP payload bytes actually queued for transmission, including KCP/FEC/encryption overhead and FEC parity packets; it does not include UDP or IP headers. Rate limiting is disabled by default, and passing `0` disables it.
+`UDPSession.SetRateLimit(bytesPerSecond)` configures an independent token-bucket rate limit for application data submitted through `Write` and `WriteBuffers`. The limit is measured in application bytes per second. It does not count KCP/FEC/encryption overhead, FEC parity, retransmissions, `SendOOB` traffic, or UDP/IP headers. Rate limiting is disabled by default, and passing `0` disables it. A throttled write waits for tokens while remaining interruptible by its write deadline, socket write errors, and session closure.
 
-The bucket allows an initial burst of up to `maxBatchSize * mtuLimit` bytes (currently 64 × 1500 = 96,000 bytes), then limits the average send rate to the configured value. Outgoing packets are sent in batches; if a batch must wait for tokens, it is held and rescheduled rather than making a shared packet-processing worker sleep. A batch larger than the bucket's burst capacity cannot be reserved and is sent immediately, so configure workloads to keep batches within that capacity if strict limiting is required.
+If the rate-limit wait is interrupted, the data has already been queued in KCP: `Write` returns the full accepted byte count together with the error. Callers must not retry the same payload.
+
+The bucket created by `SetRateLimit(bps)` has capacity `bps`, allowing an initial burst of up to one second's worth of application bytes before limiting the average rate at which writes are accepted. This controls application write throughput rather than the exact rate of UDP packets on the wire. Use `SetBucket` when a different burst capacity is required.
 
 ```go
 sess.SetRateLimit(256 * 1024) // limit this session to 256 KiB/s
@@ -185,7 +185,7 @@ sess.SetRateLimit(0)           // disable rate limiting
 
 Applications commonly use TLS or a similar protocol to protect application data. That protection does not extend to the KCP and FEC headers added below the application layer. kcp-go's packet protection is a separate layer: it can encrypt and, when using AEAD, authenticate each UDP payload, including those transport headers.
 
-Packet integrity depends on the selected mode. When a non-AEAD `BlockCrypt` is configured, kcp-go adds a CRC-32 checksum; if an encryption cipher is enabled, the checksum is carried within the encrypted packet. CRC-32 can detect many accidental transmission errors, but it is not a message authentication code: it is unkeyed, and CRC-32's linearity combined with the malleability of modes such as CFB means an active attacker may be able to modify packets without detection. Do not rely on non-AEAD modes for cryptographic integrity or authentication. AEAD modes authenticate each packet's encrypted contents and are recommended when protection against deliberate packet modification is required. AEAD packet authentication proves possession of the configured key; it does not by itself establish a peer's identity, replace secure key management, or guarantee application-level replay protection.
+Packet integrity depends on the selected mode. When a non-AEAD `BlockCrypt` is configured, kcp-go adds a CRC-32 checksum; if an encryption cipher is enabled, the checksum is carried within the encrypted packet. After CFB decryption, the receiver verifies this checksum and drops packets corrupted by accidental bit errors. This is only an anti-corruption check, not cryptographic anti-tamper protection: CRC-32 is unkeyed, and its linearity combined with the malleability of modes such as CFB means an active attacker may be able to modify packets without detection. Do not rely on non-AEAD modes for cryptographic integrity or authentication. AEAD modes authenticate each packet's encrypted contents and are recommended when protection against deliberate packet modification is required. AEAD packet authentication proves possession of the configured key; it does not by itself establish a peer's identity, replace secure key management, or guarantee application-level replay protection.
 
 Packet encryption protects packet contents, including FEC and KCP headers, but does not hide traffic metadata such as endpoints, packet sizes, timing, or traffic volume. A random nonce for each packet helps prevent repeated encryption inputs from producing repeated ciphertext, but it does not conceal this metadata or provide anonymity. Without packet encryption, packet contents are transmitted in plaintext. Algorithm performance varies by hardware and workload, so benchmark the available options in your deployment rather than assuming one cipher is always faster.
 
@@ -334,58 +334,55 @@ ok      github.com/xtaci/kcp-go/v5      49.978s
 </details>
 
 <details>
-<summary>macOS amd64 — MacBook Pro, Intel Core i5</summary>
+<summary>macOS arm64 — Apple M4 Pro</summary>
 
 ```
-===
-Model Name:	MacBook Pro
-Model Identifier:	MacBookPro14,1
-Processor Name:	Intel Core i5
-Processor Speed:	3.1 GHz
-Number of Processors:	1
-Total Number of Cores:	2
-L2 Cache (per Core):	256 KB
-L3 Cache:	4 MB
-Memory:	8 GB
-===
+macOS 26.6.2
+Apple M4 Pro
+12 CPUs, 24 GiB memory
+Go 1.27.3
 
-$ go test -v -run=^$ -bench .
-beginning tests, encryption:salsa20, fec:10/3
+$ go test -run='^$' -bench . -benchmem -count=1
 goos: darwin
-goarch: amd64
-pkg: github.com/xtaci/kcp-go
-BenchmarkSM4-4                 	   50000	     32180 ns/op	  93.23 MB/s	       0 B/op	       0 allocs/op
-BenchmarkAES128-4              	  500000	      3285 ns/op	 913.21 MB/s	       0 B/op	       0 allocs/op
-BenchmarkAES192-4              	  300000	      3623 ns/op	 827.85 MB/s	       0 B/op	       0 allocs/op
-BenchmarkAES256-4              	  300000	      3874 ns/op	 774.20 MB/s	       0 B/op	       0 allocs/op
-BenchmarkTEA-4                 	  100000	     15384 ns/op	 195.00 MB/s	       0 B/op	       0 allocs/op
-BenchmarkXOR-4                 	20000000	        89.9 ns/op	33372.00 MB/s	       0 B/op	       0 allocs/op
-BenchmarkBlowfish-4            	   50000	     26927 ns/op	 111.41 MB/s	       0 B/op	       0 allocs/op
-BenchmarkNone-4                	30000000	        45.7 ns/op	65597.94 MB/s	       0 B/op	       0 allocs/op
-BenchmarkCast5-4               	   50000	     34258 ns/op	  87.57 MB/s	       0 B/op	       0 allocs/op
-Benchmark3DES-4                	   10000	    117149 ns/op	  25.61 MB/s	       0 B/op	       0 allocs/op
-BenchmarkTwofish-4             	   50000	     33538 ns/op	  89.45 MB/s	       0 B/op	       0 allocs/op
-BenchmarkXTEA-4                	   30000	     45666 ns/op	  65.69 MB/s	       0 B/op	       0 allocs/op
-BenchmarkSalsa20-4             	  500000	      3308 ns/op	 906.76 MB/s	       0 B/op	       0 allocs/op
-BenchmarkCRC32-4               	20000000	        65.2 ns/op	15712.43 MB/s
-BenchmarkCsprngSystem-4        	 1000000	      1150 ns/op	  13.91 MB/s
-BenchmarkCsprngMD5-4           	10000000	       145 ns/op	 110.26 MB/s
-BenchmarkCsprngSHA1-4          	10000000	       158 ns/op	 126.54 MB/s
-BenchmarkCsprngNonceMD5-4      	10000000	       153 ns/op	 104.22 MB/s
-BenchmarkCsprngNonceAES128-4   	100000000	        19.1 ns/op	 837.81 MB/s
-BenchmarkFECDecode-4           	 1000000	      1119 ns/op	1339.61 MB/s	    1606 B/op	       2 allocs/op
-BenchmarkFECEncode-4           	 2000000	       832 ns/op	1801.83 MB/s	      17 B/op	       0 allocs/op
-BenchmarkFlush-4               	 5000000	       272 ns/op	       0 B/op	       0 allocs/op
-BenchmarkEchoSpeed4K-4         	    5000	    259617 ns/op	  15.78 MB/s	    5451 B/op	     149 allocs/op
-BenchmarkEchoSpeed64K-4        	    1000	   1706084 ns/op	  38.41 MB/s	   56002 B/op	    1604 allocs/op
-BenchmarkEchoSpeed512K-4       	     100	  14345505 ns/op	  36.55 MB/s	  482597 B/op	   13045 allocs/op
-BenchmarkEchoSpeed1M-4         	      30	  34859104 ns/op	  30.08 MB/s	 1143773 B/op	   27186 allocs/op
-BenchmarkSinkSpeed4K-4         	   50000	     31369 ns/op	 130.57 MB/s	    1566 B/op	      30 allocs/op
-BenchmarkSinkSpeed64K-4        	    5000	    329065 ns/op	 199.16 MB/s	   21529 B/op	     453 allocs/op
-BenchmarkSinkSpeed256K-4       	     500	   2373354 ns/op	 220.91 MB/s	  166332 B/op	    3554 allocs/op
-BenchmarkSinkSpeed1M-4         	     300	   5117927 ns/op	 204.88 MB/s	  310378 B/op	    6988 allocs/op
+goarch: arm64
+pkg: github.com/xtaci/kcp-go/v5
+cpu: Apple M4 Pro
+BenchmarkSM4-12                       	   51745	     21525 ns/op	 136.77 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAES128-12                    	  766851	      1597 ns/op	1843.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAES192-12                    	  711027	      1714 ns/op	1717.21 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAES256-12                    	  660265	      1835 ns/op	1604.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTEA-12                       	  160390	      7446 ns/op	 395.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkXOR-12                       	27940386	        43.37 ns/op	67884.26 MB/s	       0 B/op	       0 allocs/op
+BenchmarkBlowfish-12                  	   82837	     14560 ns/op	 202.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNone-12                      	47629758	        26.09 ns/op	112842.22 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCast5-12                     	   82333	     14530 ns/op	 202.62 MB/s	       0 B/op	       0 allocs/op
+Benchmark3DES-12                      	   20512	     57895 ns/op	  50.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTwofish-12                   	   62769	     19188 ns/op	 153.43 MB/s	       0 B/op	       0 allocs/op
+BenchmarkXTEA-12                      	   47636	     25590 ns/op	 115.04 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSalsa20-12                   	  303675	      3944 ns/op	 746.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCRC32-12                     	14890838	        80.91 ns/op	12656.36 MB/s
+BenchmarkCFB_AES_128_CRC32-12         	 1213918	       988.2 ns/op	1416.79 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEAD_AES_128_GCM-12          	 6249505	       194.4 ns/op	7203.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCFB_Salsa20_CRC32-12         	  607309	      1970 ns/op	 710.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEAD_Chacha20_Poly1035-12    	 1000000	      1124 ns/op	1245.71 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCsprngSystem-12              	 6860886	       175.9 ns/op	  90.98 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCsprngAES128-12              	100000000	        10.75 ns/op	1488.95 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCsprngChacha8-12             	133251962	         9.005 ns/op	 888.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECDecode-12                 	 5951834	       198.6 ns/op	7412.60 MB/s	     290 B/op	       2 allocs/op
+BenchmarkFECEncode-12                 	 6632745	       178.9 ns/op	8228.76 MB/s	       2 B/op	       0 allocs/op
+BenchmarkFlush-12                     	  572144	      1966 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDebugLog-12                  	752248714	         1.594 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEchoSpeed4K-12               	   15751	     73867 ns/op	  55.45 MB/s	    6054 B/op	     132 allocs/op
+BenchmarkEchoSpeed64K-12              	    1231	    990333 ns/op	  66.18 MB/s	   82028 B/op	    1788 allocs/op
+BenchmarkEchoSpeed512K-12             	     153	   7894735 ns/op	  66.41 MB/s	  663806 B/op	   14314 allocs/op
+BenchmarkEchoSpeed1M-12               	     100	  15527693 ns/op	  67.53 MB/s	 1388181 B/op	   28534 allocs/op
+BenchmarkSinkSpeed4K-12               	   73106	     17769 ns/op	 230.51 MB/s	    1537 B/op	      34 allocs/op
+BenchmarkSinkSpeed64K-12              	    4190	    279547 ns/op	 234.44 MB/s	   24571 B/op	     552 allocs/op
+BenchmarkSinkSpeed256K-12             	     583	   2224163 ns/op	 235.72 MB/s	  193812 B/op	    4387 allocs/op
+BenchmarkSinkSpeed1M-12               	     235	   4496335 ns/op	 233.21 MB/s	  409976 B/op	    8730 allocs/op
+BenchmarkTimedFuncHeap-12             	22539919	        53.40 ns/op	       0 B/op	       0 allocs/op
 PASS
-ok  	github.com/xtaci/kcp-go	50.349s
+ok  	github.com/xtaci/kcp-go/v5	47.161s
 ```
 </details>
 

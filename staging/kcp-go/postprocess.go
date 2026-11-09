@@ -23,14 +23,10 @@
 package kcp
 
 import (
-	"encoding/binary"
-	"hash/crc32"
 	"runtime"
 	"sync"
-	"time"
 
 	"golang.org/x/net/ipv4"
-	"golang.org/x/time/rate"
 )
 
 // ppBudget is how many packets a worker takes from one session before it
@@ -39,6 +35,8 @@ const ppBudget = 4 * maxBatchSize
 
 // ppQueue holds the sessions with packets waiting for postProcess. A fixed
 // set of workers serves every session, so an idle session holds no goroutine.
+// ppRunning ensures that a session appears at most once in this queue or is
+// being handled by a worker. head avoids shifting entries after each dequeue.
 var ppQueue struct {
 	once sync.Once
 	mu   sync.Mutex
@@ -47,18 +45,22 @@ var ppQueue struct {
 	head int
 }
 
-// ppWorker holds the TX batch of one worker, reused for every session it serves.
+// ppWorker owns a batch while a worker transforms queued packets into UDP
+// datagrams. Its slices are reused between sessions to reduce allocations.
 type ppWorker struct {
 	txqueue []ipv4.Message
 	bufs    [][]byte
 }
 
-// oneBuf returns a one-element Buffers slice for b, backed by w.bufs.
+// oneBuf appends b to the worker-owned slice and returns a one-element view
+// suitable for ipv4.Message.Buffers. recycle clears that view before reuse.
 func (w *ppWorker) oneBuf(b []byte) [][]byte {
 	w.bufs = append(w.bufs, b)
 	return w.bufs[len(w.bufs)-1 : len(w.bufs) : len(w.bufs)]
 }
 
+// recycle returns every datagram buffer to the shared pool and clears
+// references held by the worker's message and slice arrays.
 func (w *ppWorker) recycle() {
 	for k := range w.txqueue {
 		defaultBufferPool.Put(w.txqueue[k].Buffers[0])
@@ -69,7 +71,7 @@ func (w *ppWorker) recycle() {
 	w.bufs = w.bufs[:0]
 }
 
-// ppWorkers recycles batches handed to a rate limited session and back.
+// ppWorkers reuses batch storage across post-processing workers.
 var ppWorkers = sync.Pool{New: func() any {
 	return &ppWorker{
 		txqueue: make([]ipv4.Message, 0, maxBatchSize),
@@ -77,26 +79,28 @@ var ppWorkers = sync.Pool{New: func() any {
 	}
 }}
 
-// flushTx sends the batch in w. When the rate limiter needs time first, s
-// keeps the batch and flushTx reports true, so that no worker sleeps while
-// other sessions wait for it.
+// flushTx sends a completed batch and reports whether the worker must discard
+// it because the session is closed.
 func (s *UDPSession) flushTx(w *ppWorker, bytesToSend int) bool {
-	if limiter, _ := s.rateLimiter.Load().(*rate.Limiter); limiter != nil {
-		now := time.Now()
-		// A batch larger than the burst cannot be reserved, so it is sent
-		// immediately without rate limiting.
-		if r := limiter.ReserveN(now, bytesToSend); r.OK() {
-			if d := r.DelayFrom(now); d > 0 {
-				s.ppHeld.w, s.ppHeld.bytes, s.ppHeld.until = w, bytesToSend, now.Add(d)
-				return true
-			}
-		}
+	if s.isClosed() {
+		w.recycle()
+		return true
 	}
 	s.sendTx(w, bytesToSend)
 	return false
 }
 
-func (s *UDPSession) sendTx(w *ppWorker, bytesToSend int) {
+// sendTx performs the platform-specific send for a completed batch, emits a
+// trace record when enabled, and recycles the batch buffers. ppSendMu keeps
+// Close from returning while a send is in progress and rejects sends after
+// Close has shut the gate.
+func (s *UDPSession) sendTx(w *ppWorker, bytesToSend int) bool {
+	s.ppSendMu.Lock()
+	defer s.ppSendMu.Unlock()
+	if s.ppClosing {
+		w.recycle()
+		return false
+	}
 	s.tx(w.txqueue)
 	if kcpTrace {
 		s.mu.Lock()
@@ -104,15 +108,12 @@ func (s *UDPSession) sendTx(w *ppWorker, bytesToSend int) {
 		s.mu.Unlock()
 	}
 	w.recycle()
+	return true
 }
 
-// kickPostProcess queues s for a worker unless it is already queued or being
-// served. Callers queue their packet first. An empty queue is left alone so
-// a speculative kick does not claim the session.
+// kickPostProcess schedules s after its caller enqueues a packet. The atomic
+// claim prevents concurrent producers from queueing the same session twice.
 func (s *UDPSession) kickPostProcess() {
-	if s.postQueue.len() == 0 {
-		return
-	}
 	if s.claimPostProcess() {
 		ppEnqueue(s)
 	}
@@ -131,46 +132,38 @@ func (s *UDPSession) dispatchStaged(n int, lone sendRequest, many []sendRequest)
 		s.kickPostProcess()
 		return
 	}
+
 	w := ppWorkers.Get().(*ppWorker)
-	shipped := false
 	for {
-		if h := s.ppHeld.w; h != nil {
-			s.ppHeld.w = nil
-			s.sendTx(h, s.ppHeld.bytes)
-			ppWorkers.Put(h)
+		if s.isClosed() {
+			s.discardStaged(n, lone, many)
+			w.recycle()
+			ppWorkers.Put(w)
+			s.finishPostProcess()
+			return
 		}
-		// Older queued packets go out first. The fast path is an empty queue,
-		// which is an atomic load and does not take the queue lock.
-		if s.postQueue.len() > 0 {
-			more := s.postProcess(w)
-			if s.ppHeld.w == w {
-				SystemTimedSched.Put(func() { ppEnqueue(s) }, s.ppHeld.until)
-				return
-			}
-			if more {
-				continue
-			}
-		}
-		if !shipped {
-			shipped = true
-			if s.shipStaged(w, n, lone, many) {
-				SystemTimedSched.Put(func() { ppEnqueue(s) }, s.ppHeld.until)
-				return
-			}
+		// Older queued packets go out first.
+		if s.postQueue.len() > 0 && s.postProcess(w) {
 			continue
 		}
+		s.shipStaged(w, n, lone, many)
 		if !s.finishPostProcess() {
 			ppWorkers.Put(w)
 			return
 		}
+		// Only newly queued packets remain after the staged batch is sent.
+		n, lone, many = 0, sendRequest{}, nil
 	}
 }
 
-// shipStaged encodes staged packets and flushes them. Packets that do not fit
-// in the held batch are put on the queue for the worker that resumes s.
-func (s *UDPSession) shipStaged(w *ppWorker, n int, lone sendRequest, many []sendRequest) bool {
+// shipStaged encodes staged packets and flushes them on the calling writer.
+func (s *UDPSession) shipStaged(w *ppWorker, n int, lone sendRequest, many []sendRequest) {
+	if n == 0 {
+		return
+	}
 	if n == 1 {
-		return s.flushTx(w, s.txAdd(w, lone))
+		s.flushTx(w, s.txAdd(w, lone))
+		return
 	}
 	bytes := 0
 	for i, req := range many {
@@ -179,19 +172,18 @@ func (s *UDPSession) shipStaged(w *ppWorker, n int, lone sendRequest, many []sen
 			continue
 		}
 		if s.flushTx(w, bytes) {
-			for _, rest := range many[i+1:] {
-				if !s.postQueue.push(rest) {
-					defaultBufferPool.Put(rest.buffer)
-				}
-			}
-			return true
+			discardSendRequests(many[i+1:])
+			return
 		}
 		bytes = 0
 	}
-	return false
 }
 
 func (s *UDPSession) handoffStaged(n int, lone sendRequest, many []sendRequest) {
+	if s.isClosed() {
+		s.discardStaged(n, lone, many)
+		return
+	}
 	if n == 1 {
 		if !s.postQueue.push(lone) {
 			defaultBufferPool.Put(lone.buffer)
@@ -205,142 +197,78 @@ func (s *UDPSession) handoffStaged(n int, lone sendRequest, many []sendRequest) 
 	}
 }
 
-// fillNonce writes a unique GCM nonce. The 12-byte size is the transmit path.
-func (s *UDPSession) fillNonce(dst []byte) {
-	lo := s.nonceLo.Add(1)
-	if len(dst) == 12 {
-		binary.BigEndian.PutUint32(dst[:4], s.nonceHi)
-		binary.BigEndian.PutUint64(dst[4:], lo)
+func (s *UDPSession) discardStaged(n int, lone sendRequest, many []sendRequest) {
+	if n == 0 {
 		return
 	}
-	var buf [12]byte
-	binary.BigEndian.PutUint32(buf[:4], s.nonceHi)
-	binary.BigEndian.PutUint64(buf[4:], lo)
-	if len(dst) <= len(buf) {
-		copy(dst, buf[len(buf)-len(dst):])
+	if n == 1 {
+		defaultBufferPool.Put(lone.buffer)
 		return
 	}
-	clear(dst)
-	copy(dst, buf[:])
+	discardSendRequests(many)
 }
 
-// txAdd runs FEC and encryption for one packet and appends it to w.
-func (s *UDPSession) txAdd(w *ppWorker, req sendRequest) int {
-	buf := req.buffer
-	oob := req.oob
-
-	var ecc [][]byte
-
-	if s.fecEncoder != nil {
-		if !oob {
-			now := req.ms
-			if now == 0 {
-				now = int64(currentMs())
-			}
-			ecc = s.fecEncoder.encodeAt(buf, maxFECEncodeLatency, now)
-		} else {
-			s.fecEncoder.encodeOOB(buf)
-		}
+func discardSendRequests(requests []sendRequest) {
+	for _, req := range requests {
+		defaultBufferPool.Put(req.buffer)
 	}
-
-	switch block := s.block.(type) {
-	case nil:
-	case *aeadCrypt:
-		nonceSize := block.NonceSize()
-
-		dst := buf[:nonceSize]
-		nonce := buf[:nonceSize]
-		plaintext := buf[nonceSize:]
-
-		s.fillNonce(nonce)
-		buf = block.Seal(dst, nonce, plaintext, nil)
-
-		for k := range ecc {
-			dst := ecc[k][:nonceSize]
-			nonce := ecc[k][:nonceSize]
-			plaintext := ecc[k][nonceSize:]
-
-			s.fillNonce(nonce)
-			ecc[k] = block.Seal(dst, nonce, plaintext, nil)
-		}
-	default:
-		fillRand(buf[:nonceSize])
-		checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
-		binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
-		block.Encrypt(buf, buf)
-
-		for k := range ecc {
-			fillRand(ecc[k][:nonceSize])
-			checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
-			binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
-			block.Encrypt(ecc[k], ecc[k])
-		}
-	}
-
-	bytes := 0
-	var msg ipv4.Message
-	msg.Addr = s.remote
-	msg.Buffers = w.oneBuf(buf)
-	bytes += len(buf)
-	w.txqueue = append(w.txqueue, msg)
-
-	for i := 0; i < s.dup; i++ {
-		bts := defaultBufferPool.Get()[:len(buf)]
-		copy(bts, buf)
-		msg.Buffers = w.oneBuf(bts)
-		bytes += len(bts)
-		w.txqueue = append(w.txqueue, msg)
-	}
-
-	for k := range ecc {
-		bts := defaultBufferPool.Get()[:len(ecc[k])]
-		copy(bts, ecc[k])
-		msg.Buffers = w.oneBuf(bts)
-		bytes += len(bts)
-		w.txqueue = append(w.txqueue, msg)
-	}
-	return bytes
 }
 
 // dispatchPost transmits queued packets on the calling goroutine. Write uses
-// it so a just-flushed data packet is not waiting on a worker wakeup. A
-// worker that already owns s drains anything queued here.
+// it so a just-flushed data packet is not waiting on a worker wakeup.
 func (s *UDPSession) dispatchPost() {
-	if s.postQueue.len() == 0 {
-		return
-	}
-	if !s.claimPostProcess() {
+	if s.postQueue.len() == 0 || !s.claimPostProcess() {
 		return
 	}
 	w := ppWorkers.Get().(*ppWorker)
 	for {
-		if h := s.ppHeld.w; h != nil {
-			s.ppHeld.w = nil
-			s.sendTx(h, s.ppHeld.bytes)
-			ppWorkers.Put(h)
-		}
-		more := s.postProcess(w)
-		if s.ppHeld.w == w {
-			// s keeps the batch, and stays queued, until the limiter allows it.
-			SystemTimedSched.Put(func() { ppEnqueue(s) }, s.ppHeld.until)
+		if s.isClosed() {
+			w.recycle()
+			ppWorkers.Put(w)
+			s.finishPostProcess()
 			return
 		}
-		if !more && !s.finishPostProcess() {
+		if !s.postProcess(w) && !s.finishPostProcess() {
 			ppWorkers.Put(w)
 			return
 		}
 	}
 }
 
+// claimPostProcess changes the session from idle to queued-or-running.
 func (s *UDPSession) claimPostProcess() bool {
 	return s.ppRunning.CompareAndSwap(false, true)
 }
 
+// finishPostProcess relinquishes the current worker claim. If the session is
+// still open and packets arrived during processing, it claims the session
+// again so the caller can enqueue another worker pass. Closed sessions instead
+// release queued packet buffers.
 func (s *UDPSession) finishPostProcess() bool {
 	s.ppRunning.Store(false)
+	if s.isClosed() {
+		s.discardPostProcess()
+		return false
+	}
 	return s.postQueue.len() > 0 && s.claimPostProcess()
 }
 
+// discardPostProcess releases queued packet buffers after Close.
+// Close serializes its final KCP flush and closes die while holding s.mu, so
+// the output callback cannot enqueue more packets after this drain completes.
+func (s *UDPSession) discardPostProcess() {
+	for {
+		req, ok := s.postQueue.pop()
+		if !ok {
+			return
+		}
+		defaultBufferPool.Put(req.buffer)
+	}
+}
+
+// ppEnqueue appends a claimed session to the shared worker queue and wakes one
+// worker. Queue compaction drops consumed references without shifting on every
+// dequeue.
 func ppEnqueue(s *UDPSession) {
 	ppQueue.once.Do(startPostProcessWorkers)
 	ppQueue.mu.Lock()
@@ -354,20 +282,19 @@ func ppEnqueue(s *UDPSession) {
 	ppQueue.cond.Signal()
 }
 
+// startPostProcessWorkers initializes the queue condition variable and starts
+// a bounded process-wide pool. It is called exactly once by ppQueue.once.
 func startPostProcessWorkers() {
 	ppQueue.cond = sync.NewCond(&ppQueue.mu)
-	n := runtime.NumCPU()
-	if n < 2 {
-		n = 2
-	}
-	if n > 8 {
-		n = 8
-	}
+	n := min(max(runtime.NumCPU(), 2), 8)
 	for i := 0; i < n; i++ {
 		go postProcessWorker()
 	}
 }
 
+// postProcessWorker repeatedly takes one claimed session from ppQueue,
+// processes packets within the per-session budget, and requeues the session
+// when more packets remain.
 func postProcessWorker() {
 	w := ppWorkers.Get().(*ppWorker)
 	for {
@@ -383,20 +310,14 @@ func postProcessWorker() {
 		}
 		ppQueue.mu.Unlock()
 
-		// The limiter allowed a held batch when it was held, so send it now.
-		if h := s.ppHeld.w; h != nil {
-			s.ppHeld.w = nil
-			s.sendTx(h, s.ppHeld.bytes)
-			ppWorkers.Put(h)
+		if s.isClosed() {
+			// Close may leave a queue entry behind after draining its buffers.
+			// finishPostProcess clears the claim and performs an idempotent drain.
+			s.finishPostProcess()
+			continue
 		}
 
 		more := s.postProcess(w)
-		if s.ppHeld.w == w {
-			// s keeps the batch, and stays queued, until the limiter allows it.
-			w = ppWorkers.Get().(*ppWorker)
-			SystemTimedSched.Put(func() { ppEnqueue(s) }, s.ppHeld.until)
-			continue
-		}
 		if more {
 			ppEnqueue(s)
 			continue
