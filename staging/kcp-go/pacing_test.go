@@ -282,3 +282,48 @@ func TestSendBacklogCap(t *testing.T) {
 		t.Fatalf("admission still closed with %d unsent bytes, cap %d", kcp.unsent, limit)
 	}
 }
+
+// TestStandingQueueCorrection checks that after startup, a pushing round in
+// which no RTT sample came back near min RTT lowers the bandwidth estimate,
+// while rounds that drained to min RTT, or whose excess fits within one flush
+// interval of ACK delay, leave it alone.
+func TestStandingQueueCorrection(t *testing.T) {
+	setup := func() (*KCP, uint32) {
+		kcp, now := newStartupKCP()
+		kcp.interval = 30
+		kcp.min_rtt, kcp.min_rtt_ts = 200, now
+		kcp.btlbw.reset(0, 2_000_000)
+		kcp.full_pipe = true
+		return kcp, now
+	}
+	// The sample's own rate is far below the estimate, so it cannot move the
+	// max filter; only the correction can.
+	round := func(kcp *KCP, now *uint32, roundMin uint32) {
+		kcp.round_min_rtt = roundMin
+		startupRound(kcp, now, 300, 30_000, true, false, 50, 0)
+	}
+
+	kcp, now := setup()
+	round(kcp, &now, 250)
+	if got, want := kcp.btlbw.get(), uint64(2_000_000*90/100); got != want {
+		t.Fatalf("after a round with a 50 ms standing queue, btlbw = %d, want %d (one paceQueueCut step)", got, want)
+	}
+	round(kcp, &now, 400)
+	if got, want := kcp.btlbw.get(), uint64(1_800_000*90/100); got != want {
+		t.Fatalf("after a second standing-queue round, btlbw = %d, want %d (cut capped at paceQueueCut per round)", got, want)
+	}
+
+	kcp, now = setup()
+	round(kcp, &now, 201)
+	round(kcp, &now, 229) // within min RTT + interval: ACK delay, not queueing
+	if got := kcp.btlbw.get(); got != 2_000_000 {
+		t.Fatalf("rounds that drained (or only saw ACK delay) changed btlbw to %d", got)
+	}
+
+	kcp, now = setup()
+	kcp.full_pipe = false
+	round(kcp, &now, 300)
+	if got := kcp.btlbw.get(); got < 2_000_000 {
+		t.Fatalf("startup's own queue lowered btlbw to %d; startup must keep growing", got)
+	}
+}

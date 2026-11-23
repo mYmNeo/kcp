@@ -53,6 +53,7 @@ The project is layered as follows:
 - **Rate model:** BBR-like.
   - Delivery-rate samples per draft-cheng (`on_delivered` in `parse_ack`/`parse_una`, `take_rate_sample` after `Input`). Karn rule: only `xmit == 1` segments produce samples.
   - `btlbw` is a windowed max over 10 rounds (`winMax`, keyed by `kcp.round`); `min_rtt` uses a 10 s window.
+  - **Standing-queue correction:** after startup, a held, non-app-limited round whose smallest RTT sample (`round_min_rtt`) stayed above `min_rtt + max(min_rtt/8, interval)` cuts `btlbw` by `paceQueueCut` (10%). Samples taken while recovery bursts drain overestimate the rate by about 20% on shallow buffers, and the gain-1 phases would refill the queue; delay, unlike loss, is not triggered by random loss. The interval term keeps ACK delay from counting as queueing.
 - **Gain phases:**
   - Startup paces at 2.89×. It ends when bandwidth plateaus (3 held, non-app-limited rounds under 25% growth), or when a held round from round 2 on retransmits more than 5% of ≥ `8*paceInitWnd` sends. The loss exit resets `btlbw` to the last clean estimate.
   - Then ProbeBW cycles `{1.25, 0.75, 1×6}`, one phase per `min_rtt`.

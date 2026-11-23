@@ -684,19 +684,17 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 			kcp.cycle_ts = now
 		}
 	}
-	// A queue that stayed up for a whole round, while the sender was
-	// pushing, means the pacing rate exceeds the bottleneck: with a correct
-	// estimate the gain-1 phases drain what the probe built. Max-filtered
-	// samples taken while recovery bursts drain read high, so scale the
-	// estimate by how far the round's best RTT sits above min RTT, at most
-	// paceQueueCut per round. ACKs may wait up to one flush interval, so a
-	// gap below that is not counted as queueing; bursty traffic drains the
-	// queue each round, so its round minimum stays at min RTT.
+	// A queue that stayed up for a whole round while the sender was pushing
+	// means the pacing rate exceeds the bottleneck: with a correct estimate
+	// the gain-1 phases drain what the probe built. Max-filtered samples
+	// taken while recovery bursts drain read high, so cut the estimate by
+	// paceQueueCut for each such round. A round counts when its best RTT
+	// sample sat over min RTT by more than min_rtt/8 and one flush interval
+	// (ACKs may wait that long); bursty traffic drains the queue each round,
+	// so its round minimum stays at min RTT.
 	if newRound && kcp.full_pipe && roundHeld && !kcp.rs_applim && kcp.min_rtt > 0 && kcp.round_min_rtt > 0 &&
 		kcp.round_min_rtt > kcp.min_rtt+max(kcp.min_rtt/8, kcp.interval) {
-		bw := kcp.btlbw.get()
-		scaled := bw * uint64(kcp.min_rtt) / uint64(kcp.round_min_rtt)
-		kcp.btlbw.reset(kcp.round, max(scaled, bw*(100-paceQueueCut)/100))
+		kcp.btlbw.reset(kcp.round, kcp.btlbw.get()*(100-paceQueueCut)/100)
 	}
 	if newRound {
 		kcp.round_rexmit, kcp.round_sent, kcp.round_min_rtt = 0, 0, 0
