@@ -241,9 +241,9 @@ func TestSendBacklogCap(t *testing.T) {
 	kcp.min_rtt = 100
 	kcp.btlbw.reset(0, 1_000_000)
 	kcp.full_pipe = true
-	kcp.cycle_idx = 2 // gain 1
+	kcp.cycle_idx = 1 // drain phase, gain 0.75: the cap must not shrink with it
 
-	limit := kcp.pacing_rate() * paceUnsentMs / 1000
+	limit := uint64(1_000_000) * paceUnsentMs / 1000
 	queued := uint64(0)
 	for !kcp.send_backlog_full() {
 		kcp.Send(make([]byte, kcp.mss))

@@ -1501,15 +1501,21 @@ func (kcp *KCP) WaitSnd() int {
 }
 
 // send_backlog_full reports whether Write should wait. Besides the send
-// window, unsent data is capped at paceUnsentMs of the pacing rate (like
-// TCP_NOTSENT_LOWAT). Data queued beyond that only adds queueing delay for
-// everything written after it, such as interactive frames multiplexed on the
-// same session; the application can hold it and schedule it instead.
+// window, unsent data is capped at paceUnsentMs of the bottleneck bandwidth
+// estimate (like TCP_NOTSENT_LOWAT). Data queued beyond that only adds
+// queueing delay for everything written after it, such as interactive frames
+// multiplexed on the same session; the application can hold it and schedule
+// it instead. The estimate, unlike the pacing rate, does not swing with the
+// gain cycle, so the backlog stays the same size through probe and drain.
 func (kcp *KCP) send_backlog_full() bool {
 	if kcp.WaitSnd() >= int(kcp.snd_wnd) {
 		return true
 	}
-	limit := max(kcp.pacing_rate()*paceUnsentMs/1000, paceInitWnd*uint64(kcp.mss))
+	bw := max(kcp.btlbw.get(), kcp.pacing_floor())
+	if !kcp.full_pipe {
+		bw = kcp.pacing_rate()
+	}
+	limit := max(bw*paceUnsentMs/1000, paceInitWnd*uint64(kcp.mss))
 	return kcp.unsent >= limit
 }
 
