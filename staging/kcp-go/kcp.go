@@ -73,7 +73,7 @@ const (
 	paceBurstMs     = 10    // token bucket depth, in ms at the pacing rate
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
-	paceInitWnd     = 10    // segments per min RTT assumed before any bandwidth sample
+	paceInitWnd     = 32    // segments per min RTT assumed before any bandwidth sample
 )
 
 // paceCycleGain is the steady-state pacing gain cycle in percent, one phase
