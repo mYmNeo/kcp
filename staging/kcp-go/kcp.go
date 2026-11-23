@@ -75,7 +75,8 @@ const (
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
 	paceInitWnd     = 32    // segments per min RTT assumed before any bandwidth sample
-	paceUnsentMs    = 150   // writes wait while unsent data exceeds this many ms at the pacing rate
+	paceUnsentMs    = 150   // writes wait while unsent data exceeds this many ms at the bandwidth estimate
+	paceQueueCut    = 10    // percent; most the bandwidth estimate drops per round with a standing queue
 )
 
 // paceCycleGain is the steady-state pacing gain cycle in percent, one phase
@@ -336,6 +337,7 @@ type KCP struct {
 	round_held    bool   // the pacer held segments during the current round
 	round_rexmit  uint32 // segments retransmitted during the current round
 	round_sent    uint32 // segments transmitted during the current round
+	round_min_rtt uint32 // smallest RTT sample (ms) during the current round, 0 = none
 	cycle_idx     uint32 // index into paceCycleGain once full_pipe is set
 	cycle_ts      uint32 // when the current gain phase began (ms)
 	pace_tokens   int64  // pacing budget (bytes)
@@ -682,8 +684,22 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 			kcp.cycle_ts = now
 		}
 	}
+	// A queue that stayed up for a whole round, while the sender was
+	// pushing, means the pacing rate exceeds the bottleneck: with a correct
+	// estimate the gain-1 phases drain what the probe built. Max-filtered
+	// samples taken while recovery bursts drain read high, so scale the
+	// estimate by how far the round's best RTT sits above min RTT, at most
+	// paceQueueCut per round. ACKs may wait up to one flush interval, so a
+	// gap below that is not counted as queueing; bursty traffic drains the
+	// queue each round, so its round minimum stays at min RTT.
+	if newRound && kcp.full_pipe && roundHeld && !kcp.rs_applim && kcp.min_rtt > 0 && kcp.round_min_rtt > 0 &&
+		kcp.round_min_rtt > kcp.min_rtt+max(kcp.min_rtt/8, kcp.interval) {
+		bw := kcp.btlbw.get()
+		scaled := bw * uint64(kcp.min_rtt) / uint64(kcp.round_min_rtt)
+		kcp.btlbw.reset(kcp.round, max(scaled, bw*(100-paceQueueCut)/100))
+	}
 	if newRound {
-		kcp.round_rexmit, kcp.round_sent = 0, 0
+		kcp.round_rexmit, kcp.round_sent, kcp.round_min_rtt = 0, 0, 0
 	}
 
 	if kcp.full_pipe && kcp.min_rtt > 0 && _itimediff(now, kcp.cycle_ts) >= int32(kcp.min_rtt) {
@@ -727,7 +743,7 @@ func (kcp *KCP) reset_pacing(now uint32) {
 	kcp.full_bw, kcp.full_bw_cnt, kcp.full_pipe = 0, 0, false
 	kcp.cycle_idx, kcp.cycle_ts = 0, now
 	kcp.app_limited = 0
-	kcp.round_held, kcp.round_rexmit, kcp.round_sent = false, 0, 0
+	kcp.round_held, kcp.round_rexmit, kcp.round_sent, kcp.round_min_rtt = false, 0, 0, 0
 	// Two segments may leave at once, as from a fresh connection; the rest
 	// of the resend follows at the startup rate instead of in one burst.
 	kcp.pace_tokens, kcp.pace_ts = 2*int64(kcp.mtu), now
@@ -971,6 +987,9 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		if rtt := _itimediff(now, latest); rtt >= 0 {
 			kcp.update_ack(rtt)
 			kcp.update_minrtt(rtt, now)
+			if r := uint32(max(rtt, 1)); kcp.round_min_rtt == 0 || r < kcp.round_min_rtt {
+				kcp.round_min_rtt = r
+			}
 		}
 	}
 	kcp.take_rate_sample(now)
