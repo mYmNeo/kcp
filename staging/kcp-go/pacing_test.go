@@ -212,8 +212,8 @@ func TestResetRTOShorterPath(t *testing.T) {
 	if kcp.full_pipe || kcp.btlbw.get() != 0 {
 		t.Fatal("pacing kept the old path's bandwidth model after ResetRTO")
 	}
-	if kcp.pace_tokens > 0 {
-		t.Fatalf("ResetRTO left %d bytes of pacing budget; every reset segment would leave at once", kcp.pace_tokens)
+	if kcp.pace_tokens <= 0 || kcp.pace_tokens > 2*int64(kcp.mtu) {
+		t.Fatalf("ResetRTO left %d bytes of pacing budget, want (0, %d]: none stalls the resend, more lets it burst", kcp.pace_tokens, 2*kcp.mtu)
 	}
 
 	// The new path's first rate sample, over a 150 ms interval, closes

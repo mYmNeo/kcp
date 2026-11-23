@@ -724,7 +724,9 @@ func (kcp *KCP) reset_pacing(now uint32) {
 	kcp.cycle_idx, kcp.cycle_ts = 0, now
 	kcp.app_limited = 0
 	kcp.round_held, kcp.round_rexmit, kcp.round_sent = false, 0, 0
-	kcp.pace_tokens, kcp.pace_ts = 0, now
+	// Two segments may leave at once, as from a fresh connection; the rest
+	// of the resend follows at the startup rate instead of in one burst.
+	kcp.pace_tokens, kcp.pace_ts = 2*int64(kcp.mtu), now
 }
 
 // shrink_buf advances snd_una to the oldest unacknowledged segment in snd_buf.
@@ -1508,7 +1510,9 @@ func (kcp *KCP) SetLogger(mask KCPLogType, logger logoutput_callback) {
 // for all segments currently in the send buffer.
 //
 // This forces all unacknowledged segments to be eligible for immediate
-// retransmission during the next flush.
+// retransmission during the next flush. It also resets the pacing model, so
+// the possibly new path is measured from startup and the resent segments
+// leave paced rather than in one burst.
 func (kcp *KCP) ResetRTO() {
 	current := currentMs()
 

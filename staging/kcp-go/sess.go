@@ -1368,7 +1368,8 @@ func (s *UDPSession) kcpInput(data []byte) {
 //
 // It is intended for cases where the application knows connectivity
 // has been restored and wants to resume data delivery without waiting
-// for existing retransmission timers to expire.
+// for existing retransmission timers to expire. Pacing restarts from its
+// startup phase, since the restored path may differ from the old one.
 func (s *UDPSession) ResetRTO() {
 	s.mutex.Lock()
 	s.kcp.ResetRTO()

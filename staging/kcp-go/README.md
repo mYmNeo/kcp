@@ -200,8 +200,9 @@ Other possible attacks on kcp-go include:
 1. **Immediate flush on window progress or fast retransmit**: Flush pending data when acknowledgments advance the send window or trigger fast retransmission, without waiting for the next periodic update.
 2. **ACK clocking**: Flush ACKs when the pending ACK list reaches approximately one MTU's worth of ACK segments, rather than waiting for the periodic update.
    In high-speed networks, this acts as a higher-frequency "clock signal," potentially boosting unidirectional transmission speed by approximately 6x. For instance, if a batch takes only 1.5ms to process on a high-speed link but still adheres to a fixed 10ms transmission cycle, the actual throughput would be limited to 1/6 of the potential.
-3. **Packet batching**: The session packet-processing path batches outgoing packets and uses platform-specific batched I/O where available. This can reduce syscall overhead; it is not a packet pacing mechanism.
-4. **Data structures**: The `snd_buf` ring buffer supports cache-friendly sequential traversal. Retransmission checks are O(n) in the number of in-flight segments, so very large windows can increase per-update work.
+3. **Packet batching**: The session packet-processing path batches outgoing packets and uses platform-specific batched I/O where available. This reduces syscall overhead.
+4. **Pacing**: New data and retransmissions leave at a gain times the bottleneck bandwidth estimated from delivery-rate samples (BBR-style startup, then a 1.25/0.75/1 gain cycle), with a token bucket of about 10 ms. This applies even with congestion control off (`nc=1`), so a large send window does not burst into shallow router queues on long paths. The pacing rate is never below 32 segments per RTT, and ACKs are not paced.
+5. **Data structures**: The `snd_buf` ring buffer supports cache-friendly sequential traversal. Retransmission checks are O(n) in the number of in-flight segments, so very large windows can increase per-update work.
 
 Ultimately, nothing is more critical in a transmission system than the clock (real-time performance).
 

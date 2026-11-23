@@ -46,6 +46,22 @@ The project is layered as follows:
 - **Command (`cmd`):** PUSH (data), ACK (acknowledgment), WASK (window probe), WINS (window size).
 - **Fast Retransmit:** Retransmits lost packets faster than RTO if out-of-order packets are received.
 - **No Delay:** Configurable mode to minimize RTO and disable congestion control for lowest latency.
+- **RTO:** `rto = srtt + max(interval, 4*rttvar, srtt/4)`. The `srtt/4` term keeps pacing probes from firing spurious RTOs on smooth long paths. Segments sent before the first RTT sample use `IKCP_RTO_INIT` (1 s, RFC 6298), because `IKCP_RTO_DEF` (200 ms) is shorter than a 200-300 ms path RTT.
+
+### Pacing (`kcp.go`, always on, independent of `nc`)
+- **Why:** with `nc=1` (every kcptun mode), the effective window is `min(snd_wnd, rmt_wnd)`, which can be hundreds of segments. Unpaced, that window bursts into shallow bottleneck queues and causes tail drops and retransmit storms.
+- **Rate model:** BBR-like.
+  - Delivery-rate samples per draft-cheng (`on_delivered` in `parse_ack`/`parse_una`, `take_rate_sample` after `Input`). Karn rule: only `xmit == 1` segments produce samples.
+  - `btlbw` is a windowed max over 10 rounds (`winMax`, keyed by `kcp.round`); `min_rtt` uses a 10 s window.
+- **Gain phases:**
+  - Startup paces at 2.89×. It ends when bandwidth plateaus (3 held, non-app-limited rounds under 25% growth), or when a held round from round 2 on retransmits more than 5% of ≥ `8*paceInitWnd` sends. The loss exit resets `btlbw` to the last clean estimate.
+  - Then ProbeBW cycles `{1.25, 0.75, 1×6}`, one phase per `min_rtt`.
+  - The floor is `paceInitWnd` (32) segments per RTT, so request/response flows are never throttled by their own app-limited samples.
+- **Mechanics:** a token bucket (10 ms deep, at least 2 MTU) gates Phase 5 of `flush` for new data and retransmits alike; ACK-only flushes are not paced. Held segments set `kcp.pace_wait`. `UDPSession.armPaceLocked` (under `s.mutex`) schedules a one-shot `pace()` flush on `SystemTimedSched` after write, both `Input` paths, and `update()`.
+- **Early retransmit** additionally waits while unsent (pacer-held) segments sit at the tail of `snd_buf`.
+- **`ResetRTO`** calls `reset_pacing`, which clears the bandwidth model, `min_rtt` and the token budget so that a new path is measured from scratch.
+- **Wire format unchanged:** pacing is sender-local, and old peers interoperate.
+- **Tests:** `pacing_test.go` covers the state machine. `KCP_HL_BENCH=1 go test -run TestHighLatencyBench` (`highlatency_bench_test.go`) is the end-to-end long-RTT/shallow-buffer benchmark.
 
 ### FEC (Forward Error Correction)
 - Splits data into shards and generates parity shards.
