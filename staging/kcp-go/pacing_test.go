@@ -304,13 +304,14 @@ func TestStandingQueueCorrection(t *testing.T) {
 	}
 
 	kcp, now := setup()
+	cut := func(bw uint64) uint64 { return bw * (100 - paceQueueCut) / 100 }
 	round(kcp, &now, 250)
-	if got, want := kcp.btlbw.get(), uint64(2_000_000*90/100); got != want {
+	if got, want := kcp.btlbw.get(), cut(2_000_000); got != want {
 		t.Fatalf("after a round with a 50 ms standing queue, btlbw = %d, want %d (one paceQueueCut step)", got, want)
 	}
 	round(kcp, &now, 400)
-	if got, want := kcp.btlbw.get(), uint64(1_800_000*90/100); got != want {
-		t.Fatalf("after a second standing-queue round, btlbw = %d, want %d (cut capped at paceQueueCut per round)", got, want)
+	if got, want := kcp.btlbw.get(), cut(cut(2_000_000)); got != want {
+		t.Fatalf("after a second standing-queue round, btlbw = %d, want %d (one paceQueueCut step per round)", got, want)
 	}
 
 	kcp, now = setup()
