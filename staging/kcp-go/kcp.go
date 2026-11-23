@@ -68,13 +68,19 @@ const (
 // time instead of overflowing shallow router queues and socket buffers.
 const (
 	paceStartupGain = 200   // percent; pacing gain until the bandwidth estimate plateaus
-	paceSteadyGain  = 125   // percent; pacing gain afterwards, enough to probe for more bandwidth
 	paceFullBwRnds  = 3     // rounds without 25% bandwidth growth that end startup
 	paceBurstMs     = 10    // token bucket depth, in ms at the pacing rate
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
 	paceInitWnd     = 10    // segments per min RTT assumed before any bandwidth sample
 )
+
+// paceCycleGain is the steady-state pacing gain cycle in percent, one phase
+// per min RTT. Pacing at gain 1 bounds delivery-rate samples by the send
+// rate, so ACK bursts cannot ratchet the bandwidth estimate upward; the 1.25
+// phase probes for more bandwidth and the 0.75 phase drains the queue that
+// probing built.
+var paceCycleGain = [8]uint64{125, 75, 100, 100, 100, 100, 100, 100}
 
 type winMaxSample struct {
 	t uint32
@@ -323,6 +329,8 @@ type KCP struct {
 	full_bw       uint64 // startup: bandwidth when growth last exceeded 25%
 	full_bw_cnt   uint32 // startup: rounds since then; paceFullBwRnds ends startup
 	full_pipe     bool   // the bandwidth estimate has plateaued
+	cycle_idx     uint32 // index into paceCycleGain once full_pipe is set
+	cycle_ts      uint32 // when the current gain phase began (ms)
 	pace_tokens   int64  // pacing budget (bytes)
 	pace_ts       uint32 // when pace_tokens was last refilled (ms)
 	pace_wait     uint32 // ms until held segments may leave, 0 = nothing held
@@ -561,7 +569,10 @@ func (kcp *KCP) update_ack(rtt int32) {
 			kcp.rx_rttvar += (delta - kcp.rx_rttvar) >> 2
 		}
 	}
-	rto = uint32(kcp.rx_srtt) + max(kcp.interval, uint32(kcp.rx_rttvar)<<2)
+	// The variance term alone is a few ms on a smooth long path, so a pacing
+	// probe that queues even srtt/8 extra would fire RTO for the whole
+	// flight. Keep at least srtt/4 of margin, as such probes queue less.
+	rto = uint32(kcp.rx_srtt) + max(kcp.interval, uint32(kcp.rx_rttvar)<<2, uint32(kcp.rx_srtt)>>2)
 	kcp.rx_rto = min(max(kcp.rx_minrto, rto), IKCP_RTO_MAX)
 }
 
@@ -634,7 +645,14 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 			kcp.full_bw_cnt = 0
 		} else if kcp.full_bw_cnt++; kcp.full_bw_cnt >= paceFullBwRnds {
 			kcp.full_pipe = true
+			kcp.cycle_idx = 2
+			kcp.cycle_ts = now
 		}
+	}
+
+	if kcp.full_pipe && kcp.min_rtt > 0 && _itimediff(now, kcp.cycle_ts) >= int32(kcp.min_rtt) {
+		kcp.cycle_idx = (kcp.cycle_idx + 1) % uint32(len(paceCycleGain))
+		kcp.cycle_ts = now
 	}
 }
 
@@ -657,7 +675,7 @@ func (kcp *KCP) pacing_floor() uint64 {
 func (kcp *KCP) pacing_rate() uint64 {
 	gain := uint64(paceStartupGain)
 	if kcp.full_pipe {
-		gain = paceSteadyGain
+		gain = paceCycleGain[kcp.cycle_idx]
 	}
 	return gain * max(kcp.btlbw.get(), kcp.pacing_floor()) / 100
 }
