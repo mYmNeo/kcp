@@ -138,6 +138,8 @@ fast3:  {1, 10, 2, 1}
 
 Unknown mode names (including `manual`) leave the hidden flags (`-nodelay -interval -resend -nc`, `Hidden: true`) intact. That is how `-mode manual -nodelay 1 -interval 20 -resend 2 -nc 1` works.
 
+Every preset sets `nc=1`, which turns off only KCP's Reno `cwnd`. kcp-go still paces every session at its measured bottleneck bandwidth (BBR-style startup and gain cycle) so that the `sndwnd`/`rcvwnd` window does not burst into shallow queues on long paths. See the Pacing section in [`staging/kcp-go/AGENTS.md`](staging/kcp-go/AGENTS.md).
+
 **JSON-only fields (no CLI flag):**
 
 - client: `conntrack` (Linux `SO_ORIGINAL_DST` transparent proxy), `shmmap` (shm segment name)

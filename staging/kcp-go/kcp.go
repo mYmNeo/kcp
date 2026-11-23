@@ -1118,7 +1118,6 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		cwnd = min(kcp.cwnd, cwnd)
 	}
 
-	newSegsCount := 0
 	for {
 		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
 			break
@@ -1134,12 +1133,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		newseg.sn = kcp.snd_nxt
 		kcp.snd_buf.Push(newseg)
 		kcp.snd_nxt++
-		newSegsCount++
 	}
 
-	// Early retransmit recovers the tail of a flight, so it waits while new
-	// data is going out (as upstream KCP does) and while unsent segments
-	// still wait for the pacer at the tail of snd_buf: more ACKs will follow.
+	// Early retransmit recovers the tail of a flight, so it waits while
+	// unsent segments sit at the tail of snd_buf: segments Phase 4 just moved
+	// in (upstream KCP's newSegsCount == 0 gate) and segments the pacer held.
+	// Either way more transmissions, and so more ACKs, will follow.
 	tailUnsent := false
 	if n := kcp.snd_buf.Len(); n > 0 {
 		tailUnsent = kcp.snd_buf.At(n-1).xmit == 0
@@ -1200,7 +1199,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				segment.resendts = current + segment.rto
 				change++
 				fastRetransSegs++
-			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 && !tailUnsent { // early retransmit
+			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && !tailUnsent { // early retransmit
 				needsend = true
 				segment.fastack = 0xFFFFFFFF
 				segment.rto = kcp.rx_rto

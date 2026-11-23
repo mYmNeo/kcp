@@ -21,7 +21,7 @@ The project is layered as follows:
 ### Data Pipeline
 
 **Outgoing (Write):**
-`App Stream` -> `UDPSession.Write` -> `KCP.Send` -> `KCP.flush` -> `UDPSession.output` -> `chPostProcessing` -> `postProcess` (FEC Encode -> Encrypt) -> `UDP Socket`
+`App Stream` -> `UDPSession.Write` -> `KCP.Send` -> `KCP.flush` (Phase 5 token bucket; held segments set `pace_wait`, released by the one-shot `UDPSession.pace` timer) -> `UDPSession.output` -> `chPostProcessing` -> `postProcess` (FEC Encode -> Encrypt) -> `UDP Socket`
 
 **Incoming (Read):**
 `UDP Socket` -> `readLoop` -> `packetInput` (Decrypt -> FEC Decode) -> `KCP.Input` -> `UDPSession.Read` -> `App Stream`
@@ -45,7 +45,7 @@ The project is layered as follows:
 - **Conversation ID (`conv`):** Uniquely identifies a session.
 - **Command (`cmd`):** PUSH (data), ACK (acknowledgment), WASK (window probe), WINS (window size).
 - **Fast Retransmit:** Retransmits lost packets faster than RTO if out-of-order packets are received.
-- **No Delay:** Configurable mode to minimize RTO and disable congestion control for lowest latency.
+- **No Delay:** Configurable mode to minimize RTO and disable Reno congestion control (`cwnd`) for lowest latency. `nc=1` does not disable pacing (below), which is the only rate control left in every kcptun mode. Do not strip it as dead code.
 - **RTO:** `rto = srtt + max(interval, 4*rttvar, srtt/4)`. The `srtt/4` term keeps pacing probes from firing spurious RTOs on smooth long paths. Segments sent before the first RTT sample use `IKCP_RTO_INIT` (1 s, RFC 6298), because `IKCP_RTO_DEF` (200 ms) is shorter than a 200-300 ms path RTT.
 
 ### Pacing (`kcp.go`, always on, independent of `nc`)

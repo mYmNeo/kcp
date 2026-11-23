@@ -92,22 +92,28 @@ func TestPacingSpreadsBurst(t *testing.T) {
 		return n
 	}
 
-	// The bucket holds paceBurstMs of the rate: 10 KB, about 8 segments.
+	// The bucket holds paceBurstMs of the rate: 10 KB, about 8 segments. A
+	// burst is the whole bucket, give or take the segment that overdraws it.
 	bucket := int(1_000_000*paceBurstMs/1000)/int(kcp.mtu+IKCP_OVERHEAD) + 1
+	inBucket := func(n int) bool { return n >= bucket-1 && n <= bucket }
+
+	// pace_ts is set relative to the clock flush reads, so the refill is the
+	// same however long the process has run.
+	kcp.pace_tokens, kcp.pace_ts = 0, currentMs()-100
 	kcp.flush(IKCP_FLUSH_FULL)
 	first := sent()
-	if first == 0 || first > bucket {
-		t.Fatalf("first flush sent %d of %d segments, want at most one %d-segment bucket", first, segs, bucket)
+	if !inBucket(first) {
+		t.Fatalf("first flush sent %d of %d segments, want one %d-segment bucket", first, segs, bucket)
 	}
 	if kcp.pace_wait == 0 {
 		t.Fatal("segments are held but pace_wait is 0, so nothing would release them early")
 	}
 
-	// 100 ms later the bucket has refilled only to its depth, not 100 ms worth.
-	kcp.pace_ts -= 100
+	// Another 100 ms refills to the bucket depth, not 100 ms worth (~74).
+	kcp.pace_tokens, kcp.pace_ts = 0, currentMs()-100
 	kcp.flush(IKCP_FLUSH_FULL)
-	if second := sent(); second <= first || second-first > bucket {
-		t.Fatalf("after a 100 ms gap %d more segments left, want at most one %d-segment bucket", second-first, bucket)
+	if n := sent() - first; !inBucket(n) {
+		t.Fatalf("after a 100 ms gap %d more segments left, want one %d-segment bucket", n, bucket)
 	}
 }
 
