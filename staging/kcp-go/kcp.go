@@ -31,10 +31,11 @@ import (
 // KCP Protocol Constants
 const (
 	// Retransmission Timeout (RTO) bounds, in milliseconds
-	IKCP_RTO_NDL = 30    // no-delay mode: minimum RTO (ms)
-	IKCP_RTO_MIN = 100   // normal mode: minimum RTO (ms)
-	IKCP_RTO_DEF = 200   // default RTO (ms)
-	IKCP_RTO_MAX = 60000 // maximum RTO (ms), 60 seconds
+	IKCP_RTO_NDL  = 30    // no-delay mode: minimum RTO (ms)
+	IKCP_RTO_MIN  = 100   // normal mode: minimum RTO (ms)
+	IKCP_RTO_DEF  = 200   // default RTO (ms)
+	IKCP_RTO_INIT = 1000  // RTO for segments sent before any RTT sample (ms), as in RFC 6298
+	IKCP_RTO_MAX  = 60000 // maximum RTO (ms), 60 seconds
 
 	// Command types for the KCP segment header (cmd field)
 	IKCP_CMD_PUSH = 81 // cmd: push data
@@ -1152,6 +1153,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 			if segment.xmit == 0 { // initial transmit
 				needsend = true
 				segment.rto = kcp.rx_rto
+				if kcp.rx_srtt == 0 {
+					// No RTT sample yet. On a long path the default RTO is
+					// shorter than one round trip and would resend the first
+					// flight before its ACKs could arrive; RFC 6298 waits 1 s.
+					segment.rto = max(segment.rto, IKCP_RTO_INIT)
+				}
 				segment.resendts = current + segment.rto
 			} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
 				needsend = true
