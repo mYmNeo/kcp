@@ -712,16 +712,19 @@ func (kcp *KCP) pacing_rate() uint64 {
 	return gain * max(kcp.btlbw.get(), kcp.pacing_floor()) / 100
 }
 
-// reset_pacing forgets the bandwidth model, so pacing measures the path
-// again from startup. Delivery and in-flight accounting are kept, and so is
-// min RTT: its own 10 s window replaces it if the path changed, while
-// clearing it would let ACK-compressed samples into the bandwidth filter.
+// reset_pacing forgets the path model, so pacing measures the path again
+// from startup. Delivery and in-flight accounting are kept. Min RTT is
+// cleared too: after a move to a shorter path a stale, larger value would
+// reject every honest rate sample (interval < min_rtt) for its 10 s window.
+// Input refills it from the next ACK before taking a rate sample.
 func (kcp *KCP) reset_pacing(now uint32) {
 	kcp.btlbw = winMax{}
+	kcp.min_rtt, kcp.min_rtt_ts = 0, 0
 	kcp.full_bw, kcp.full_bw_cnt, kcp.full_pipe = 0, 0, false
 	kcp.cycle_idx, kcp.cycle_ts = 0, now
 	kcp.app_limited = 0
 	kcp.round_held, kcp.round_rexmit, kcp.round_sent = false, 0, 0
+	kcp.pace_tokens, kcp.pace_ts = 0, now
 }
 
 // shrink_buf advances snd_una to the oldest unacknowledged segment in snd_buf.
