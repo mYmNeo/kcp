@@ -644,34 +644,36 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 		}
 	}
 
-	// Startup ends once the bandwidth estimate fails to grow by 25% for
-	// paceFullBwRnds rounds in a row. Only rounds in which the pacer held
+	// A round that had to retransmit more than paceStartupLoss of what it
+	// sent overflowed the bottleneck, so the pipe is already full. Only
+	// rounds in which the pacer held segments count: in others the sender
+	// was not pushing at the startup gain, so losses there say nothing
+	// about the pipe. Retransmits in the first round come from the initial
+	// RTO guess, which can be shorter than the path RTT, and a few segments
+	// are too small a sample: random loss of one in fifty would end startup.
+	lossy := newRound && roundHeld && kcp.round >= 2 && kcp.round_sent >= 8*paceInitWnd &&
+		kcp.round_rexmit*100 > kcp.round_sent*paceStartupLoss
+	if lossy && !kcp.full_pipe {
+		// Samples from the round that overflowed include the queue it built
+		// draining; keep the last estimate that grew cleanly.
+		if kcp.full_bw > 0 {
+			kcp.btlbw.reset(kcp.round, kcp.full_bw)
+		}
+		kcp.full_pipe = true
+		kcp.cycle_idx = 2
+		kcp.cycle_ts = now
+	}
+
+	// Otherwise startup ends once the bandwidth estimate fails to grow by 25%
+	// for paceFullBwRnds rounds in a row. Only rounds in which the pacer held
 	// segments and the sample was not app-limited count: elsewhere the
 	// application, not the path, set the delivery rate.
 	if newRound && !kcp.full_pipe && roundHeld && !kcp.rs_applim {
-		// A round that had to retransmit more than paceStartupLoss of what
-		// it sent overflowed the bottleneck, so the pipe is already full.
-		// Retransmits in the first round come from the initial RTO guess,
-		// which can be shorter than the path RTT, and a few segments are too
-		// small a sample: random loss of one in fifty would end startup.
-		lossy := kcp.round >= 2 && kcp.round_sent >= 8*paceInitWnd &&
-			kcp.round_rexmit*100 > kcp.round_sent*paceStartupLoss
-		switch bw := kcp.btlbw.get(); {
-		case lossy:
-			// Samples from the round that overflowed include the queue it
-			// built draining; keep the last estimate that grew cleanly.
-			if kcp.full_bw > 0 {
-				kcp.btlbw.reset(kcp.round, kcp.full_bw)
-			}
-			kcp.full_pipe = true
-		case bw >= kcp.full_bw*5/4:
+		if bw := kcp.btlbw.get(); bw >= kcp.full_bw*5/4 {
 			kcp.full_bw = bw
 			kcp.full_bw_cnt = 0
-		default:
-			kcp.full_bw_cnt++
-			kcp.full_pipe = kcp.full_bw_cnt >= paceFullBwRnds
-		}
-		if kcp.full_pipe {
+		} else if kcp.full_bw_cnt++; kcp.full_bw_cnt >= paceFullBwRnds {
+			kcp.full_pipe = true
 			kcp.cycle_idx = 2
 			kcp.cycle_ts = now
 		}
@@ -710,11 +712,12 @@ func (kcp *KCP) pacing_rate() uint64 {
 	return gain * max(kcp.btlbw.get(), kcp.pacing_floor()) / 100
 }
 
-// reset_pacing forgets the path model, so pacing measures the path again
-// from startup. Delivery and in-flight accounting are kept.
+// reset_pacing forgets the bandwidth model, so pacing measures the path
+// again from startup. Delivery and in-flight accounting are kept, and so is
+// min RTT: its own 10 s window replaces it if the path changed, while
+// clearing it would let ACK-compressed samples into the bandwidth filter.
 func (kcp *KCP) reset_pacing(now uint32) {
 	kcp.btlbw = winMax{}
-	kcp.min_rtt, kcp.min_rtt_ts = 0, 0
 	kcp.full_bw, kcp.full_bw_cnt, kcp.full_pipe = 0, 0, false
 	kcp.cycle_idx, kcp.cycle_ts = 0, now
 	kcp.app_limited = 0
@@ -1110,6 +1113,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		cwnd = min(kcp.cwnd, cwnd)
 	}
 
+	newSegsCount := 0
 	for {
 		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
 			break
@@ -1125,11 +1129,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		newseg.sn = kcp.snd_nxt
 		kcp.snd_buf.Push(newseg)
 		kcp.snd_nxt++
+		newSegsCount++
 	}
 
-	// Segments never sent sit at the tail of snd_buf. While any wait for the
-	// pacer, more ACKs will follow, so early retransmit, which recovers the
-	// tail of a flight, must not fire yet.
+	// Early retransmit recovers the tail of a flight, so it waits while new
+	// data is going out (as upstream KCP does) and while unsent segments
+	// still wait for the pacer at the tail of snd_buf: more ACKs will follow.
 	tailUnsent := false
 	if n := kcp.snd_buf.Len(); n > 0 {
 		tailUnsent = kcp.snd_buf.At(n-1).xmit == 0
@@ -1190,7 +1195,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				segment.resendts = current + segment.rto
 				change++
 				fastRetransSegs++
-			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && !tailUnsent { // early retransmit
+			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 && !tailUnsent { // early retransmit
 				needsend = true
 				segment.fastack = 0xFFFFFFFF
 				segment.rto = kcp.rx_rto
