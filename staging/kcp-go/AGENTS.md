@@ -59,9 +59,12 @@ The project is layered as follows:
   - The floor is `paceInitWnd` (32) segments per RTT, so request/response flows are never throttled by their own app-limited samples.
 - **Mechanics:** a token bucket (10 ms deep, at least 2 MTU) gates Phase 5 of `flush` for new data and retransmits alike; ACK-only flushes are not paced. Held segments set `kcp.pace_wait`. `UDPSession.armPaceLocked` (under `s.mutex`) schedules a one-shot `pace()` flush on `SystemTimedSched` after write, both `Input` paths, and `update()`.
 - **Early retransmit** additionally waits while unsent (pacer-held) segments sit at the tail of `snd_buf`.
+- **Write admission (`send_backlog_full`)**, like `TCP_NOTSENT_LOWAT`: besides `snd_wnd`, `Write` blocks while unsent bytes (`kcp.unsent`, counted in `Send` and cleared at first transmission) reach `paceUnsentMs` (150 ms) of the pacing rate, with a floor of 32 MSS. Without this cap a saturating writer queues the whole window (~500 segments) of unsent data, and a frame written later, such as an smux frame from an interactive stream, waits seconds behind it. Every `notifyWriteEvent` site uses the same predicate.
 - **`ResetRTO`** calls `reset_pacing`, which clears the bandwidth model, `min_rtt` and the token budget so that a new path is measured from scratch.
 - **Wire format unchanged:** pacing is sender-local, and old peers interoperate.
-- **Tests:** `pacing_test.go` covers the state machine. `KCP_HL_BENCH=1 go test -run TestHighLatencyBench` (`highlatency_bench_test.go`) is the end-to-end long-RTT/shallow-buffer benchmark.
+- **Tests:** `pacing_test.go` covers the state machine.
+  - `KCP_HL_BENCH=1 go test -run TestHighLatencyBench` (`highlatency_bench_test.go`) is the end-to-end long-RTT/shallow-buffer benchmark.
+  - `KCP_BULK_BENCH=1 go test -run TestBulkBench` (`bulk_bench_test.go`) runs a saturating download with interactive pings on the same session.
 
 ### FEC (Forward Error Correction)
 - Splits data into shards and generates parity shards.

@@ -229,3 +229,43 @@ func TestResetRTOShorterPath(t *testing.T) {
 		t.Fatal("a 150 ms sample on the new path was rejected against the old path's 300 ms min RTT")
 	}
 }
+
+// TestSendBacklogCap checks that Write admission stops once the unsent data
+// covers paceUnsentMs at the pacing rate, and reopens as the pacer sends it,
+// so data written later (an interactive frame) waits behind a bounded queue.
+func TestSendBacklogCap(t *testing.T) {
+	kcp := NewKCP(1, func([]byte, int) {})
+	kcp.NoDelay(1, 10, 2, 1)
+	kcp.WndSize(4096, 4096)
+	kcp.rmt_wnd = 4096
+	kcp.min_rtt = 100
+	kcp.btlbw.reset(0, 1_000_000)
+	kcp.full_pipe = true
+	kcp.cycle_idx = 2 // gain 1
+
+	limit := kcp.pacing_rate() * paceUnsentMs / 1000
+	queued := uint64(0)
+	for !kcp.send_backlog_full() {
+		kcp.Send(make([]byte, kcp.mss))
+		queued += uint64(kcp.mss)
+		if queued > 4*limit {
+			t.Fatalf("admission still open with %d unsent bytes, cap %d", queued, limit)
+		}
+	}
+	if kcp.unsent != queued || queued < limit || queued > limit+uint64(kcp.mss) {
+		t.Fatalf("admission closed at %d unsent bytes (counter %d), want the first segment past %d", queued, kcp.unsent, limit)
+	}
+	if kcp.WaitSnd() >= int(kcp.snd_wnd) {
+		t.Fatal("cap test hit the send window instead of the unsent cap")
+	}
+
+	// One pacer burst goes out; the unsent count drops and admission reopens.
+	kcp.pace_tokens, kcp.pace_ts = 0, currentMs()-paceBurstMs
+	kcp.flush(IKCP_FLUSH_FULL)
+	if kcp.unsent >= queued {
+		t.Fatalf("unsent = %d after a flush, want below %d", kcp.unsent, queued)
+	}
+	if kcp.send_backlog_full() {
+		t.Fatalf("admission still closed with %d unsent bytes, cap %d", kcp.unsent, limit)
+	}
+}
