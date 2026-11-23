@@ -691,8 +691,11 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 	// paceQueueCut for each such round. A round counts when its best RTT
 	// sample sat over min RTT by more than min_rtt/8 and one flush interval
 	// (ACKs may wait that long); bursty traffic drains the queue each round,
-	// so its round minimum stays at min RTT.
-	if newRound && kcp.full_pipe && roundHeld && !kcp.rs_applim && kcp.min_rtt > 0 && kcp.round_min_rtt > 0 &&
+	// so its round minimum stays at min RTT. Only paths whose min RTT is
+	// well above the flush interval qualify: where ACK delay is comparable
+	// to the RTT, RTT samples cannot tell a standing queue from ACK delay,
+	// and short rounds would apply the cut many times per second.
+	if newRound && kcp.full_pipe && roundHeld && !kcp.rs_applim && kcp.min_rtt > 2*kcp.interval && kcp.round_min_rtt > 0 &&
 		kcp.round_min_rtt > kcp.min_rtt+max(kcp.min_rtt/8, kcp.interval) {
 		kcp.btlbw.reset(kcp.round, kcp.btlbw.get()*(100-paceQueueCut)/100)
 	}

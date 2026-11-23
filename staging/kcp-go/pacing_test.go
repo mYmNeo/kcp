@@ -326,4 +326,14 @@ func TestStandingQueueCorrection(t *testing.T) {
 	if got := kcp.btlbw.get(); got < 2_000_000 {
 		t.Fatalf("startup's own queue lowered btlbw to %d; startup must keep growing", got)
 	}
+
+	// A LAN path: min RTT 4 ms against a 30 ms flush interval. RTT samples
+	// there mostly measure ACK delay, so even a 60 ms round minimum is not
+	// read as a standing queue.
+	kcp, now = setup()
+	kcp.min_rtt = 4
+	round(kcp, &now, 60)
+	if got := kcp.btlbw.get(); got != 2_000_000 {
+		t.Fatalf("on a path with RTT below the flush interval btlbw changed to %d", got)
+	}
 }
