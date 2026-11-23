@@ -67,7 +67,9 @@ const (
 // bandwidth estimated from delivery-rate samples, so bursts are spread over
 // time instead of overflowing shallow router queues and socket buffers.
 const (
-	paceGain        = 2     // pacing rate = paceGain x estimated bottleneck bandwidth
+	paceStartupGain = 200   // percent; pacing gain until the bandwidth estimate plateaus
+	paceSteadyGain  = 125   // percent; pacing gain afterwards, enough to probe for more bandwidth
+	paceFullBwRnds  = 3     // rounds without 25% bandwidth growth that end startup
 	paceBurstMs     = 10    // token bucket depth, in ms at the pacing rate
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
@@ -318,6 +320,9 @@ type KCP struct {
 	btlbw         winMax // windowed max delivery rate (bytes/s); t is kcp.round
 	round         uint32 // round trips counted by delivery
 	round_deliv   uint64 // delivered value that ends the current round
+	full_bw       uint64 // startup: bandwidth when growth last exceeded 25%
+	full_bw_cnt   uint32 // startup: rounds since then; paceFullBwRnds ends startup
+	full_pipe     bool   // the bandwidth estimate has plateaued
 	pace_tokens   int64  // pacing budget (bytes)
 	pace_ts       uint32 // when pace_tokens was last refilled (ms)
 	pace_wait     uint32 // ms until held segments may leave, 0 = nothing held
@@ -601,29 +606,40 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 	if kcp.app_limited != 0 && kcp.delivered > kcp.app_limited {
 		kcp.app_limited = 0
 	}
+	newRound := false
 	if kcp.rs_deliv >= kcp.round_deliv {
 		kcp.round++
 		kcp.round_deliv = kcp.delivered
+		newRound = true
 	}
 	kcp.first_sent_ts = kcp.rs_sent_ts
 
 	// The slower of the send and ACK rates bounds the delivery rate. Intervals
 	// shorter than min RTT come from ACK compression and are discarded.
 	interval := max(_itimediff(kcp.rs_sent_ts, kcp.rs_first_ts), _itimediff(now, kcp.rs_deliv_ts))
-	if interval <= 0 || (kcp.min_rtt != 0 && uint32(interval) < kcp.min_rtt) {
-		return
+	if interval > 0 && (kcp.min_rtt == 0 || uint32(interval) >= kcp.min_rtt) {
+		rate := (kcp.delivered - kcp.rs_deliv) * 1000 / uint64(interval)
+		if !kcp.rs_applim || rate >= kcp.btlbw.get() {
+			kcp.btlbw.update(paceBwWinRounds, kcp.round, rate)
+		}
 	}
-	rate := (kcp.delivered - kcp.rs_deliv) * 1000 / uint64(interval)
-	if !kcp.rs_applim || rate >= kcp.btlbw.get() {
-		kcp.btlbw.update(paceBwWinRounds, kcp.round, rate)
+
+	// Startup ends once a non-app-limited round fails to grow the bandwidth
+	// estimate by 25% for paceFullBwRnds rounds in a row. Rounds whose
+	// estimate is still under the pacing floor were limited by the floor, not
+	// the path, and do not count.
+	if newRound && !kcp.full_pipe && !kcp.rs_applim {
+		if bw := kcp.btlbw.get(); bw >= kcp.full_bw*5/4 || bw <= kcp.pacing_floor() {
+			kcp.full_bw = max(kcp.full_bw, bw)
+			kcp.full_bw_cnt = 0
+		} else if kcp.full_bw_cnt++; kcp.full_bw_cnt >= paceFullBwRnds {
+			kcp.full_pipe = true
+		}
 	}
 }
 
-// pacing_rate returns the transmit rate in bytes/s: paceGain times the
-// bottleneck bandwidth estimate, but never less than paceInitWnd segments per
-// RTT. The floor keeps short request/response flows, whose delivery-rate
-// samples only measure the application, from being throttled by them.
-func (kcp *KCP) pacing_rate() uint64 {
+// pacing_floor is paceInitWnd segments per RTT, in bytes/s.
+func (kcp *KCP) pacing_floor() uint64 {
 	rtt := kcp.min_rtt
 	if rtt == 0 {
 		rtt = uint32(max(kcp.rx_srtt, 0))
@@ -631,8 +647,19 @@ func (kcp *KCP) pacing_rate() uint64 {
 	if rtt == 0 {
 		rtt = IKCP_RTO_DEF
 	}
-	floor := paceInitWnd * uint64(kcp.mtu) * 1000 / uint64(rtt)
-	return paceGain * max(kcp.btlbw.get(), floor)
+	return paceInitWnd * uint64(kcp.mtu) * 1000 / uint64(rtt)
+}
+
+// pacing_rate returns the transmit rate in bytes/s: a gain times the
+// bottleneck bandwidth estimate, but never less than pacing_floor. The floor
+// keeps short request/response flows, whose delivery-rate samples only
+// measure the application, from being throttled by them.
+func (kcp *KCP) pacing_rate() uint64 {
+	gain := uint64(paceStartupGain)
+	if kcp.full_pipe {
+		gain = paceSteadyGain
+	}
+	return gain * max(kcp.btlbw.get(), kcp.pacing_floor()) / 100
 }
 
 // shrink_buf advances snd_una to the oldest unacknowledged segment in snd_buf.
