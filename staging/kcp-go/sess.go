@@ -137,6 +137,9 @@ type (
 		block   BlockCrypt     // block encryption object
 
 		updateFn func() // s.update, made once so rescheduling does not allocate
+		paceFn   func() // s.pace, made once so rescheduling does not allocate
+		// paceArmed reports whether a pace callback is scheduled. Guarded by mutex.
+		paceArmed bool
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
@@ -299,6 +302,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 	// start per-session updater
 	sess.updateFn = sess.update
+	sess.paceFn = sess.pace
 	SystemTimedSched.Put(sess.updateFn, time.Now())
 
 	DefaultSnmp.increaseCurrEstab()
@@ -448,6 +452,7 @@ func (s *UDPSession) writeBuffersLocked(v [][]byte) (int, bool) {
 		// so we do not have to wait for the periodic update to uncork.
 		s.kcp.flush(IKCP_FLUSH_FULL)
 	}
+	s.armPaceLocked()
 	return n, true
 }
 
@@ -991,6 +996,7 @@ func (s *UDPSession) update() {
 		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
+		s.armPaceLocked()
 		s.mutex.Unlock()
 		// self-synchronized timed scheduling
 		fn := s.updateFn
@@ -999,6 +1005,32 @@ func (s *UDPSession) update() {
 		}
 		SystemTimedSched.Put(fn, time.Now().Add(time.Duration(interval)*time.Millisecond))
 	}
+}
+
+// armPaceLocked schedules one pace callback when the pacer holds segments
+// that are due before the next update tick. s.mutex must be held.
+func (s *UDPSession) armPaceLocked() {
+	wait := s.kcp.pace_wait
+	if s.paceArmed || wait == 0 || s.paceFn == nil {
+		return
+	}
+	s.paceArmed = true
+	SystemTimedSched.Put(s.paceFn, time.Now().Add(time.Duration(wait)*time.Millisecond))
+}
+
+// pace releases segments held by the pacer and re-arms while any remain.
+func (s *UDPSession) pace() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.paceArmed = false
+	if s.isClosed() {
+		return
+	}
+	s.kcp.flush(IKCP_FLUSH_FULL)
+	if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
+		s.notifyWriteEvent()
+	}
+	s.armPaceLocked()
 }
 
 // GetConv returns the session's conversation ID.
@@ -1278,6 +1310,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 			// recycle the buffer
 			defaultBufferPool.Put(r)
 		}
+		s.armPaceLocked()
 
 		// to notify the readers to receive the data if there's any
 		if n := s.kcp.PeekSize(); n > 0 {
@@ -1313,6 +1346,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
 			DefaultSnmp.addKCPInErrors(1)
 		}
+		s.armPaceLocked()
 
 		if n := s.kcp.PeekSize(); n > 0 {
 			s.notifyReadEvent()

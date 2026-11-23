@@ -63,6 +63,61 @@ const (
 	IKCP_SN_OFFSET   = 12     // byte offset of sequence number (sn) within the segment header
 )
 
+// Pacing parameters. Transmission is paced at a gain times the bottleneck
+// bandwidth estimated from delivery-rate samples, so bursts are spread over
+// time instead of overflowing shallow router queues and socket buffers.
+const (
+	paceGain        = 2     // pacing rate = paceGain x estimated bottleneck bandwidth
+	paceBurstMs     = 10    // token bucket depth, in ms at the pacing rate
+	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
+	paceMinRttWinMs = 10000 // min RTT filter window (ms)
+	paceInitWnd     = 10    // segments per min RTT assumed before any bandwidth sample
+)
+
+type winMaxSample struct {
+	t uint32
+	v uint64
+}
+
+// winMax is a windowed max filter that tracks the best, second best and
+// third best samples (Kathleen Nichols' algorithm, as in Linux lib/minmax.c).
+type winMax struct {
+	s [3]winMaxSample
+}
+
+func (m *winMax) get() uint64 { return m.s[0].v }
+
+func (m *winMax) reset(t uint32, v uint64) {
+	m.s[0] = winMaxSample{t, v}
+	m.s[1], m.s[2] = m.s[0], m.s[0]
+}
+
+// update adds sample v taken at time t and keeps the max over window win.
+func (m *winMax) update(win, t uint32, v uint64) {
+	val := winMaxSample{t, v}
+	if v >= m.s[0].v || t-m.s[2].t > win {
+		m.reset(t, v)
+		return
+	}
+	if v >= m.s[1].v {
+		m.s[1], m.s[2] = val, val
+	} else if v >= m.s[2].v {
+		m.s[2] = val
+	}
+	dt := t - m.s[0].t
+	switch {
+	case dt > win:
+		m.s[0], m.s[1], m.s[2] = m.s[1], m.s[2], val
+		if t-m.s[0].t > win {
+			m.s[0], m.s[1], m.s[2] = m.s[1], m.s[2], val
+		}
+	case m.s[1].t == m.s[0].t && dt > win/4:
+		m.s[1], m.s[2] = val, val
+	case m.s[2].t == m.s[1].t && dt > win/2:
+		m.s[2] = val
+	}
+}
+
 type PacketType int8
 
 const (
@@ -130,6 +185,12 @@ type segment struct {
 	resendts uint32
 	fastack  uint32
 	acked    uint32 // whether the segment has been acknowledged
+
+	// delivery-rate sample state, stamped at each transmission
+	deliv    uint64 // kcp.delivered when sent
+	deliv_ts uint32 // kcp.delivered_ts when sent
+	first_ts uint32 // kcp.first_sent_ts when sent
+	applim   bool   // sent while the sender was application-limited
 	data     []byte
 }
 
@@ -244,6 +305,30 @@ type KCP struct {
 	output output_callback // callback to write data to the underlying transport
 
 	log logoutput_callback // trace log callback
+
+	// Delivery-rate estimation (draft-cheng-iccrg-delivery-rate-estimation)
+	// and pacing. Byte counts include the KCP segment header.
+	delivered     uint64 // bytes acknowledged so far
+	delivered_ts  uint32 // when delivered last advanced (ms)
+	first_sent_ts uint32 // send time of the newest acknowledged segment (ms)
+	app_limited   uint64 // nonzero: samples are app-limited until delivered passes it
+	inflight      uint64 // bytes sent and not yet acknowledged
+	min_rtt       uint32 // windowed minimum RTT (ms), 0 = unknown
+	min_rtt_ts    uint32 // when min_rtt was taken (ms)
+	btlbw         winMax // windowed max delivery rate (bytes/s); t is kcp.round
+	round         uint32 // round trips counted by delivery
+	round_deliv   uint64 // delivered value that ends the current round
+	pace_tokens   int64  // pacing budget (bytes)
+	pace_ts       uint32 // when pace_tokens was last refilled (ms)
+	pace_wait     uint32 // ms until held segments may leave, 0 = nothing held
+
+	// rate sample from the most recently sent segment acked by one Input call
+	rs_have     bool
+	rs_deliv    uint64
+	rs_deliv_ts uint32
+	rs_first_ts uint32
+	rs_sent_ts  uint32
+	rs_applim   bool
 }
 
 type ackItem struct {
@@ -475,6 +560,81 @@ func (kcp *KCP) update_ack(rtt int32) {
 	kcp.rx_rto = min(max(kcp.rx_minrto, rto), IKCP_RTO_MAX)
 }
 
+// update_minrtt feeds an RTT sample (ms) into the windowed min RTT filter.
+func (kcp *KCP) update_minrtt(rtt int32, now uint32) {
+	r := uint32(max(rtt, 1))
+	if kcp.min_rtt == 0 || r <= kcp.min_rtt || _itimediff(now, kcp.min_rtt_ts) > paceMinRttWinMs {
+		kcp.min_rtt = r
+		kcp.min_rtt_ts = now
+	}
+}
+
+// on_delivered accounts a newly acknowledged segment for delivery-rate
+// sampling. It must run before the segment's data is recycled.
+func (kcp *KCP) on_delivered(seg *segment, now uint32) {
+	if seg.xmit == 0 {
+		return
+	}
+	size := uint64(len(seg.data) + IKCP_OVERHEAD)
+	kcp.inflight -= min(size, kcp.inflight)
+	kcp.delivered += size
+	kcp.delivered_ts = now
+	// Keep the sample of the most recently sent segment, as RFC draft-cheng
+	// does, so one sample covers everything acknowledged by this Input call.
+	if !kcp.rs_have || seg.deliv >= kcp.rs_deliv {
+		kcp.rs_have = true
+		kcp.rs_deliv = seg.deliv
+		kcp.rs_deliv_ts = seg.deliv_ts
+		kcp.rs_first_ts = seg.first_ts
+		kcp.rs_sent_ts = seg.ts
+		kcp.rs_applim = seg.applim
+	}
+}
+
+// take_rate_sample turns the pending sample into a delivery rate and feeds
+// the bottleneck bandwidth filter.
+func (kcp *KCP) take_rate_sample(now uint32) {
+	if !kcp.rs_have {
+		return
+	}
+	kcp.rs_have = false
+	if kcp.app_limited != 0 && kcp.delivered > kcp.app_limited {
+		kcp.app_limited = 0
+	}
+	if kcp.rs_deliv >= kcp.round_deliv {
+		kcp.round++
+		kcp.round_deliv = kcp.delivered
+	}
+	kcp.first_sent_ts = kcp.rs_sent_ts
+
+	// The slower of the send and ACK rates bounds the delivery rate. Intervals
+	// shorter than min RTT come from ACK compression and are discarded.
+	interval := max(_itimediff(kcp.rs_sent_ts, kcp.rs_first_ts), _itimediff(now, kcp.rs_deliv_ts))
+	if interval <= 0 || (kcp.min_rtt != 0 && uint32(interval) < kcp.min_rtt) {
+		return
+	}
+	rate := (kcp.delivered - kcp.rs_deliv) * 1000 / uint64(interval)
+	if !kcp.rs_applim || rate >= kcp.btlbw.get() {
+		kcp.btlbw.update(paceBwWinRounds, kcp.round, rate)
+	}
+}
+
+// pacing_rate returns the transmit rate in bytes/s. Before the first
+// bandwidth sample it assumes paceInitWnd segments per RTT.
+func (kcp *KCP) pacing_rate() uint64 {
+	if bw := kcp.btlbw.get(); bw > 0 {
+		return bw * paceGain
+	}
+	rtt := kcp.min_rtt
+	if rtt == 0 {
+		rtt = uint32(max(kcp.rx_srtt, 0))
+	}
+	if rtt == 0 {
+		rtt = IKCP_RTO_DEF
+	}
+	return paceGain * paceInitWnd * uint64(kcp.mtu) * 1000 / uint64(rtt)
+}
+
 // shrink_buf advances snd_una to the oldest unacknowledged segment in snd_buf.
 func (kcp *KCP) shrink_buf() {
 	if seg, ok := kcp.snd_buf.Peek(); ok {
@@ -487,7 +647,7 @@ func (kcp *KCP) shrink_buf() {
 // parse_ack marks a segment as acknowledged in snd_buf by sequence number.
 // The segment is not removed immediately; it stays until snd_una advances past it,
 // avoiding expensive shifts in the ring buffer.
-func (kcp *KCP) parse_ack(sn uint32) {
+func (kcp *KCP) parse_ack(sn, now uint32) {
 	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return
 	}
@@ -499,6 +659,9 @@ func (kcp *KCP) parse_ack(sn uint32) {
 			// Mark it acknowledged and recycle its data, but leave the slot
 			// until `una` advances. This avoids shifting later segments in the
 			// ring buffer.
+			if seg.acked == 0 {
+				kcp.on_delivered(seg, now)
+			}
 			seg.acked = 1
 			kcp.recycleSegment(seg)
 			break
@@ -537,11 +700,14 @@ func (kcp *KCP) parse_fastack(sn, ts uint32) int {
 
 // parse_una removes all segments from snd_buf that have been cumulatively acknowledged
 // (i.e., segments with sn < una). Returns the number of segments removed.
-func (kcp *KCP) parse_una(una uint32) int {
+func (kcp *KCP) parse_una(una, now uint32) int {
 	count := 0
 	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
 		seg := kcp.snd_buf.At(ri)
 		if _itimediff(una, seg.sn) > 0 {
+			if seg.acked == 0 {
+				kcp.on_delivered(seg, now)
+			}
 			kcp.recycleSegment(seg)
 			count++
 		} else {
@@ -610,6 +776,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 	var updateRTT int
 	var inSegs uint64
 	var flushSegments int // signal to flush segments
+	now := currentMs()
 
 	for {
 		if len(data) < int(IKCP_OVERHEAD) {
@@ -648,7 +815,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		if pktType == IKCP_PACKET_REGULAR {
 			kcp.rmt_wnd = uint32(wnd)
 		}
-		if kcp.parse_una(una) > 0 {
+		if kcp.parse_una(una, now) > 0 {
 			flushSegments |= 1
 		}
 		kcp.shrink_buf()
@@ -658,7 +825,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			if kcpTrace {
 				kcp.debugLog(IKCP_LOG_IN_ACK, "conv", conv, "sn", sn, "una", una, "ts", ts, "rto", kcp.rx_rto)
 			}
-			kcp.parse_ack(sn)
+			kcp.parse_ack(sn, now)
 			flushSegments |= kcp.parse_fastack(sn, ts)
 			updateRTT |= 1
 			latest = ts
@@ -703,11 +870,12 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 	// update rtt with the latest ts
 	// ignore the FEC packet
 	if updateRTT != 0 && pktType == IKCP_PACKET_REGULAR {
-		current := currentMs()
-		if _itimediff(current, latest) >= 0 {
-			kcp.update_ack(_itimediff(current, latest))
+		if rtt := _itimediff(now, latest); rtt >= 0 {
+			kcp.update_ack(rtt)
+			kcp.update_minrtt(rtt, now)
 		}
 	}
+	kcp.take_rate_sample(now)
 
 	// Congestion window (cwnd) update on ACK arrival.
 	// Uses Reno-style algorithm: slow-start below ssthresh, then AIMD.
@@ -891,12 +1059,27 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	nextUpdate = kcp.interval
 
+	// Refill the pacing budget. The bucket holds paceBurstMs of the pacing
+	// rate, but at least two segments so a lone segment is never delayed.
+	rate := kcp.pacing_rate()
+	burst := max(int64(rate*paceBurstMs/1000), 2*int64(kcp.mtu))
+	if elapsed := _itimediff(current, kcp.pace_ts); elapsed > 0 {
+		kcp.pace_tokens = min(kcp.pace_tokens+int64(rate*uint64(elapsed)/1000), burst)
+		kcp.pace_ts = current
+	}
+	held := false
+
 	if flushType == IKCP_FLUSH_FULL {
 		for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
 			segment := kcp.snd_buf.At(ri)
 			needsend := false
 			if segment.acked == 1 {
 				continue
+			}
+			if kcp.pace_tokens <= 0 {
+				// Out of budget: this and later segments wait for the pacer.
+				held = true
+				break
 			}
 			if segment.xmit == 0 { // initial transmit
 				needsend = true
@@ -930,12 +1113,26 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 			if needsend {
 				current = currentMs()
+				need := IKCP_OVERHEAD + len(segment.data)
+				if segment.xmit == 0 {
+					if kcp.inflight == 0 {
+						// Restart the delivery-rate interval after idle.
+						kcp.first_sent_ts = current
+						kcp.delivered_ts = current
+					}
+					kcp.inflight += uint64(need)
+				}
+				segment.deliv = kcp.delivered
+				segment.deliv_ts = kcp.delivered_ts
+				segment.first_ts = kcp.first_sent_ts
+				segment.applim = kcp.app_limited != 0
+				kcp.pace_tokens -= int64(need)
+
 				segment.xmit++
 				segment.ts = current
 				segment.wnd = seg.wnd
 				segment.una = seg.una
 
-				need := IKCP_OVERHEAD + len(segment.data)
 				ptr = kcp.makeSpace(buffer, ptr, need)
 				ptr = segment.encode(ptr)
 				copy(ptr, segment.data)
@@ -953,6 +1150,21 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 			// get the nearest rto
 			if rto := _itimediff(segment.resendts, current); rto > 0 && uint32(rto) < nextUpdate {
 				nextUpdate = uint32(rto)
+			}
+		}
+	}
+
+	if flushType == IKCP_FLUSH_FULL {
+		if held {
+			// Time until the budget covers one full segment.
+			deficit := uint64(int64(kcp.mtu) - kcp.pace_tokens)
+			kcp.pace_wait = max(uint32(deficit*1000/rate), 1)
+		} else {
+			kcp.pace_wait = 0
+			if kcp.snd_queue.Len() == 0 {
+				// Nothing left to send: later rate samples reflect the
+				// application, not the network, until this data is delivered.
+				kcp.app_limited = max(kcp.delivered+kcp.inflight, 1)
 			}
 		}
 	}
