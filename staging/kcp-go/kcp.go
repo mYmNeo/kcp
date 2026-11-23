@@ -619,12 +619,11 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 	}
 }
 
-// pacing_rate returns the transmit rate in bytes/s. Before the first
-// bandwidth sample it assumes paceInitWnd segments per RTT.
+// pacing_rate returns the transmit rate in bytes/s: paceGain times the
+// bottleneck bandwidth estimate, but never less than paceInitWnd segments per
+// RTT. The floor keeps short request/response flows, whose delivery-rate
+// samples only measure the application, from being throttled by them.
 func (kcp *KCP) pacing_rate() uint64 {
-	if bw := kcp.btlbw.get(); bw > 0 {
-		return bw * paceGain
-	}
 	rtt := kcp.min_rtt
 	if rtt == 0 {
 		rtt = uint32(max(kcp.rx_srtt, 0))
@@ -632,7 +631,8 @@ func (kcp *KCP) pacing_rate() uint64 {
 	if rtt == 0 {
 		rtt = IKCP_RTO_DEF
 	}
-	return paceGain * paceInitWnd * uint64(kcp.mtu) * 1000 / uint64(rtt)
+	floor := paceInitWnd * uint64(kcp.mtu) * 1000 / uint64(rtt)
+	return paceGain * max(kcp.btlbw.get(), floor)
 }
 
 // shrink_buf advances snd_una to the oldest unacknowledged segment in snd_buf.
