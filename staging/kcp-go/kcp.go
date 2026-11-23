@@ -67,8 +67,9 @@ const (
 // bandwidth estimated from delivery-rate samples, so bursts are spread over
 // time instead of overflowing shallow router queues and socket buffers.
 const (
-	paceStartupGain = 200   // percent; pacing gain until the bandwidth estimate plateaus
+	paceStartupGain = 289   // percent; 2/ln2, doubles delivery rate each round until bandwidth plateaus
 	paceFullBwRnds  = 3     // rounds without 25% bandwidth growth that end startup
+	paceStartupLoss = 5     // percent of a round's transmissions retransmitted that ends startup
 	paceBurstMs     = 10    // token bucket depth, in ms at the pacing rate
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
@@ -329,6 +330,9 @@ type KCP struct {
 	full_bw       uint64 // startup: bandwidth when growth last exceeded 25%
 	full_bw_cnt   uint32 // startup: rounds since then; paceFullBwRnds ends startup
 	full_pipe     bool   // the bandwidth estimate has plateaued
+	round_held    bool   // the pacer held segments during the current round
+	round_rexmit  uint32 // segments retransmitted during the current round
+	round_sent    uint32 // segments transmitted during the current round
 	cycle_idx     uint32 // index into paceCycleGain once full_pipe is set
 	cycle_ts      uint32 // when the current gain phase began (ms)
 	pace_tokens   int64  // pacing budget (bytes)
@@ -342,6 +346,7 @@ type KCP struct {
 	rs_first_ts uint32
 	rs_sent_ts  uint32
 	rs_applim   bool
+	rs_rexmit   bool // sample came from a retransmitted segment
 }
 
 type ackItem struct {
@@ -604,6 +609,7 @@ func (kcp *KCP) on_delivered(seg *segment, now uint32) {
 		kcp.rs_first_ts = seg.first_ts
 		kcp.rs_sent_ts = seg.ts
 		kcp.rs_applim = seg.applim
+		kcp.rs_rexmit = seg.xmit > 1
 	}
 }
 
@@ -617,11 +623,15 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 	if kcp.app_limited != 0 && kcp.delivered > kcp.app_limited {
 		kcp.app_limited = 0
 	}
-	newRound := false
-	if kcp.rs_deliv >= kcp.round_deliv {
+	// As in Karn's algorithm, a retransmitted segment does not end a round:
+	// its ACK may answer the earlier transmission, so its newer stamp would
+	// make rounds look shorter than a round trip.
+	newRound, roundHeld := false, false
+	if !kcp.rs_rexmit && kcp.rs_deliv >= kcp.round_deliv {
 		kcp.round++
 		kcp.round_deliv = kcp.delivered
-		newRound = true
+		newRound, roundHeld = true, kcp.round_held
+		kcp.round_held = false
 	}
 	kcp.first_sent_ts = kcp.rs_sent_ts
 
@@ -635,19 +645,32 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 		}
 	}
 
-	// Startup ends once a non-app-limited round fails to grow the bandwidth
-	// estimate by 25% for paceFullBwRnds rounds in a row. Rounds whose
-	// estimate is still under the pacing floor were limited by the floor, not
-	// the path, and do not count.
-	if newRound && !kcp.full_pipe && !kcp.rs_applim {
-		if bw := kcp.btlbw.get(); bw >= kcp.full_bw*5/4 || bw <= kcp.pacing_floor() {
+	// Startup ends once the bandwidth estimate fails to grow by 25% for
+	// paceFullBwRnds rounds in a row. Only rounds in which the pacer held
+	// segments count: elsewhere the application, not the path, set the
+	// delivery rate.
+	if newRound && !kcp.full_pipe && roundHeld {
+		if bw := kcp.btlbw.get(); bw >= kcp.full_bw*5/4 {
 			kcp.full_bw = max(kcp.full_bw, bw)
 			kcp.full_bw_cnt = 0
-		} else if kcp.full_bw_cnt++; kcp.full_bw_cnt >= paceFullBwRnds {
+		} else {
+			kcp.full_bw_cnt++
+		}
+		// A round that had to retransmit more than paceStartupLoss of what
+		// it sent overflowed the bottleneck, so the pipe is already full.
+		// Retransmits in the first round come from the initial RTO guess,
+		// which can be shorter than the path RTT, and a few segments are too
+		// small a sample: random loss of one in fifty would end startup.
+		lossy := kcp.round >= 2 && kcp.round_sent >= 8*paceInitWnd &&
+			kcp.round_rexmit*100 > kcp.round_sent*paceStartupLoss
+		if kcp.full_bw_cnt >= paceFullBwRnds || lossy {
 			kcp.full_pipe = true
 			kcp.cycle_idx = 2
 			kcp.cycle_ts = now
 		}
+	}
+	if newRound {
+		kcp.round_rexmit, kcp.round_sent = 0, 0
 	}
 
 	if kcp.full_pipe && kcp.min_rtt > 0 && _itimediff(now, kcp.cycle_ts) >= int32(kcp.min_rtt) {
@@ -1172,6 +1195,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				segment.first_ts = kcp.first_sent_ts
 				segment.applim = kcp.app_limited != 0
 				kcp.pace_tokens -= int64(need)
+				kcp.round_sent++
 
 				segment.xmit++
 				segment.ts = current
@@ -1201,6 +1225,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 	if flushType == IKCP_FLUSH_FULL {
 		if held {
+			kcp.round_held = true
 			// Time until the budget covers one full segment.
 			deficit := uint64(int64(kcp.mtu) - kcp.pace_tokens)
 			kcp.pace_wait = max(uint32(deficit*1000/rate), 1)
@@ -1229,6 +1254,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	}
 	if sum > 0 {
 		DefaultSnmp.addRetransSegs(sum)
+		kcp.round_rexmit += uint32(sum)
 	}
 
 	// cwnd update
