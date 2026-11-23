@@ -423,9 +423,9 @@ func (s *UDPSession) writeBuffersLocked(v [][]byte) (int, bool) {
 		return 0, false
 	}
 
-	// make sure write do not overflow the max sliding window on both side
-	waitsnd := s.kcp.WaitSnd()
-	if waitsnd >= int(s.kcp.snd_wnd) {
+	// make sure write do not overflow the max sliding window on both side,
+	// nor queue more unsent data than the pacer drains in paceUnsentMs
+	if s.kcp.send_backlog_full() {
 		return 0, false
 	}
 
@@ -445,7 +445,7 @@ func (s *UDPSession) writeBuffersLocked(v [][]byte) (int, bool) {
 		}
 	}
 
-	waitsnd = s.kcp.WaitSnd()
+	waitsnd := s.kcp.WaitSnd()
 	if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
 		// put the packets on wire immediately if the inflight window is full
 		// or if write delay is disabled (no merging of outgoing bytes),
@@ -992,8 +992,7 @@ func (s *UDPSession) update() {
 			return
 		}
 		interval := s.kcp.flush(IKCP_FLUSH_FULL)
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		if !s.kcp.send_backlog_full() {
 			s.notifyWriteEvent()
 		}
 		s.armPaceLocked()
@@ -1027,7 +1026,7 @@ func (s *UDPSession) pace() {
 		return
 	}
 	s.kcp.flush(IKCP_FLUSH_FULL)
-	if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
+	if !s.kcp.send_backlog_full() {
 		s.notifyWriteEvent()
 	}
 	s.armPaceLocked()
@@ -1319,8 +1318,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 
 		// to notify the writers if the window size allows to send more packets
 		// and the remote window size is not full.
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		if !s.kcp.send_backlog_full() {
 			s.notifyWriteEvent()
 		}
 
@@ -1352,8 +1350,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 			s.notifyReadEvent()
 		}
 
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		if !s.kcp.send_backlog_full() {
 			s.notifyWriteEvent()
 		}
 		return

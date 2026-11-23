@@ -75,6 +75,7 @@ const (
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
 	paceInitWnd     = 32    // segments per min RTT assumed before any bandwidth sample
+	paceUnsentMs    = 150   // writes wait while unsent data exceeds this many ms at the pacing rate
 )
 
 // paceCycleGain is the steady-state pacing gain cycle in percent, one phase
@@ -323,6 +324,7 @@ type KCP struct {
 	first_sent_ts uint32 // send time of the newest acknowledged segment (ms)
 	app_limited   uint64 // nonzero: samples are app-limited until delivered passes it
 	inflight      uint64 // bytes sent and not yet acknowledged
+	unsent        uint64 // bytes queued by Send and not yet transmitted once
 	min_rtt       uint32 // windowed minimum RTT (ms), 0 = unknown
 	min_rtt_ts    uint32 // when min_rtt was taken (ms)
 	btlbw         winMax // windowed max delivery rate (bytes/s); t is kcp.round
@@ -510,6 +512,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 					oldlen := len(seg.data)
 					seg.data = seg.data[:oldlen+extend]
 					copy(seg.data[oldlen:], buffer)
+					kcp.unsent += uint64(extend)
 					buffer = buffer[extend:]
 				}
 				break
@@ -547,6 +550,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		}
 
 		kcp.snd_queue.Push(seg)
+		kcp.unsent += uint64(size)
 		buffer = buffer[size:]
 	}
 	return 0
@@ -1228,6 +1232,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 						kcp.delivered_ts = current
 					}
 					kcp.inflight += uint64(need)
+					kcp.unsent -= min(uint64(len(segment.data)), kcp.unsent)
 				}
 				segment.deliv = kcp.delivered
 				segment.deliv_ts = kcp.delivered_ts
@@ -1493,6 +1498,19 @@ func (kcp *KCP) WndSize(sndwnd, rcvwnd int) int {
 // WaitSnd returns the number of segments in the send buffer and send queue.
 func (kcp *KCP) WaitSnd() int {
 	return kcp.snd_buf.Len() + kcp.snd_queue.Len()
+}
+
+// send_backlog_full reports whether Write should wait. Besides the send
+// window, unsent data is capped at paceUnsentMs of the pacing rate (like
+// TCP_NOTSENT_LOWAT). Data queued beyond that only adds queueing delay for
+// everything written after it, such as interactive frames multiplexed on the
+// same session; the application can hold it and schedule it instead.
+func (kcp *KCP) send_backlog_full() bool {
+	if kcp.WaitSnd() >= int(kcp.snd_wnd) {
+		return true
+	}
+	limit := max(kcp.pacing_rate()*paceUnsentMs/1000, paceInitWnd*uint64(kcp.mss))
+	return kcp.unsent >= limit
 }
 
 // SetLogger configures the trace logger
