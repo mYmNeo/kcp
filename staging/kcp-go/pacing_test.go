@@ -231,8 +231,9 @@ func TestResetRTOShorterPath(t *testing.T) {
 }
 
 // TestSendBacklogCap checks that Write admission stops once the unsent data
-// covers paceUnsentMs at the pacing rate, and reopens as the pacer sends it,
-// so data written later (an interactive frame) waits behind a bounded queue.
+// covers paceUnsentMs at the bandwidth estimate, and reopens as the pacer
+// sends it, so data written later (an interactive frame) waits behind a
+// bounded queue.
 func TestSendBacklogCap(t *testing.T) {
 	kcp := NewKCP(1, func([]byte, int) {})
 	kcp.NoDelay(1, 10, 2, 1)
@@ -257,6 +258,18 @@ func TestSendBacklogCap(t *testing.T) {
 	}
 	if kcp.WaitSnd() >= int(kcp.snd_wnd) {
 		t.Fatal("cap test hit the send window instead of the unsent cap")
+	}
+
+	// Stream mode appends small writes into the last queued segment instead
+	// of pushing a new one; those bytes are unsent too.
+	kcp.stream = 1
+	last := kcp.snd_queue.At(kcp.snd_queue.Len() - 1)
+	last.data = last.data[:len(last.data)-100]
+	kcp.unsent -= 100
+	before := kcp.unsent
+	kcp.Send(make([]byte, 40))
+	if got := kcp.unsent - before; got != 40 {
+		t.Fatalf("stream-mode append counted %d unsent bytes, want 40", got)
 	}
 
 	// One pacer burst goes out; the unsent count drops and admission reopens.

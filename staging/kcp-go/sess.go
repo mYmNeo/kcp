@@ -445,11 +445,11 @@ func (s *UDPSession) writeBuffersLocked(v [][]byte) (int, bool) {
 		}
 	}
 
-	waitsnd := s.kcp.WaitSnd()
-	if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
-		// put the packets on wire immediately if the inflight window is full
-		// or if write delay is disabled (no merging of outgoing bytes),
-		// so we do not have to wait for the periodic update to uncork.
+	if s.kcp.send_backlog_full() || !s.writeDelay {
+		// put the packets on wire immediately if the next Write would wait
+		// (window full or unsent cap reached) or if write delay is disabled
+		// (no merging of outgoing bytes), so we do not have to wait for the
+		// periodic update to uncork.
 		s.kcp.flush(IKCP_FLUSH_FULL)
 	}
 	s.armPaceLocked()
