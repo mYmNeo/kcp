@@ -23,7 +23,7 @@
 package smux
 
 import (
-	"io"
+	"container/heap"
 	"os"
 	"runtime"
 	"sync"
@@ -32,26 +32,25 @@ import (
 )
 
 func TestShaper(t *testing.T) {
+	w1 := writeRequest{seq: 1}
+	w2 := writeRequest{seq: 2}
+	w3 := writeRequest{seq: 3}
+	w4 := writeRequest{seq: 4}
+	w5 := writeRequest{seq: 5}
+
 	var reqs shaperHeap
-
-	w1 := writeRequest{frame: newFrame(1, cmdPSH, 1), seq: 1}
-	w2 := writeRequest{frame: newFrame(2, cmdPSH, 2), seq: 2}
-	w3 := writeRequest{frame: newFrame(3, cmdPSH, 3), seq: 3}
-	w4 := writeRequest{frame: newFrame(4, cmdPSH, 4), seq: 4}
-	w5 := writeRequest{frame: newFrame(5, cmdPSH, 5), seq: 5}
-
-	reqs.push(w5)
-	reqs.push(w4)
-	reqs.push(w3)
-	reqs.push(w2)
-	reqs.push(w1)
+	heap.Push(&reqs, w5)
+	heap.Push(&reqs, w4)
+	heap.Push(&reqs, w3)
+	heap.Push(&reqs, w2)
+	heap.Push(&reqs, w1)
 
 	wantSeqs := []uint32{1, 2, 3, 4, 5}
 	for _, want := range wantSeqs {
 		if len(reqs) == 0 {
 			t.Fatalf("heap empty before sequence %d", want)
 		}
-		w, _ := reqs.pop()
+		w := heap.Pop(&reqs).(writeRequest)
 		if w.seq != want {
 			t.Fatalf("heap popped sequence %d; want %d", w.seq, want)
 		}
@@ -62,30 +61,29 @@ func TestShaper(t *testing.T) {
 }
 
 func TestShaper2(t *testing.T) {
+	w1 := writeRequest{class: CLSDATA, seq: 1} // stream 0
+	w2 := writeRequest{class: CLSDATA, seq: 2}
+	w3 := writeRequest{class: CLSDATA, seq: 3}
+	w4 := writeRequest{class: CLSDATA, seq: 4}
+	w5 := writeRequest{class: CLSDATA, seq: 5}
+	w6 := writeRequest{class: CLSCTRL, seq: 6, frame: Frame{sid: 10}} // ctrl 1
+	w7 := writeRequest{class: CLSCTRL, seq: 7, frame: Frame{sid: 11}} // ctrl 2
+
 	var reqs shaperHeap
-
-	w1 := writeRequest{class: CLSDATA, frame: newFrame(1, cmdPSH, 1), seq: 1}
-	w2 := writeRequest{class: CLSDATA, frame: newFrame(2, cmdPSH, 2), seq: 2}
-	w3 := writeRequest{class: CLSDATA, frame: newFrame(3, cmdPSH, 3), seq: 3}
-	w4 := writeRequest{class: CLSDATA, frame: newFrame(4, cmdPSH, 4), seq: 4}
-	w5 := writeRequest{class: CLSDATA, frame: newFrame(5, cmdPSH, 5), seq: 5}
-	w6 := writeRequest{class: CLSCTRL, frame: newFrame(1, cmdPSH, 10), seq: 6}
-	w7 := writeRequest{class: CLSCTRL, frame: newFrame(1, cmdPSH, 11), seq: 7}
-
-	reqs.push(w6)
-	reqs.push(w5)
-	reqs.push(w4)
-	reqs.push(w3)
-	reqs.push(w2)
-	reqs.push(w1)
-	reqs.push(w7)
+	heap.Push(&reqs, w6)
+	heap.Push(&reqs, w5)
+	heap.Push(&reqs, w4)
+	heap.Push(&reqs, w3)
+	heap.Push(&reqs, w2)
+	heap.Push(&reqs, w1)
+	heap.Push(&reqs, w7)
 
 	wantSeqs := []uint32{6, 7, 1, 2, 3, 4, 5}
 	for _, want := range wantSeqs {
 		if len(reqs) == 0 {
 			t.Fatalf("heap empty before sequence %d", want)
 		}
-		w, _ := reqs.pop()
+		w := heap.Pop(&reqs).(writeRequest)
 		if w.seq != want {
 			t.Fatalf("heap popped sequence %d; want %d", w.seq, want)
 		}
@@ -144,7 +142,6 @@ func TestShaperQueueConcurrentStress(t *testing.T) {
 	var producers sync.WaitGroup
 	producers.Add(streams)
 	for sid := range streams {
-		sid := sid
 		go func() {
 			defer producers.Done()
 			<-start
@@ -324,18 +321,21 @@ func TestShaperQueue_MultiStreamRemoval(t *testing.T) {
 
 func TestShaperHeap_MemoryLeak(t *testing.T) {
 	h := &shaperHeap{}
+	heap.Init(h)
+
 	req := writeRequest{frame: Frame{sid: 1, data: make([]byte, 100)}}
-	h.push(req)
+	heap.Push(h, req)
 
 	if h.Len() != 1 {
 		t.Fatal("Heap len should be 1")
 	}
 	backing := *h
 
-	popped, _ := h.pop()
+	popped := heap.Pop(h).(writeRequest)
 	if popped.frame.sid != 1 {
-		t.Fatal("Unexpected sid:", popped.frame.sid)
+		t.Fatal("Incorrect popped item")
 	}
+
 	if h.Len() != 0 {
 		t.Fatal("Heap len should be 0")
 	}
@@ -361,133 +361,4 @@ func TestShaperIsEmpty(t *testing.T) {
 	if sq.IsEmpty() {
 		t.Fatal("ShaperQueue should not be empty")
 	}
-}
-
-// stallRWC blocks all Read/Write until Close, so sendLoop stalls and the
-// shaper queue can be observed under backpressure without a real peer.
-type stallRWC struct {
-	block chan struct{}
-}
-
-func newStallRWC() *stallRWC { return &stallRWC{block: make(chan struct{})} }
-
-func (s *stallRWC) Read(p []byte) (int, error) {
-	<-s.block
-	return 0, io.EOF
-}
-
-func (s *stallRWC) Write(p []byte) (int, error) {
-	<-s.block
-	return 0, io.ErrClosedPipe
-}
-
-func (s *stallRWC) Close() error {
-	select {
-	case <-s.block:
-	default:
-		close(s.block)
-	}
-	return nil
-}
-
-// TestShaperCtrlQueueBound verifies CLSCTRL admission respects maxCtrlShaperSize
-// when sendLoop cannot drain (Critical: no unbounded sq growth).
-func TestShaperCtrlQueueBound(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.KeepAliveDisabled = true
-	cfg.Version = 2
-
-	conn := newStallRWC()
-	sess := newSession(cfg, conn, true)
-	defer sess.Close()
-
-	var wg sync.WaitGroup
-	const flood = 4000
-	for i := 0; i < flood; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			f := newFrame(byte(cfg.Version), cmdNOP, 0)
-			deadline := time.After(200 * time.Millisecond)
-			_, _ = writeFrameInternal(sess, f, deadline, CLSCTRL)
-		}()
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	var peak int
-	for time.Now().Before(deadline) {
-		if n := sess.sq.Len(); n > peak {
-			peak = n
-		}
-		if peak > maxCtrlShaperSize {
-			t.Fatalf("shaper queue unbounded: peak=%d > maxCtrlShaperSize=%d", peak, maxCtrlShaperSize)
-		}
-		if peak >= maxCtrlShaperSize {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	wg.Wait()
-
-	if n := sess.sq.Len(); n > maxCtrlShaperSize {
-		t.Fatalf("after flood: sq.Len()=%d > maxCtrlShaperSize=%d", n, maxCtrlShaperSize)
-	}
-	if peak == 0 {
-		t.Fatal("expected shaper queue to accumulate while sendLoop stalled")
-	}
-	t.Logf("CLSCTRL flood peak sq.Len()=%d (cap=%d)", peak, maxCtrlShaperSize)
-}
-
-// TestShaperLoopExitsOnClose verifies shaperLoop is reaped after Close while
-// CLSCTRL feeders keep refilling shaperCtrl. Feeders push directly into the
-// channel (bypassing writeFrameInternal's <-die) so Close cannot abort the
-// flood via the writer-side select. The single-select shaperLoop must keep
-// s.die reachable under control-frame pressure; shaperLoopDone is the
-// deterministic exit signal observed here.
-func TestShaperLoopExitsOnClose(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.KeepAliveDisabled = true
-	cfg.Version = 2
-
-	conn := newStallRWC()
-	sess := newSession(cfg, conn, true)
-
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	for i := 0; i < 64; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				req := writeRequest{
-					class:  CLSCTRL,
-					frame:  newFrame(byte(cfg.Version), cmdNOP, 0),
-					seq:    1,
-					result: make(chan writeResult, 1),
-				}
-				select {
-				case <-stop:
-					return
-				case sess.shaperCtrl <- req:
-				}
-			}
-		}()
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	if err := sess.Close(); err != nil && err != io.ErrClosedPipe {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Wait for shaperLoop to exit via its deterministic reaping signal,
-	// then stop the flood and reap the feeder goroutines.
-	select {
-	case <-sess.shaperLoopDone:
-	case <-time.After(2 * time.Second):
-		close(stop)
-		wg.Wait()
-		t.Fatal("shaperLoop still running after Close under CLSCTRL flood")
-	}
-	close(stop)
-	wg.Wait()
 }

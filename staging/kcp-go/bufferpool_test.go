@@ -22,10 +22,13 @@
 
 package kcp
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestBufferPoolGetSize(t *testing.T) {
-	bp := newBufferPool()
+	bp := newPacketBufferPool()
 
 	buf := bp.Get()
 
@@ -43,13 +46,12 @@ func TestBufferPoolGetSize(t *testing.T) {
 }
 
 func TestBufferPoolPutResetsLength(t *testing.T) {
-	bp := newBufferPool()
+	bp := newPacketBufferPool()
 
 	buf := bp.Get()[:1]
 	if err := bp.Put(buf); err != nil {
 		t.Fatal(err)
 	}
-
 	buf2 := bp.Get()
 
 	if len(buf2) != maxPacketSize {
@@ -61,7 +63,7 @@ func TestBufferPoolPutResetsLength(t *testing.T) {
 }
 
 func TestBufferPoolPutWrongSizeIgnored(t *testing.T) {
-	bp := newBufferPool()
+	bp := newPacketBufferPool()
 
 	// Make a buffer with wrong capacity
 	wrongBuf := make([]byte, 100)
@@ -70,13 +72,15 @@ func TestBufferPoolPutWrongSizeIgnored(t *testing.T) {
 
 	// Get should still return a buffer with maxPacketSize capacity
 	buf := bp.Get()
+
 	if cap(buf) != maxPacketSize {
 		t.Fatalf("pool accepted wrong-sized buffer; expected cap=%d, got %d", maxPacketSize, cap(buf))
+		return
 	}
 }
 
 func TestBufferPoolPutReturnsError(t *testing.T) {
-	bp := newBufferPool()
+	bp := newPacketBufferPool()
 
 	// 1. Correct size
 	buf := make([]byte, maxPacketSize)
@@ -91,42 +95,54 @@ func TestBufferPoolPutReturnsError(t *testing.T) {
 	}
 }
 
-// sinkBufPair forces the wrapper to escape, matching postProcess assigning
-// pair[:] into ipv4.Message.Buffers (otherwise the compiler elides allocs).
-var sinkBufPair [][]byte
+// BenchmarkPacketBufferPoolGetPut compares the production *[maxPacketSize]byte
+// pool against a naive []byte pool to demonstrate the slice-header boxing
+// allocation avoided on sync.Pool.Put.
+func BenchmarkPacketBufferPoolGetPut(b *testing.B) {
+	runPair := func(b *testing.B, get func() []byte, put func([]byte)) {
+		b.Run("Serial", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				buf := get()[:1]
+				buf[0] = 1
+				put(buf)
+			}
+		})
+		b.Run("Parallel", func(b *testing.B) {
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					buf := get()[:1]
+					buf[0] = 1
+					put(buf)
+				}
+			})
+		})
+	}
 
-// BenchmarkBufPairPool measures the TX-path wrapper used for
-// ipv4.Message.Buffers: pooled *[1][]byte vs allocating a fresh
-// [][]byte{buf} / new([1][]byte) each time. ReportAllocs decides whether
-// bufPairPool is worth keeping (review: "先 bench 再保留").
-func BenchmarkBufPairPool(b *testing.B) {
-	payload := make([]byte, 1200)
-
-	b.Run("Pooled", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			pair := bufPairPool.Get().(*[1][]byte)
-			pair[0] = payload
-			sinkBufPair = pair[:]
-			pair[0] = nil
-			bufPairPool.Put(pair)
-		}
+	b.Run("ArrayPointer", func(b *testing.B) {
+		bp := newPacketBufferPool()
+		runPair(b, bp.Get, func(buf []byte) {
+			_ = bp.Put(buf)
+		})
 	})
 
-	b.Run("AllocSlice", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			buffers := [][]byte{payload}
-			sinkBufPair = buffers
+	b.Run("Slice", func(b *testing.B) {
+		// Local baseline only; not for production use.
+		var sp = sync.Pool{
+			New: func() any {
+				return make([]byte, maxPacketSize)
+			},
 		}
-	})
-
-	b.Run("AllocArrayPtr", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			pair := new([1][]byte)
-			pair[0] = payload
-			sinkBufPair = pair[:]
-		}
+		runPair(b,
+			func() []byte {
+				return sp.Get().([]byte)
+			},
+			func(buf []byte) {
+				if cap(buf) == maxPacketSize {
+					sp.Put(buf[:maxPacketSize])
+				}
+			},
+		)
 	})
 }

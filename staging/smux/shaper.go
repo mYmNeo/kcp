@@ -23,6 +23,7 @@
 package smux
 
 import (
+	"container/heap"
 	"container/list"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,7 @@ func _itimediff(later, earlier uint32) int32 {
 // number within each class.
 type shaperHeap []writeRequest
 
+// Len returns the number of requests in the heap.
 func (h shaperHeap) Len() int { return len(h) }
 
 // Less reports whether the request at i has higher priority than the request at j.
@@ -49,61 +51,20 @@ func (h shaperHeap) Less(i, j int) bool {
 	return _itimediff(h[j].seq, h[i].seq) > 0
 }
 
+// Swap exchanges the requests at indices i and j.
 func (h shaperHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
-// push adds req to the heap and restores heap order via sift-up.
-func (h *shaperHeap) push(req writeRequest) {
-	*h = append(*h, req)
-	h.up(len(*h) - 1)
-}
+// Push adds a write request to the heap.
+func (h *shaperHeap) Push(x any) { *h = append(*h, x.(writeRequest)) }
 
-// pop removes and returns the minimum element.
-// Returns (writeRequest{}, false) if the heap is empty.
-func (h *shaperHeap) pop() (writeRequest, bool) {
-	if len(*h) == 0 {
-		return writeRequest{}, false
-	}
-	n := len(*h)
-	(*h)[0], (*h)[n-1] = (*h)[n-1], (*h)[0]
-	x := (*h)[n-1]
-	(*h)[n-1] = writeRequest{} // avoid memory leak
-	*h = (*h)[:n-1]
-	if n > 1 {
-		h.down(0)
-	}
-	return x, true
-}
-
-// up performs sift-up (bubble-up) on the heap at index j.
-func (h *shaperHeap) up(j int) {
-	for {
-		parent := (j - 1) / 2
-		if parent == j || !h.Less(j, parent) {
-			break
-		}
-		h.Swap(j, parent)
-		j = parent
-	}
-}
-
-// down performs sift-down (heapify-down) on the heap at index i.
-func (h *shaperHeap) down(i int) {
-	n := len(*h)
-	for {
-		left := 2*i + 1
-		if left >= n {
-			break
-		}
-		smallest := left
-		if right := left + 1; right < n && h.Less(right, left) {
-			smallest = right
-		}
-		if !h.Less(smallest, i) {
-			break
-		}
-		h.Swap(i, smallest)
-		i = smallest
-	}
+// Pop removes and returns the request with the highest priority.
+func (h *shaperHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	old[n-1] = writeRequest{} // avoid memory leak
+	*h = old[0 : n-1]
+	return x
 }
 
 // shaperQueue schedules writeRequests from multiple streams in round-robin order.
@@ -123,6 +84,7 @@ var shaperHeapPool = sync.Pool{
 	},
 }
 
+// NewShaperQueue creates an empty queue for fairly scheduling stream writes.
 func NewShaperQueue() *shaperQueue {
 	return &shaperQueue{
 		streams: make(map[uint32]*shaperHeap),
@@ -130,7 +92,7 @@ func NewShaperQueue() *shaperQueue {
 	}
 }
 
-// Push adds a writeRequest to the shaperQueue.
+// Push adds a write request to its stream's priority heap.
 func (sq *shaperQueue) Push(req writeRequest) {
 	sq.mu.Lock()
 	defer sq.mu.Unlock()
@@ -150,11 +112,11 @@ func (sq *shaperQueue) Push(req writeRequest) {
 
 	// push the request into the corresponding stream heap.
 	h := sq.streams[sid]
-	h.push(req)
+	heap.Push(h, req)
 	sq.count.Add(1)
 }
 
-// Pop returns the next writeRequest in round-robin order, if one is available.
+// Pop returns the next request in round-robin stream order, or false if empty.
 func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 	sq.mu.Lock()
 	defer sq.mu.Unlock()
@@ -175,7 +137,7 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 
 		if h.Len() > 0 {
 			// pop the top request from the heap
-			req, _ := h.pop()
+			req := heap.Pop(h).(writeRequest)
 			sq.count.Add(-1)
 
 			// update next pointer for round-robin
@@ -219,7 +181,7 @@ func (sq *shaperQueue) IsEmpty() bool {
 	return sq.count.Load() == 0
 }
 
-// Len returns the total number of writeRequests in the shaperQueue.
+// Len returns the total number of queued write requests.
 func (sq *shaperQueue) Len() int {
 	return int(sq.count.Load())
 }

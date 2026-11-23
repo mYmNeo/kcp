@@ -1,172 +1,77 @@
-# Repository Guidelines
+# kcp-go Project Guide for AI Agents
 
-## Project Overview
+## 1. Project Overview
+**kcp-go** is a production-grade, reliable UDP library for Go. It implements the KCP protocol, providing a stream-based interface (like TCP) over UDP with low latency, high throughput, and packet-level control. It is widely used in gaming, streaming, and network acceleration (e.g., kcptun).
 
-A practical reference for AI assistants working in the **kcp-go** codebase. kcp-go is a production-grade reliable UDP transport library for Go — it provides `net.Conn` and `net.Listener` interfaces over UDP with ARQ, FEC, encryption, and congestion control. Module: `github.com/xtaci/kcp-go/v5`. Licensed MIT (Copyright xtaci, 2015). Go 1.26.2+.
+**Key Features:**
+- **Reliable ARQ:** Automatic Repeat reQuest for reliable delivery.
+- **FEC (Forward Error Correction):** Reed-Solomon codes to recover lost packets without retransmission.
+- **Encryption:** Packet-level encryption (AES, TEA, Salsa20, etc.).
+- **Performance:** Optimized for high concurrency and low memory footprint using buffer pools and platform-specific syscalls (sendmmsg/recvmmsg).
 
-## Architecture & Data Flow
+## 2. Architecture
 
-The library is layered as three subsystems, all in `package kcp`:
+The project is layered as follows:
 
-| Layer | Files | Responsibility |
-|-------|-------|----------------|
-| **Transport (I/O)** | `readloop*.go`, `tx*.go`, `platform*.go` | Raw packet I/O with platform batching |
-| **Session** | `sess.go` | `net.Conn` facade, crypto, FEC, pipeline goroutines |
-| **Protocol** | `kcp.go` | Pure ARQ state machine — sequence numbers, RTO, congestion, retransmit |
+1.  **Application Layer:** Uses `net.Conn` interface (`UDPSession`) to Read/Write streams.
+2.  **Session Layer (`sess.go`):** Manages the connection lifecycle, encryption/decryption, and FEC encoding/decoding. It acts as the glue between the raw UDP socket and the KCP protocol state.
+3.  **Protocol Layer (`kcp.go`):** The core KCP state machine. Handles sequence numbers, retransmission queues, flow control, and congestion control.
+4.  **Transport Layer:** Raw UDP sockets (`net.PacketConn`).
 
-### Data pipeline (documented in `sess.go:23-44`)
+### Data Pipeline
 
-**Write path**: `App → UDPSession.Write → KCP.Send → KCP.flush → output callback → postQueue → shared postProcess worker → [FEC Encode] → [Encrypt/CRC32] → TxQueue → tx(txqueue) → net.PacketConn → UDP`
+**Outgoing (Write):**
+`App Stream` -> `UDPSession.Write` -> `KCP.Send` -> `KCP.flush` -> `UDPSession.output` -> `chPostProcessing` -> `postProcess` (FEC Encode -> Encrypt) -> `UDP Socket`
 
-**Read path**: `UDP → readLoop goroutine → packetInput → [Decrypt] → [CRC32] → kcpInput → demux FEC type marker → [FEC Decode] / [OOB] → KCP.Input → UDPSession.Read → App`
+**Incoming (Read):**
+`UDP Socket` -> `readLoop` -> `packetInput` (Decrypt -> FEC Decode) -> `KCP.Input` -> `UDPSession.Read` -> `App Stream`
 
-### KCP state machine (`kcp.go:194-248`)
+## 3. Key Files & Components
 
-`KCP` is a pure ARQ implementation with **no I/O** — it calls a user-supplied `output callback` to emit packets. Key fields:
+| File | Component | Description |
+| :--- | :--- | :--- |
+| **`kcp.go`** | **Core Protocol** | Implements the KCP protocol logic (ARQ, RTO calculation, window management). Pure logic, no I/O. |
+| **`sess.go`** | **Session Management** | Defines `UDPSession` (implements `net.Conn`) and `Listener`. Handles the "plumbing" of data. |
+| **`fec.go`** | **FEC** | Forward Error Correction implementation using Reed-Solomon codes. |
+| **`crypt.go`** | **Encryption** | Block ciphers and stream ciphers wrapper for packet encryption. |
+| **`tx.go`** | **Transmission** | Platform-specific packet transmission logic (e.g., `tx_linux.go` uses `sendmmsg`). |
+| **`readloop.go`** | **Reception** | Platform-specific packet reception loops (e.g., `readloop_linux.go` uses `recvmmsg`). |
+| **`timedsched.go`** | **Scheduler** | A global timer scheduler to drive `KCP.update` for all sessions, reducing goroutine overhead. |
+| **`bufferpool.go`** | **Memory Management** | `sync.Pool` wrappers to minimize GC pressure during high-throughput data transfer. |
 
-- **Sequence space**: `snd_una` (oldest unacked), `snd_nxt` (next to send), `rcv_nxt` (next expected)
-- **Congestion control** (RFC 5681/6298): `ssthresh`, `rx_srtt`/`rx_rttvar` (smoothed RTT), `rx_rto`/`rx_minrto`, `snd_wnd`/`rcv_wnd`/`rmt_wnd`/`cwnd`, `incr`
-- **Window probing**: `probe`, `ts_probe`, `probe_wait` — sends WASK/WINS probes when remote window is zero
-- **Queues**: `snd_queue` / `snd_buf` / `rcv_queue` (`RingBuffer[segment]`), `rcv_buf` (`segmentHeap` for reorder), `acklist []ackItem`
+## 4. Core Concepts
 
-Key methods: `NewKCP(conv, output_callback)`, `Send(buf)`, `Recv(buf)`, `Input(data, pktType, ackNoDelay)`, `Update()`, `Check()`, `flush(flushType)`, `NoDelay(nodelay, interval, resend, nc)`, `WndSize(sndwnd, rcvwnd)`.
+### KCP Protocol
+- **Conversation ID (`conv`):** Uniquely identifies a session.
+- **Command (`cmd`):** PUSH (data), ACK (acknowledgment), WASK (window probe), WINS (window size).
+- **Fast Retransmit:** Retransmits lost packets faster than RTO if out-of-order packets are received.
+- **No Delay:** Configurable mode to minimize RTO and disable congestion control for lowest latency.
 
-`flush()` (`kcp.go:759-996`) is the core scheduler — 6 phases: flush ACKs, window probing, move snd_queue→snd_buf, retransmit (initial/fast/early/RTO), update SNMP/cwnd.
+### FEC (Forward Error Correction)
+- Splits data into shards and generates parity shards.
+- Allows recovery of `N` lost packets if `N <= parity_shards`.
+- Increases bandwidth usage but reduces latency caused by retransmissions.
 
-### Session (`sess.go:118-185`)
+### Concurrency Model
+- **Per-Session Goroutines:**
+    - `readLoop`: Reads from the UDP socket (for clients).
+    - `postProcess`: Handles encryption and FEC encoding before sending.
+- **Global Scheduler:** `SystemTimedSched` (in `timedsched.go`) manages the `update` tick for all sessions to avoid creating a ticker goroutine per session.
+- **Locking:** `UDPSession` uses a `sync.Mutex` to protect KCP state.
 
-`UDPSession` implements `net.Conn`. Key fields:
-- `conn net.PacketConn`, `kcp *KCP`, `block BlockCrypt` — the transport/protocol/crypto triad
-- `fecEncoder *fecEncoder`, `fecDecoder *fecDecoder` — forward error correction
-- `mu sync.Mutex` — guards KCP state (`Read`/`Write`/`update`, and any other path that touches `kcp`, serialize on this)
-- `chReadEvent`, `chWriteEvent` — wakeup channels for blocking Read/Write
-- `postQueue sendQueue` — packets waiting for a shared postProcess worker (`sendqueue.go`). `Write` collects immediate output into `stageArr`/`staging` and transmits inline after releasing `mu` when the queue is idle; otherwise it preserves order through `postQueue`. The slice is allocated only while packets wait and keeps at most `sendQueueKeep` (64) slots after it drains. `push` fails once `devBacklog` packets are waiting; the caller drops the packet and recycles its buffer.
-- `ppRunning` — set while the session is queued for or served by a worker
-- `die`, `dieOnce`, `chSocketReadError`, `chSocketWriteError` — lifecycle/error signals
-- `readDeadline`, `writeDeadline` — read/write deadlines (`pion/transport/v5/deadline`; timers stopped on close)
-- `ackNoDelay bool`, `writeDelay bool` — protocol tuning
+## 5. Development Guidelines for AI
 
-`postprocess.go` runs a fixed worker pool (`ppQueue`). An idle session has no postProcess goroutine. `kickPostProcess` claims `ppRunning` and enqueues the session; a worker calls `postProcess` for at most `ppBudget` packets, then `finishPostProcess` either releases the session or requeues it if more packets arrived. Immediate writes use `IKCP_FLUSH_SEND` and `dispatchStaged` to perform FEC, encryption, and socket I/O on the writer after releasing `mu`; `ppSendMu` serializes socket sends with `Close`.
+1.  **Context Awareness:** When modifying `kcp.go`, remember it is a pure state machine. Do not introduce I/O operations directly into `KCP` methods.
+2.  **Performance:** Be mindful of memory allocations. Use `defaultBufferPool` (`bufferpool.go`) for temporary byte slices.
+3.  **Platform Compatibility:** If modifying network I/O, check `platform_*.go`, `tx_*.go`, and `readloop_*.go` to ensure cross-platform compatibility (Linux, BSD, Windows, Generic).
+4.  **Testing:**
+    - Use `kcp_test.go` for protocol logic tests.
+    - Use `sess_test.go` for integration tests involving `UDPSession`.
+    - Use `examples/` to verify end-to-end functionality.
+5.  **Encryption:** New encryption methods should implement the `BlockCrypt` or `aeadCrypt` interfaces in `crypt.go`.
 
-The `Listener` type (`sess.go:1079-1101`) demuxes incoming packets by remote address (`packetInput` → lookup or create session), enabling a single UDP socket to serve many connections. `Close` holds `sessionLock` while it closes `die`, so `packetInput` cannot register a session on an already-closed listener: under that lock it sees `die`, unlocks, closes the new session, and returns. When the listener is closed and its last session is gone, `releasePusherLocked` returns the `PacketPusher`; the caller calls `SetPacketReceiver(nil)` after releasing `sessionLock`.
+## 6. Common Tasks
 
-A short `Read` calls `notifyReadIfAvailableLocked` before returning. If the input reader or `KCP` still has bytes, it signals `chReadEvent` so another reader is not left blocked.
-
-### Global timer scheduler (`timedsched.go`)
-
-`var SystemTimedSched *TimedSched` — a global two-stage parallel scheduler shared by all sessions to avoid per-session timer goroutines. Stage 1 ("prepend") collects `Put(f, deadline)` calls; Stage 2 ("sched", `runtime.NumCPU()` workers) maintains local min-heaps of timed tasks. Each session registers its `update()` callback via `SystemTimedSched.Put(s.update, nextUpdate)`.
-
-### Platform I/O (`readloop*.go`, `tx*.go`, `platform*.go`)
-
-Build-tag-gated (`//go:build linux` vs `//go:build !linux`):
-
-| Function | Generic | Linux |
-|----------|---------|-------|
-| Incoming | `defaultReadLoop` — `ReadFrom` single packet | `readLoop` — `recvmmsg` batch (256 pkts, `golang.org/x/net/ipv4/6`) |
-| Outgoing | `defaultTx` — `WriteTo` single packet | `tx` — `WriteBatch` via `sendmmsg` (`ipv4.PacketConn`) |
-| Platform | `platform` struct empty | `platform.batchConn` (if underlying conn is `*net.UDPConn`) |
-
-Batch ops degrade gracefully: if `batchConn` is nil (non-UDP conn, mock), it falls back to the generic path. Linux batch size is 256 packets per syscall, with pre-allocated 256×1472 byte buffers (368 KiB per session).
-
-## Key Directories
-
-Flat Go package — all source lives at the repo root.
-
-- `.` (root) — all `.go` files, all in `package kcp`
-- `assets/` — images and diagrams (layermodel.jpg, frame.png, flame graphs)
-- `examples/` — `echo.go` (working client-server demo)
-- `wireshark/` — Lua dissector plugin for Wireshark packet inspection
-
-## Development Commands
-
-```bash
-go build ./...                                    # compile
-go vet ./...                                      # lint
-go test ./...                                     # run all tests
-go test -bench=. -benchmem                        # benchmarks with allocation stats
-go test -coverprofile=coverage.txt -covermode=atomic -bench . -timeout 10m   # CI coverage + benchmarks
-
-# Debug logging (rebuilds with trace output)
-go test -tags debug -run ^TestSetLogger$
-
-# Run the echo example (terminal 1 = server, terminal 2 = client)
-go run examples/echo.go
-```
-
-Travis CI (`go 1.11.x`–`1.13.x`) runs the coverage command above, uploading to codecov. Local development requires Go 1.26.2 or newer.
-
-## Code Conventions & Common Patterns
-
-### Concurrency
-
-- **`UDPSession.mu` is the central lock** — it serializes `Read`, `Write`, and `update()` calls. KCP is NOT thread-safe internally; all access must be behind this mutex.
-- **Goroutines**: `readLoop` (reads from `net.PacketConn`, calls `packetInput` → `kcpInput` → `KCP.Input`) is per owning connection. Post-processing (FEC encode → encrypt → TX) runs on the shared `ppQueue` workers or inline on an immediate writer, not a goroutine per session. The scheduler runs `update()` on a pooled goroutine from `SystemTimedSched`. `readLoop` and `Write` contend on `mu`. `SetLogger`, `GetOOBMaxSize`, and the trace log in `sendTx` also take `mu` before touching KCP state.
-- **Channel-as-signal pattern**: `chReadEvent`, `chWriteEvent`, `chSocketReadError`, `chSocketWriteError` are `chan struct{}` used for wakeup/notification, NOT as data queues. Outbound packets wait on `postQueue`, a mutex-guarded slice, not a channel.
-- **Error propagation**: the first socket error is stored under `sync.Once`; closing `chSocketReadError` or `chSocketWriteError` publishes it to blocked callers.
-- **`sync.Once` for one-shot channel close** — `dieOnce`, `socketReadErrorOnce`, `socketWriteErrorOnce`.
-
-### KCP is a pure state machine
-
-`KCP` has **no I/O**, no channels, no goroutines. It calls `output(buf, size)` (a callback set at construction) when it needs to emit packets. This property is load-bearing — the session output callback stages packets or pushes them onto `postQueue`; `push` does not block, and a full queue drops the packet. Actual socket I/O runs only after `UDPSession.mu` is released.
-
-### v1/v2 protocol constants
-
-The 4 KCP packet types (`kcp.go:69-72`): `IKCP_PACKET_DATA=81`, `IKCP_PACKET_ACK=82`, `IKCP_PACKET_WASK=83` (window probe request), `IKCP_PACKET_WINS=84` (window size report). FEC-encoded packets use type markers `0xf1` (typeData), `0xf2` (typeParity), `0xf3` (typeOOB) at offset 4 — these don't collide with KCP cmd values in little-endian.
-
-### Memory management
-
-- `bufferpool.go`: `defaultBufferPool` — `sync.Pool` of array-backed packet buffers with cap 1472 (`maxPacketSize`). Used for all packet allocations on the hot path (rx, tx, FEC). Always `Put` back.
-- `ringbuffer.go`: `RingBuffer[T]` — generic O(1) push/pop ring with automatic growth. Used for `snd_queue`, `snd_buf`, `rcv_queue` on `KCP`.
-- `snmp.go` (+ `snmp_on.go`/`snmp_off.go`): SNMP stats (`DefaultSnmp`) track packet/byte/retransmit counts atomically via its unexported methods (`increaseOutSegs`, `addOutSegs`, `addInSegs`, `addLostSegs`, `storeRingBufferSndQueue`, …) — never mutate `DefaultSnmp` fields directly from other files; under `kcp_no_snmp` these become NOPs.
-
-### Version-compatible API
-
-Multiple `NewConn` variants exist for backward compat: `NewConn4`, `NewConn3`, `NewConn2`, `NewConn`. Each varies in what parameters it accepts. Prefer `DialWithOptions` / `ListenWithOptions` for new code. `KCP.ResetRTO` (wrapped by `UDPSession.ResetRTO`) resets the RTO backoff so an in-flight session can recover immediately after a network event.
-
-## Important Files
-
-| File | Size | Role |
-|------|------|------|
-| `sess.go` | 43.6 KB | `UDPSession` (`net.Conn`), `Listener`, `postProcess`, `packetInput`, `kcpInput`, public API (`Dial`, `Listen`, `NewConn*`) |
-| `kcp.go` | 31.5 KB | `KCP` state machine — `Send`, `Recv`, `Input`, `flush` (6-phase), `Update`, `Check`, `NoDelay`, `WndSize` |
-| `crypt.go` | 18.1 KB | `BlockCrypt` interface, implementations (AES, TEA, Salsa20, SM4, etc.), AEAD support |
-| `fec.go` | 15.7 KB | `fecEncoder`/`fecDecoder`, Reed-Solomon via `klauspost/reedsolomon`, marshal/unmarshal |
-| `timedsched.go` | 5.3 KB | `SystemTimedSched` — two-stage global timer for `KCP.Update` |
-| `autotune.go` | 5.2 KB | Auto-bandwidth tuning based on RTT/loss measurement |
-| `bufferpool.go` | 2.1 KB | `defaultBufferPool` — `sync.Pool` for 1472-byte packet buffers |
-| `readloop*.go` | 1–3 KB each | Platform-gated packet receive (generic: `ReadFrom`, Linux: `recvmmsg` batch) |
-| `tx*.go` | 1–2 KB each | Platform-gated packet send (generic: `WriteTo`, Linux: `sendmmsg` batch) |
-| `snmp.go` | `Snmp` struct — global counters (packets in/out, bytes, retransmits, FEC stats, etc.); paired with `snmp_on.go`/`snmp_off.go`: build tag `kcp_no_snmp` swaps real atomics for NOP stubs and an empty `Snmp{}` (no per-segment atomic traffic) |
-
-## Runtime/Tooling Preferences
-
-- **Runtime**: Go 1.26.2+ (per `go.mod`). No CGo required — all platform ops use `golang.org/x/net/ipv4`/`ipv6`, not raw syscalls.
-- **Dependencies**: `klauspost/reedsolomon` (FEC), `tjfoc/gmsm` (SM4 crypto), `pkg/errors` (error wrapping), `x/crypto`, `x/net`, `x/sys`, `juju/ratelimit` (application write rate limiting, `UDPSession.SetRateLimit`), `pion/transport/v5` (deadline timers). Test deps: `stretchr/testify`, `xtaci/lossyconn` (simulated packet loss).
-- **CI**: Travis CI (legacy, Go 1.11–1.13). Codecov for coverage.
-- **Debug**: Build tag `debug` enables KCP trace logging (`kcp_trace_on.go` vs `kcp_trace_off.go`). Build tag `kcp_no_snmp` compiles out SNMP entirely (NOP stubs).
-- **PGO**: Profile-guided optimization supported — configure in `build.sh` (kcptun parent project).
-
-## Testing & QA
-
-- **Framework**: stdlib `testing` predominantly; `testify/assert` used in a subset of tests (`autotune_test.go`, `snmp_test.go`).
-- **Harness**: Test helpers in `sess_test.go` build real UDP echo servers over `localhost:0`:
-  - `nextPort()` — atomic port allocator starting at 10000
-  - `dialEcho`/`listenEcho` constructors with crypto + FEC config
-  - `echoServer` goroutines → `handleEcho` per-conn
-  - `echo_tester(msg, count)` verifies N-round-trip correctness
-  - `randomEchoTest(cli, N)` — parallel writer/reader with deterministic random streams
-- **Loss simulation**: `lossyconn.NewLossyConn(lossRate, minDelayMs)` wraps a `net.PacketConn` with configurable loss/delay. Used in `kcp_test.go`, `fec_test.go`, and `sess_test.go`.
-- **Representative tests**: `Test1GBEcho` (flow control, ~1 GB transfer), `TestParallel1024CLIENT_64BMSG_64CNT` (1024 concurrent clients), `TestFECDecodeLoss` (100 groups, 3 random losses, verified recovery), `TestAES256GCM` (AEAD round-trip), `TestAutoTune`, `TestTinyBufferReceiver` (2-byte server buffer).
-- **Benchmarks**: `BenchmarkEchoSpeed4K` (echo throughput), `BenchmarkSinkSpeed1M` (sink throughput), `BenchmarkFlush` (flush with 1024 segments), `BenchmarkFECDecode`, `BenchmarkAES256`, `BenchmarkAEAD_Chacha20_Poly1035`.
-- **Conventions**: Tests are function-per-case, no `t.Parallel()` (sessions use real UDP). SNMP-dependent tests use `//go:build !kcp_no_snmp`; `-tags kcp_no_snmp` compiles counters out. `-tags debug` enables trace logging. Timeouts may be real (echo transfers take seconds).
-
-## Editing checklist
-
-When modifying this codebase, an AI assistant should:
-
-1. **Never add I/O to `KCP`** — it's a pure state machine. All I/O lives in `sess.go`, `readloop*.go`, `tx*.go`.
-2. **Respect `UDPSession.mu`** — `Read`, `Write`, and `update()` all hold it. Adding a new path that touches KCP state outside the lock is a concurrency bug.
-3. **Touch both platform branches** when modifying I/O — any change to `readLoop` or `tx` must have a corresponding change in `readloop_generic.go`/`tx_generic.go` or vice versa.
-4. **Always `Put` back pool buffers** — `defaultBufferPool.Get()` must be paired with `.Put()`. A leaked buffer is a GC pressure leak.
-5. **Preserve the output callback contract** — `KCP.output` is called from `flush()` and must never block. The session implementation stages packets or pushes onto `postQueue` and returns; a full queue drops the packet and recycles its buffer. Do not call `SetPacketReceiver` while holding `Listener.sessionLock`.
-6. **Add a test** using the `dialEcho`/`listenEcho` harness for integration changes, or `lossyconn` for loss-simulation scenarios. Match the flat `TestXxx` naming convention.
+- **Tuning Parameters:** Look at `SetNoDelay`, `SetWindowSize`, `SetMtu` in `sess.go`.
+- **Debugging:** `KCP` struct has `reserved` fields and logging constants (`IKCP_LOG_*`) that can be enabled for tracing.
+- **Adding Metrics:** `snmp.go` contains the `Snmp` struct for global statistics. Update this struct to add new metrics.

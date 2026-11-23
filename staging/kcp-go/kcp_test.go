@@ -24,10 +24,13 @@ package kcp
 
 import (
 	"bytes"
-	"encoding/binary"
+	"container/heap"
+	crand "crypto/rand"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -51,6 +54,24 @@ type lossyTestCase struct {
 	wantCorrupt  bool
 	wantReorder  bool
 	wantLinkDown bool
+}
+
+// netAddrFactory supplies distinct UDP addresses to the lossy connection tests.
+func netAddrFactory() net.Addr {
+	ip := make(net.IP, net.IPv6len)
+	ip[0] = 0x20
+	ip[1] = 0x01
+	ip[2] = 0x0d
+	ip[3] = 0xb8
+	_, err := io.ReadFull(crand.Reader, ip[4:])
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate random IP: %v", err))
+	}
+
+	return &net.UDPAddr{
+		IP:   ip,
+		Port: rand.Intn(65535) + 1,
+	}
 }
 
 func TestLossyConn(t *testing.T) {
@@ -106,11 +127,11 @@ func TestLossyConn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			clientConfig, serverConfig := tt.config, tt.config
 			serverConfig.Seed++
-			client, err := lossyconn.NewWithConfig(clientConfig)
+			client, err := lossyconn.NewWithConfigAndAddrFactory(clientConfig, netAddrFactory)
 			if err != nil {
 				t.Fatal(err)
 			}
-			server, err := lossyconn.NewWithConfig(serverConfig)
+			server, err := lossyconn.NewWithConfigAndAddrFactory(serverConfig, netAddrFactory)
 			if err != nil {
 				_ = client.Close()
 				t.Fatal(err)
@@ -312,7 +333,7 @@ func TestSegmentHeap(t *testing.T) {
 	}
 
 	for _, seg := range segments {
-		h.push(seg)
+		heap.Push(h, seg)
 		t.Logf("pushed segment with seq %d", seg.sn)
 	}
 
@@ -321,7 +342,7 @@ func TestSegmentHeap(t *testing.T) {
 	}
 
 	for i := range segments {
-		seg, _ := h.pop()
+		seg := heap.Pop(h).(segment)
 		if seg.sn != segments[i].sn {
 			t.Errorf("expected seq %d, got %d", segments[i].sn, seg.sn)
 		}
@@ -427,57 +448,5 @@ func TestSetMtuRetainsBufferForQueuedOldMssSegment(t *testing.T) {
 				t.Fatalf("output packet size = %d, want %d", got, want)
 			}
 		})
-	}
-}
-
-// TestFlushSendAfterAckOnlyKeepsSnOrder checks that a SEND flush still emits
-// segments an earlier ACK-only flush parked in snd_buf with xmit==0, and that
-// those older sequence numbers go out before the segment just queued.
-func TestFlushSendAfterAckOnlyKeepsSnOrder(t *testing.T) {
-	var packets [][]byte
-	kcp := NewKCP(1, func(buf []byte, size int) {
-		pkt := make([]byte, size)
-		copy(pkt, buf[:size])
-		packets = append(packets, pkt)
-	})
-	// fast2 disables congestion control, so an ACK-only flush is allowed to
-	// move queued segments into snd_buf. With congestion control on, cwnd
-	// starts at 0 and that first flush moves nothing.
-	kcp.NoDelay(1, 20, 2, 1)
-	first := []byte("aaaa")
-	second := []byte("bbbb")
-	if got := kcp.Send(first); got != 0 {
-		t.Fatalf("Send(first) = %d", got)
-	}
-	kcp.flush(IKCP_FLUSH_ACKONLY)
-	if len(packets) != 0 {
-		t.Fatalf("ACK-only flush emitted %d packets", len(packets))
-	}
-	if kcp.snd_buf.Len() != 1 || kcp.snd_buf.At(0).xmit != 0 {
-		t.Fatalf("ACK-only flush did not park an unsent segment, buf=%d", kcp.snd_buf.Len())
-	}
-	if got := kcp.Send(second); got != 0 {
-		t.Fatalf("Send(second) = %d", got)
-	}
-	kcp.flush(IKCP_FLUSH_SEND)
-
-	var sns []uint32
-	var payloads [][]byte
-	for _, pkt := range packets {
-		for off := 0; off+IKCP_OVERHEAD <= len(pkt); {
-			sns = append(sns, binary.LittleEndian.Uint32(pkt[off+12:off+16]))
-			n := int(binary.LittleEndian.Uint32(pkt[off+20 : off+24]))
-			if off+IKCP_OVERHEAD+n > len(pkt) {
-				t.Fatalf("segment length %d overruns packet of %d", n, len(pkt))
-			}
-			payloads = append(payloads, append([]byte(nil), pkt[off+IKCP_OVERHEAD:off+IKCP_OVERHEAD+n]...))
-			off += IKCP_OVERHEAD + n
-		}
-	}
-	if len(sns) != 2 || sns[0] != 0 || sns[1] != 1 {
-		t.Fatalf("output sns = %v, want [0 1]", sns)
-	}
-	if string(payloads[0]) != string(first) || string(payloads[1]) != string(second) {
-		t.Fatalf("payloads = %q %q", payloads[0], payloads[1])
 	}
 }

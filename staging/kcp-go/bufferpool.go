@@ -32,67 +32,50 @@ var errBufferSizeMismatch = errors.New("buffer size mismatch")
 
 // A system-wide packet buffer shared among sending, receiving and FEC
 // to mitigate high-frequency memory allocation of packets.
-var defaultBufferPool = newBufferPool()
+var defaultBufferPool = newPacketBufferPool()
 
-type bufferPool struct {
+type packetBuffer = [maxPacketSize]byte
+
+type packetBufferPool struct {
 	xmitBuf sync.Pool
 }
 
-// newBufferPool creates a system-wide packet buffer pool.
-// Buffers are stored as *[maxPacketSize]byte array pointers (8 bytes) so that
-// Put/Get into sync.Pool avoids interface-boxing allocations — the same
-// technique used by bufPairPool below.
-func newBufferPool() *bufferPool {
-	return &bufferPool{
+// newPacketBufferPool creates a new packet buffer pool with fixed maxPacketSize buffers.
+func newPacketBufferPool() *packetBufferPool {
+	return &packetBufferPool{
 		xmitBuf: sync.Pool{
 			New: func() any {
-				return new([maxPacketSize]byte)
+				return new(packetBuffer)
 			},
 		},
 	}
 }
 
-// Get retrieves a buffer from the pool as a []byte slice.
-func (bp *bufferPool) Get() []byte {
-	arr := bp.xmitBuf.Get().(*[maxPacketSize]byte)
-	return arr[:]
+// Get retrieves a buffer from the pool.
+func (bp *packetBufferPool) Get() []byte {
+	return (*bp.xmitBuf.Get().(*packetBuffer))[:]
 }
 
 // Put returns a buffer to the pool.
-// Invariant: buf must have cap == maxPacketSize and be backed by a *[maxPacketSize]byte
-// (as returned by Get). Wrong-sized slices are rejected; converting any other
-// backing array with that capacity would be unsafe.
-func (bp *bufferPool) Put(buf []byte) error {
+func (bp *packetBufferPool) Put(buf []byte) error {
 	// Only put back buffers whose capacity matches maxPacketSize.
 	if cap(buf) != maxPacketSize {
 		return errBufferSizeMismatch
 	}
-	// Convert slice back to array pointer — 8 bytes, no boxing allocation.
-	bp.xmitBuf.Put((*[maxPacketSize]byte)(buf[:cap(buf)]))
+	bp.xmitBuf.Put((*packetBuffer)(buf[:maxPacketSize]))
 	return nil
 }
 
 // Puts returns some buffers to the pool.
-func (bp *bufferPool) Puts(buffers [][]byte) {
+func (bp *packetBufferPool) Puts(buffers [][]byte) {
 	for _, buf := range buffers {
 		bp.Put(buf)
 	}
 }
 
-// PutPkts returns some FEC packets to the pool.
-func (bp *bufferPool) PutPkts(buffers []fecPacket) {
+// PutPkts returns some FEC packet buffers to the pool.
+func (bp *packetBufferPool) PutPkts(buffers []fecPacket) {
 	for _, buf := range buffers {
 		bp.Put(buf)
 	}
-}
-
-// bufPairPool reduces allocation of [][]byte wrapper slices used in
-// ipv4.Message.Buffers during TX batching. Each entry is a *[1][]byte
-// (8-byte pointer) that fits inline in any - no boxing allocation.
-// Retention justified by BenchmarkBufPairPool (Pooled vs AllocSlice/AllocArrayPtr).
-var bufPairPool = sync.Pool{
-	New: func() any {
-		var a [1][]byte
-		return &a
-	},
 }

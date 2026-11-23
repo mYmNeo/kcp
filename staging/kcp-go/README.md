@@ -116,15 +116,18 @@ func main() {
 }
 ```
 
-For optional packet encryption or FEC, use `ListenWithOptions` and `DialWithOptions`; both peers must use matching encryption keys and FEC shard settings. See [Godoc](https://pkg.go.dev/github.com/xtaci/kcp-go/v5) for configuration details.
+For optional packet encryption or FEC, use `ListenWithOptions` and `DialWithOptions`. Both peers must use matching encryption keys. The sender's FEC shard settings configure its encoder; the receiver can automatically detect and adapt to the sender's data/parity shard counts. See [Godoc](https://pkg.go.dev/github.com/xtaci/kcp-go/v5) for configuration details.
 
 ## Features
 
 - Reliable, ordered byte-stream delivery over UDP with configurable latency/throughput trade-offs.
 - `net.Conn` and `net.Listener` APIs; the familiar interface does not make the transport TCP.
 - Optional Reed-Solomon FEC to recover some packet loss, with configurable data/parity shard counts.
+- The FEC receiver can automatically detect and adapt to the sender's shard counts.
 - Optional packet encryption, including AEAD for packet-level integrity and authentication.
+- SNMP statistics are enabled by default. To disable statistics collection, build with `go build -tags kcp_no_snmp ./...`; in this build, `Snmp` is an empty placeholder and its statistics fields and reporting methods are unavailable.
 - A shared timer scheduler and batched, platform-specific UDP I/O to support many sessions efficiently.
+- On Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, and DragonFly, wildcard UDP listeners use OS control messages to track each packet's local destination and send replies from that address. Other platforms use generic UDP handling without guaranteed source-address preservation.
 - Designed for high concurrency; capacity depends on workload, configuration, and hardware.
 - Based on [skywind3000's KCP](https://github.com/skywind3000/kcp), with additional features and optimizations.
 
@@ -166,15 +169,13 @@ The number of clock reads varies with the flush path: KCP samples time while che
 
 ### 3. Memory Management
 
-Many packet buffers are obtained from the package-wide `defaultBufferPool`, which provides buffers with a fixed capacity of 1472 bytes (`maxPacketSize`). Buffers are returned to the pool when they are no longer needed, reducing repeated allocations. The pool uses `sync.Pool`, so the Go runtime may discard pooled buffers during garbage collection; reuse and retention are not guaranteed.
+Many packet buffers are obtained from the package-wide `defaultBufferPool`, which provides buffers with a fixed capacity of 1500 bytes (`mtuLimit`). Buffers are returned to the pool when they are no longer needed, reducing repeated allocations. The pool uses `sync.Pool`, so the Go runtime may discard pooled buffers during garbage collection; reuse and retention are not guaranteed.
 
 ### 4. Per-session Application Write Rate Limiting
 
 `UDPSession.SetRateLimit(bytesPerSecond)` configures an independent token-bucket rate limit for application data submitted through `Write` and `WriteBuffers`. The limit is measured in application bytes per second. It does not count KCP/FEC/encryption overhead, FEC parity, retransmissions, `SendOOB` traffic, or UDP/IP headers. Rate limiting is disabled by default, and passing `0` disables it. A throttled write waits for tokens while remaining interruptible by its write deadline, socket write errors, and session closure.
 
-If the rate-limit wait is interrupted, the data has already been queued in KCP: `Write` returns the full accepted byte count together with the error. Callers must not retry the same payload.
-
-The bucket created by `SetRateLimit(bps)` has capacity `bps`, allowing an initial burst of up to one second's worth of application bytes before limiting the average rate at which writes are accepted. This controls application write throughput rather than the exact rate of UDP packets on the wire. Use `SetBucket` when a different burst capacity is required.
+The bucket allows an initial burst of up to `maxBatchSize * maxPacketSize` bytes (currently 64 × 1472 = 94,208 bytes), then limits the average rate at which writes are accepted. Writes larger than the burst capacity are admitted in rate-limited chunks. This controls application write throughput rather than the exact rate of UDP packets on the wire.
 
 ```go
 sess.SetRateLimit(256 * 1024) // limit this session to 256 KiB/s
@@ -210,6 +211,7 @@ Ultimately, nothing is more critical in a transmission system than the clock (re
 - Data/parity ratios are configurable per session. More parity can recover more packet loss, at the cost of additional bandwidth; the overhead depends on the configured ratio.
 - Encoder and decoder buffers are reused where possible to reduce allocations; actual memory use depends on traffic and configuration.
 - When enough shards arrive, the decoder attempts to reconstruct missing data packets and passes recovered packets to KCP for normal processing.
+- The receiver detects a sender/receiver shard-configuration mismatch from incoming data and parity packet sequence patterns. Once it has enough consecutive samples to identify both shard counts, it rebuilds its decoder and discards shards buffered under the old configuration. Detection tolerates missing or duplicate samples, but may take longer when packets are lost or reordered. The detected configuration is accepted only when the total number of data and parity shards is at most 256.
 - When packet encryption is enabled, FEC headers are included in the encrypted packet. AEAD authenticates packet contents; non-AEAD modes with CRC-32 do not provide cryptographic authentication.
 
 ## Specification

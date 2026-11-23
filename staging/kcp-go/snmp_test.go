@@ -25,8 +25,6 @@
 package kcp
 
 import (
-	"net"
-	"sync/atomic"
 	"testing"
 )
 
@@ -59,79 +57,5 @@ func TestSNMP(t *testing.T) {
 		if value != "0" {
 			t.Fatalf("ToSlice()[%d] = %q after Reset, want %q", i, value, "0")
 		}
-	}
-}
-
-func TestPacketPusherPinsFirstPeer(t *testing.T) {
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer udp.Close()
-	sess, err := NewConn3(1, nil, nil, 0, 0, &pushConn{UDPConn: udp})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-
-	first := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
-	other := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
-	pkt := make([]byte, IKCP_OVERHEAD)
-	before := atomic.LoadUint64(&DefaultSnmp.InErrs)
-	sess.pushedPacket(pkt, first, nil)
-	sess.pushedPacket(pkt, first, nil)
-	if got := atomic.LoadUint64(&DefaultSnmp.InErrs) - before; got != 0 {
-		t.Fatalf("packets from the first peer counted %d errors", got)
-	}
-	sess.pushedPacket(pkt, other, nil)
-	if got := atomic.LoadUint64(&DefaultSnmp.InErrs) - before; got != 1 {
-		t.Fatalf("a packet from another peer counted %d errors, want 1", got)
-	}
-}
-
-// TestOutSegsBatching verifies that the OutSegs SNMP counter is updated
-// once per flush() call, not once per segment encoded.
-func TestOutSegsBatching(t *testing.T) {
-	var outCalled []int // sizes passed to output callback
-	kcp1 := NewKCP(0xABCDEF01, func(buf []byte, size int) {
-		outCalled = append(outCalled, size)
-	})
-	kcp1.NoDelay(1, 10, 2, 1)
-	kcp1.WndSize(128, 128)
-
-	const numSegs = 10
-	for range numSegs {
-		kcp1.Send([]byte("data"))
-	}
-
-	before := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-	kcp1.flush(IKCP_FLUSH_FULL)
-	after := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-
-	if delta := after - before; delta != numSegs {
-		t.Errorf("OutSegs delta = %d, expected %d (one per segment)", delta, numSegs)
-	}
-	if len(outCalled) == 0 {
-		t.Error("output callback was never called")
-	}
-}
-
-// TestOutSegsBatching_BulkFlush verifies OutSegs on the normal update path.
-func TestOutSegsBatching_BulkFlush(t *testing.T) {
-	kcp1 := NewKCP(0xDEADBEEF, func(buf []byte, size int) {})
-	kcp1.NoDelay(1, 10, 2, 1)
-	kcp1.WndSize(128, 128)
-
-	const numSegs = 20
-	for range numSegs {
-		kcp1.Send(make([]byte, 100))
-	}
-
-	before := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-	kcp1.flush(IKCP_FLUSH_FULL)
-	after := atomic.LoadUint64(&DefaultSnmp.OutSegs)
-
-	if delta := after - before; delta != numSegs {
-		t.Errorf("OutSegs delta = %d, expected %d", delta, numSegs)
 	}
 }

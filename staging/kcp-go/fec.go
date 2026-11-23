@@ -40,9 +40,10 @@
 package kcp
 
 import (
+	"container/heap"
 	"encoding/binary"
-	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -64,16 +65,6 @@ func (bts fecPacket) seqid() uint32 { return binary.LittleEndian.Uint32(bts) }
 func (bts fecPacket) flag() uint16  { return binary.LittleEndian.Uint16(bts[4:]) }
 func (bts fecPacket) data() []byte  { return bts[6:] }
 
-// shardHeapPool recycles shardHeap allocations.
-// Each shardHeap lives for one shard set (~13 packets) then returns here.
-var shardHeapPool = sync.Pool{
-	New: func() any {
-		return &shardHeap{
-			marks: make(map[uint32]struct{}),
-		}
-	},
-}
-
 // shardHeap holds the FEC shards belonging to one shard set.
 type shardHeap struct {
 	elements []fecPacket
@@ -81,43 +72,32 @@ type shardHeap struct {
 }
 
 func newShardHeap() *shardHeap {
-	return shardHeapPool.Get().(*shardHeap)
-}
-
-// release resets the shardHeap and returns it to the pool.
-// Caller MUST have already recycled all elements' packet buffers.
-func (h *shardHeap) release() {
-	for k := range h.marks {
-		delete(h.marks, k)
+	h := &shardHeap{
+		marks: make(map[uint32]struct{}),
 	}
-	for i := range h.elements {
-		h.elements[i] = nil
-	}
-	h.elements = h.elements[:0]
-	shardHeapPool.Put(h)
+	heap.Init(h)
+	return h
 }
 
 func (h *shardHeap) Len() int { return len(h.elements) }
 
-// push appends a FEC packet. Ordering is LIFO via pop(); this is intentionally
-// a set/stack (not a priority queue) — callers only need membership + drain.
-func (h *shardHeap) push(pkt fecPacket) {
-	h.elements = append(h.elements, pkt)
-	h.marks[pkt.seqid()] = struct{}{}
+func (h *shardHeap) Less(i, j int) bool {
+	return _itimediff(h.elements[j].seqid(), h.elements[i].seqid()) > 0
 }
 
-// pop removes and returns the last FEC packet from the heap (stack-like
-// behavior). Returns (nil, false) if the heap is empty.
-func (h *shardHeap) pop() (fecPacket, bool) {
+func (h *shardHeap) Swap(i, j int) { h.elements[i], h.elements[j] = h.elements[j], h.elements[i] }
+func (h *shardHeap) Push(x any) {
+	h.elements = append(h.elements, x.(fecPacket))
+	h.marks[x.(fecPacket).seqid()] = struct{}{}
+}
+
+func (h *shardHeap) Pop() any {
 	n := len(h.elements)
-	if n == 0 {
-		return nil, false
-	}
 	x := h.elements[n-1]
 	h.elements[n-1] = nil // clear to avoid memory leak
 	h.elements = h.elements[:n-1]
 	delete(h.marks, x.seqid())
-	return x, true
+	return x
 }
 
 func (h *shardHeap) Has(sn uint32) bool {
@@ -178,7 +158,7 @@ func newFECDecoder(dataShards, parityShards int) *fecDecoder {
 }
 
 // decode a fec packet
-func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
+func (dec *fecDecoder) decode(in fecPacket) [][]byte {
 	// Sample the packet type for auto-tuning
 	if in.flag() == typeData {
 		dec.autoTune.Sample(true, in.seqid())
@@ -220,7 +200,6 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 					for _, pkt := range shard.elements {
 						defaultBufferPool.Put(pkt)
 					}
-					shard.release()
 				}
 				dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
 				codec, err := reedsolomon.New(autoDS, autoPS)
@@ -233,6 +212,7 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 				dec.paws = 0xffffffff / uint32(dec.shardSize) * uint32(dec.shardSize)
 				dec.newestShardId = in.seqid() / uint32(dec.shardSize)
 				DefaultSnmp.storeFECShardMin(dec.newestShardId)
+				//log.Println("autotune to :", dec.dataShards, dec.parityShards)
 			}
 			// reset shouldTune flag regardless of whether parameters changed
 			// to avoid permanent blocking when detected parameters match current ones
@@ -263,84 +243,7 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 	// push the packet into the shard heap
 	pkt := fecPacket(defaultBufferPool.Get()[:len(in)])
 	copy(pkt, in)
-	shard.push(pkt)
-
-	// try to recover data if we have enough shards
-	if shard.Len() >= dec.dataShards {
-		var numDataShard, maxlen int
-
-		// prepare the decode cache
-		shards := dec.decodeCache
-		shardsflag := dec.flagCache
-		for k := range dec.decodeCache {
-			shards[k] = nil
-			shardsflag[k] = false
-		}
-
-		// pop all shards from the heap and fill into the decode cache
-		var pkts []fecPacket
-		for shard.Len() > 0 {
-			pkt, _ := shard.pop()
-			pkts = append(pkts, pkt)
-			seqid := pkt.seqid()
-			shards[seqid%uint32(dec.shardSize)] = pkt.data()
-			shardsflag[seqid%uint32(dec.shardSize)] = true
-			if pkt.flag() == typeData {
-				numDataShard++
-			}
-			if len(pkt.data()) > maxlen {
-				maxlen = len(pkt.data())
-			}
-		}
-
-		// case 1: all data shards are present
-		if numDataShard == dec.dataShards {
-			DefaultSnmp.increaseFECFullShardSet()
-		} else { // case 2: some data shards are missing, try to recover
-			// fill '0' into the tail of each shard to make them equal-sized
-			var newBuffers [][]byte
-			for k := range shards {
-				if shards[k] != nil {
-					dlen := len(shards[k])
-					shards[k] = shards[k][:maxlen]
-					clear(shards[k][dlen:])
-				} else if k < dec.dataShards {
-					// prepare memory for the data recovery
-					shards[k] = defaultBufferPool.Get()[:0]
-					newBuffers = append(newBuffers, shards[k])
-				}
-			}
-
-			// Reed-Solomon Erasure Code Decoding
-			if err := dec.codec.ReconstructData(shards); err == nil {
-				for k := range shards[:dec.dataShards] {
-					if !shardsflag[k] {
-						recovered = append(recovered, shards[k])
-					}
-				}
-			} else {
-				// recovery failed, record the error
-				DefaultSnmp.increaseFECErrs()
-				// recycle new buffers if failed
-				// NOTE: if success, these buffers are returned in 'recovered' and will be recycled by the caller
-				for _, buf := range newBuffers {
-					defaultBufferPool.Put(buf)
-				}
-			}
-
-			// record the number of recovered packets
-			DefaultSnmp.addFECRecovered(len(recovered))
-		}
-
-		// recycle the packets
-		for _, pkt := range pkts {
-			defaultBufferPool.Put(pkt)
-		}
-		// Set fully drained — return empty heap to pool early.
-		// FECShardSet is refreshed by discardShards() below.
-		shard.release()
-		delete(dec.shardSet, shardId)
-	}
+	shard.Push(pkt)
 
 	// update the newest shard id
 	if _itimediff(shardId*uint32(dec.shardSize), dec.newestShardId*uint32(dec.shardSize)) > 0 {
@@ -349,9 +252,86 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 	}
 
 	// try to discard shard sets that are too old
-	dec.discardShards()
+	defer dec.discardShards()
 
-	return
+	// try to recover data if we have enough shards
+	if shard.Len() < dec.dataShards {
+		return nil
+	}
+
+	var numDataShard, maxlen int
+
+	// prepare the decode cache
+	shards := dec.decodeCache
+	shardsflag := dec.flagCache
+	for k := range dec.decodeCache {
+		shards[k] = nil
+		shardsflag[k] = false
+	}
+
+	// pop all shards from the heap and fill into the decode cache
+	var pkts []fecPacket
+	for shard.Len() > 0 {
+		pkt := shard.Pop().(fecPacket)
+		pkts = append(pkts, pkt)
+		seqid := pkt.seqid()
+		shards[seqid%uint32(dec.shardSize)] = pkt.data()
+		shardsflag[seqid%uint32(dec.shardSize)] = true
+		if pkt.flag() == typeData {
+			numDataShard++
+		}
+		if len(pkt.data()) > maxlen {
+			maxlen = len(pkt.data())
+		}
+	}
+	defer defaultBufferPool.PutPkts(pkts)
+
+	// case 1: all data shards are present
+	if numDataShard == dec.dataShards {
+		DefaultSnmp.increaseFECFullShardSet()
+		return nil
+	}
+
+	// case 2: some data shards are missing, try to recover
+	// fill '0' into the tail of each shard to make them equal-sized
+	var newBuffers [][]byte
+	for k := range shards {
+		if shards[k] != nil {
+			dlen := len(shards[k])
+			shards[k] = shards[k][:maxlen]
+			clear(shards[k][dlen:])
+			continue
+		}
+
+		if k < dec.dataShards {
+			// prepare memory for the data recovery
+			shards[k] = defaultBufferPool.Get()[:0]
+			newBuffers = append(newBuffers, shards[k])
+			continue
+		}
+	}
+
+	// Reed-Solomon Erasure Code Decoding
+	err := dec.codec.ReconstructData(shards)
+	if err != nil {
+		// recovery failed, record the error
+		DefaultSnmp.increaseFECErrs()
+		// recycle new buffers if failed
+		// NOTE: if success, these buffers are returned in 'recovered' and will be recycled by the caller
+		defaultBufferPool.Puts(newBuffers)
+		return nil
+	}
+
+	var recovered [][]byte
+	for k := range shards[:dec.dataShards] {
+		if !shardsflag[k] {
+			recovered = append(recovered, shards[k])
+		}
+	}
+
+	// record the number of recovered packets
+	DefaultSnmp.addFECRecovered(len(recovered))
+	return recovered
 }
 
 // getShardId calculates the shard id based on the sequence id
@@ -364,11 +344,10 @@ func (dec *fecDecoder) discardShards() {
 	for shardId, shard := range dec.shardSet {
 		// discard shards that are too old
 		if _itimediff(dec.newestShardId*uint32(dec.shardSize), shardId*uint32(dec.shardSize)) > maxShardSets*int32(dec.shardSize) {
-			// println("flushing shard", shardId, "minShardId", dec.minShardId, _itimediff(dec.minShardId, shardId))
+			//println("flushing shard", shardId, "minShardId", dec.minShardId, _itimediff(dec.minShardId, shardId))
 			for _, pkt := range shard.elements {
 				defaultBufferPool.Put(pkt)
 			}
-			shard.release()
 			delete(dec.shardSet, shardId)
 		}
 	}
@@ -431,12 +410,6 @@ func newFECEncoder(dataShards, parityShards, offset int) *fecEncoder {
 // encode encodes a packet and may output parity shards once enough data shards
 // have been collected. The contents of ps are overwritten on subsequent calls.
 func (enc *fecEncoder) encode(b []byte, rto uint32) [][]byte {
-	return enc.encodeAt(b, rto, int64(currentMs()))
-}
-
-// encodeAt is encode with the flush's millisecond clock. FEC only compares
-// deltas, so the caller can reuse a stamp it already took.
-func (enc *fecEncoder) encodeAt(b []byte, rto uint32, now int64) [][]byte {
 	// The header format:
 	// | FEC SEQID(4B) | FEC TYPE(2B) | SIZE (2B) | PAYLOAD(SIZE-2) |
 	// |<-headerOffset                |<-payloadOffset
@@ -454,6 +427,8 @@ func (enc *fecEncoder) encodeAt(b []byte, rto uint32, now int64) [][]byte {
 		enc.maxSize = sz
 	}
 
+	// Generate Reed-Solomon erasure codes once enough data shards are collected.
+	now := time.Now().UnixMilli()
 	// record the time of the latest data packet
 	tsLastPacket := atomic.SwapInt64(&enc.tsLatestPacket, now)
 
