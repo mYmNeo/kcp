@@ -92,7 +92,7 @@ func TestPacingSpreadsBurst(t *testing.T) {
 		return n
 	}
 
-	// The bucket holds paceBurstMs of the rate: 10 KB, about 8 segments. A
+	// The bucket holds paceBurstMs of the rate (a few segments at 1 MB/s). A
 	// burst is the whole bucket, give or take the segment that overdraws it.
 	bucket := int(1_000_000*paceBurstMs/1000)/int(kcp.mtu+IKCP_OVERHEAD) + 1
 	inBucket := func(n int) bool { return n >= bucket-1 && n <= bucket }
