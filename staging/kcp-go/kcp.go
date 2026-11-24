@@ -607,7 +607,8 @@ func (kcp *KCP) on_delivered(seg *segment, now uint32) {
 	kcp.inflight -= min(size, kcp.inflight)
 	// A first transmission acknowledged after later segments (fastack > 0)
 	// was lost and repaired by FEC parity. Counting it would credit the
-	// overflow that parity absorbed as delivered bandwidth.
+	// overflow that parity absorbed as delivered bandwidth. A lost ACK also
+	// leaves fastack > 0; skipping that segment only under-counts.
 	if seg.xmit == 1 && seg.fastack > 0 {
 		return
 	}
