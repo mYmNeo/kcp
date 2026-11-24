@@ -356,3 +356,46 @@ func TestStandingQueueCorrection(t *testing.T) {
 		t.Fatalf("on a path with RTT below the flush interval btlbw changed to %d", got)
 	}
 }
+
+// TestProbeEndsOnQueue checks that the probe phase ends at the first RTT
+// sample showing a queue, that the drain then lasts as long as the probe ran,
+// and that ACK delay alone (or a path where it dominates) ends nothing.
+func TestProbeEndsOnQueue(t *testing.T) {
+	setup := func(minRtt uint32) (*KCP, uint32) {
+		kcp, now := newStartupKCP()
+		kcp.interval = 30
+		kcp.min_rtt = minRtt
+		kcp.full_pipe = true
+		kcp.cycle_idx, kcp.cycle_ts = 0, now
+		return kcp, now
+	}
+
+	kcp, now := setup(200)
+	kcp.end_probe_on_queue(229, now+50) // within min RTT + interval: ACK delay
+	if kcp.cycle_idx != 0 {
+		t.Fatalf("an RTT sample within one flush interval of min RTT ended the probe (phase %d)", kcp.cycle_idx)
+	}
+	kcp.end_probe_on_queue(240, now+50)
+	if kcp.cycle_idx != 1 {
+		t.Fatalf("a 40 ms queue 50 ms into the probe left phase %d, want the drain phase 1", kcp.cycle_idx)
+	}
+	// The drain should end 50 ms later, after as long as the probe ran.
+	if got := _itimediff(now+100, kcp.cycle_ts); got != int32(kcp.min_rtt) {
+		t.Fatalf("drain ends %d ms after the early exit, want 50 (the probe's length)", int32(kcp.min_rtt)-_itimediff(now+50, kcp.cycle_ts))
+	}
+
+	kcp, now = setup(200)
+	kcp.cycle_idx = 2
+	kcp.end_probe_on_queue(400, now+50)
+	if kcp.cycle_idx != 2 {
+		t.Fatal("a queueing RTT sample outside the probe changed the gain phase")
+	}
+
+	// LAN: min RTT 4 ms against a 30 ms flush interval; samples there
+	// mostly measure ACK delay.
+	kcp, now = setup(4)
+	kcp.end_probe_on_queue(60, now+2)
+	if kcp.cycle_idx != 0 {
+		t.Fatal("on a path with RTT below the flush interval an RTT sample ended the probe")
+	}
+}

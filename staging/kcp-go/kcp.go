@@ -717,6 +717,24 @@ func (kcp *KCP) take_rate_sample(now uint32) {
 	}
 }
 
+// end_probe_on_queue ends the probe phase early once an RTT sample shows
+// queueing: above min RTT by more than min_rtt/8 and one flush interval (ACK
+// delay). The probe phase lasts one min RTT, but on a shallow buffer it fills
+// the queue well before then, and the overflow costs both drops and latency
+// for everything behind it. The drain phase that follows lasts as long as the
+// probe ran: with symmetric gains that removes what the probe added, where a
+// full min RTT of drain would leave the link idle. Paths where ACK delay
+// dominates the RTT keep the timed phase, as for the standing-queue
+// correction.
+func (kcp *KCP) end_probe_on_queue(rtt, now uint32) {
+	if !kcp.full_pipe || kcp.cycle_idx != 0 || kcp.min_rtt <= 2*kcp.interval ||
+		rtt <= kcp.min_rtt+max(kcp.min_rtt/8, kcp.interval) {
+		return
+	}
+	probed := min(uint32(max(_itimediff(now, kcp.cycle_ts), 0)), kcp.min_rtt)
+	kcp.cycle_idx, kcp.cycle_ts = 1, now-kcp.min_rtt+probed
+}
+
 // pacing_floor is paceInitWnd segments per RTT, in bytes/s.
 func (kcp *KCP) pacing_floor() uint64 {
 	rtt := kcp.min_rtt
@@ -999,6 +1017,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			if r := uint32(max(rtt, 1)); kcp.round_min_rtt == 0 || r < kcp.round_min_rtt {
 				kcp.round_min_rtt = r
 			}
+			kcp.end_probe_on_queue(uint32(rtt), now)
 		}
 	}
 	kcp.take_rate_sample(now)
