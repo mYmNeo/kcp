@@ -604,6 +604,12 @@ func (kcp *KCP) on_delivered(seg *segment, now uint32) {
 	}
 	size := uint64(len(seg.data) + IKCP_OVERHEAD)
 	kcp.inflight -= min(size, kcp.inflight)
+	// A first transmission acknowledged after later segments (fastack > 0)
+	// was lost and repaired by FEC parity. Counting it would credit the
+	// overflow that parity absorbed as delivered bandwidth.
+	if seg.xmit == 1 && seg.fastack > 0 {
+		return
+	}
 	kcp.delivered += size
 	kcp.delivered_ts = now
 	// Keep the sample of the most recently sent segment, as RFC draft-cheng
