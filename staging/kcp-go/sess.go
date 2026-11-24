@@ -1395,7 +1395,7 @@ type (
 		udpPort      uint16         // the local UDP port, if applicable
 		ownConn      bool           // true if we created conn internally, false if provided by caller
 
-		sessions connManager // all sessions accepted by this Listener
+		sessions connManagerImpl // all sessions accepted by this Listener
 		acceptCh chan *UDPSession
 		shutdown *libsync.Quit // signals closure and tracks active dispatch calls
 
@@ -1802,7 +1802,7 @@ func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 	runtime.AddCleanup(l, freeDeadline, l.acceptDeadline)
 
 	if pp, ok := conn.(PacketPusher); ok {
-		l.sessions = newConnManager()
+		l.sessions.connManager = newConnManager()
 		pp.SetPacketReceiver(l.pushedPacket)
 		return l, nil
 	}
@@ -1838,13 +1838,13 @@ func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 		}
 
 		l.udpPort = uint16(laddr.Port)
-		l.sessions = newConnManagerUnspecified()
+		l.sessions.connManager = newConnManagerUnspecified()
 		go l.readLoopUnspecified()
 		return l, nil
 	}
 
 genericListener:
-	l.sessions = newConnManager()
+	l.sessions.connManager = newConnManager()
 	go l.readLoop()
 	return l, nil
 }
