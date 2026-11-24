@@ -71,11 +71,11 @@ const (
 	paceStartupGain = 289   // percent; 2/ln2, doubles delivery rate each round until bandwidth plateaus
 	paceFullBwRnds  = 3     // rounds without 25% bandwidth growth that end startup
 	paceStartupLoss = 5     // percent of a round's transmissions retransmitted that ends startup
-	paceBurstMs     = 10    // token bucket depth, in ms at the pacing rate
+	paceBurstMs     = 5     // token bucket depth, in ms at the pacing rate
 	paceBwWinRounds = 10    // bandwidth max-filter window, in round trips
 	paceMinRttWinMs = 10000 // min RTT filter window (ms)
 	paceInitWnd     = 32    // segments per min RTT assumed before any bandwidth sample
-	paceUnsentMs    = 35    // writes wait while unsent data exceeds this many ms at the bandwidth estimate
+	paceUnsentMs    = 50    // writes wait while unsent data exceeds this many ms at the bandwidth estimate
 	paceQueueCut    = 10    // percent; most the bandwidth estimate drops per round with a standing queue
 )
 
