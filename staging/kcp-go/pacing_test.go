@@ -249,9 +249,10 @@ func TestResetRTOShorterPath(t *testing.T) {
 }
 
 // TestSendBacklogCap checks that Write admission stops once the unsent data
-// covers paceUnsentMs at the bandwidth estimate, and reopens as the pacer
-// sends it, so data written later (an interactive frame) waits behind a
-// bounded queue.
+// covers paceUnsentLong at the bandwidth estimate on a long path after
+// startup, and reopens as the pacer sends it, so data written later (an
+// interactive frame) waits behind a bounded queue. Startup and short paths
+// keep the larger paceUnsentMs.
 func TestSendBacklogCap(t *testing.T) {
 	kcp := NewKCP(1, func([]byte, int) {})
 	kcp.NoDelay(1, 10, 2, 1)
@@ -262,7 +263,7 @@ func TestSendBacklogCap(t *testing.T) {
 	kcp.full_pipe = true
 	kcp.cycle_idx = 1 // drain phase, gain below 1: the cap must not shrink with it
 
-	limit := uint64(1_000_000) * paceUnsentMs / 1000
+	limit := uint64(1_000_000) * paceUnsentLong / 1000
 	queued := uint64(0)
 	for !kcp.send_backlog_full() {
 		kcp.Send(make([]byte, kcp.mss))
@@ -298,6 +299,27 @@ func TestSendBacklogCap(t *testing.T) {
 	}
 	if kcp.send_backlog_full() {
 		t.Fatalf("admission still closed with %d unsent bytes, cap %d", kcp.unsent, limit)
+	}
+
+	// Startup and a path where ACK delay dominates the RTT (min RTT 15 ms
+	// against a 10 ms interval) still admit past the long-path cap.
+	for _, tc := range []struct {
+		name     string
+		minRtt   uint32
+		fullPipe bool
+	}{{"startup", 100, false}, {"short path", 15, true}} {
+		k := NewKCP(1, func([]byte, int) {})
+		k.NoDelay(1, 10, 2, 1)
+		k.WndSize(4096, 4096)
+		k.min_rtt = tc.minRtt
+		k.btlbw.reset(0, 1_000_000)
+		k.full_pipe = tc.fullPipe
+		for k.unsent < limit+2*uint64(k.mss) {
+			k.Send(make([]byte, k.mss))
+		}
+		if k.send_backlog_full() {
+			t.Fatalf("%s: admission closed at %d unsent bytes, the long-path cap; want paceUnsentMs", tc.name, k.unsent)
+		}
 	}
 }
 

@@ -77,6 +77,7 @@ const (
 	paceInitWnd     = 32    // segments per min RTT assumed before any bandwidth sample
 	paceUnsentMs    = 50    // writes wait while unsent data exceeds this many ms at the bandwidth estimate
 	paceQueueCut    = 10    // percent; most the bandwidth estimate drops per round with a standing queue
+	paceUnsentLong  = 25    // paceUnsentMs after startup where min RTT > 2*interval, with a paceInitWnd/2 floor
 )
 
 // paceCycleGain is the steady-state pacing gain cycle in percent, one phase
@@ -1562,7 +1563,18 @@ func (kcp *KCP) send_backlog_full() bool {
 	if !kcp.full_pipe {
 		bw = kcp.pacing_rate()
 	}
-	limit := max(bw*paceUnsentMs/1000, paceInitWnd*uint64(kcp.mss))
+	// After startup, where RTT samples resolve queueing (min RTT above two
+	// flush intervals, as for the standing-queue correction), the estimate
+	// is steady enough to hold half the backlog. On those paths a frame
+	// written behind the backlog already waits for a deep bottleneck queue.
+	// During startup the rate doubles each round, and on short paths ACK
+	// delay makes the estimate noisy; a short backlog there starves the
+	// pacer and costs goodput.
+	ms, floor := uint64(paceUnsentMs), uint64(paceInitWnd)
+	if kcp.full_pipe && kcp.min_rtt > 2*kcp.interval {
+		ms, floor = paceUnsentLong, paceInitWnd/2
+	}
+	limit := max(bw*ms/1000, floor*uint64(kcp.mss))
 	return kcp.unsent >= limit
 }
 
