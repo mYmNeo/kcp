@@ -53,7 +53,7 @@ func TestRTOBeforeAndAfterFirstSample(t *testing.T) {
 	}
 
 	// A smooth 300 ms path drives the variance term to a few ms. The RTO
-	// must still leave room for the queueing a 1.25x pacing probe adds.
+	// must still leave room for the queueing a pacing probe adds.
 	for range 200 {
 		kcp.update_ack(300)
 	}
@@ -260,7 +260,7 @@ func TestSendBacklogCap(t *testing.T) {
 	kcp.min_rtt = 100
 	kcp.btlbw.reset(0, 1_000_000)
 	kcp.full_pipe = true
-	kcp.cycle_idx = 1 // drain phase, gain 0.75: the cap must not shrink with it
+	kcp.cycle_idx = 1 // drain phase, gain below 1: the cap must not shrink with it
 
 	limit := uint64(1_000_000) * paceUnsentMs / 1000
 	queued := uint64(0)

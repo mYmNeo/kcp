@@ -81,10 +81,11 @@ const (
 
 // paceCycleGain is the steady-state pacing gain cycle in percent, one phase
 // per min RTT. Pacing at gain 1 bounds delivery-rate samples by the send
-// rate, so ACK bursts cannot ratchet the bandwidth estimate upward; the 1.25
-// phase probes for more bandwidth and the 0.75 phase drains the queue that
-// probing built.
-var paceCycleGain = [8]uint64{125, 75, 100, 100, 100, 100, 100, 100}
+// rate, so ACK bursts cannot ratchet the bandwidth estimate upward; the 1.15
+// phase probes for more bandwidth and the 0.85 phase drains the queue that
+// probing built. A gentler probe than BBR's 1.25 keeps the probe's queue
+// within shallow bottleneck buffers on long paths.
+var paceCycleGain = [8]uint64{115, 85, 100, 100, 100, 100, 100, 100}
 
 type winMaxSample struct {
 	t uint32
