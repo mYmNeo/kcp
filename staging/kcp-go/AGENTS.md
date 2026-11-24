@@ -64,8 +64,6 @@ The project is layered as follows:
 - **`ResetRTO`** calls `reset_pacing`, which clears the bandwidth model, `min_rtt` and the token budget so that a new path is measured from scratch.
 - **Wire format unchanged:** pacing is sender-local, and old peers interoperate.
 - **Tests:** `pacing_test.go` covers the state machine.
-  - `KCP_HL_BENCH=1 go test -run TestHighLatencyBench` (`highlatency_bench_test.go`) is the end-to-end long-RTT/shallow-buffer benchmark.
-  - `KCP_BULK_BENCH=1 go test -run TestBulkBench` (`bulk_bench_test.go`) runs a saturating download with interactive pings on the same session.
 
 ### FEC (Forward Error Correction)
 - Splits data into shards and generates parity shards.
