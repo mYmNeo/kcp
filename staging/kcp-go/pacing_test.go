@@ -203,6 +203,24 @@ func TestStartupExit(t *testing.T) {
 			t.Fatalf("retransmission produced bandwidth sample %d; its ACK may answer the first transmission", got)
 		}
 	})
+
+	t.Run("FEC-repaired segment is not counted as delivered", func(t *testing.T) {
+		kcp, now := newStartupKCP()
+		kcp.inflight = 2 * (1000 + IKCP_OVERHEAD)
+		repaired := segment{xmit: 1, fastack: 1, data: make([]byte, 1000)}
+		kcp.on_delivered(&repaired, now)
+		if kcp.delivered != 0 {
+			t.Fatalf("delivered = %d after an FEC-repaired segment; parity-absorbed overflow would inflate the bandwidth estimate", kcp.delivered)
+		}
+		if kcp.inflight != 1000+IKCP_OVERHEAD {
+			t.Fatalf("inflight = %d, want %d: the repaired segment left the network", kcp.inflight, 1000+IKCP_OVERHEAD)
+		}
+		clean := segment{xmit: 1, data: make([]byte, 1000)}
+		kcp.on_delivered(&clean, now)
+		if kcp.delivered != 1000+IKCP_OVERHEAD {
+			t.Fatalf("delivered = %d after an in-order segment, want %d", kcp.delivered, 1000+IKCP_OVERHEAD)
+		}
+	})
 }
 
 // TestResetRTOShorterPath checks that after ResetRTO, as when connectivity
