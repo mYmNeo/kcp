@@ -550,8 +550,9 @@ func (s *UDPSession) acquireWriteGate() error {
 	return s.waitWriteGate()
 }
 
-// waitWriteGate handles the contended gate path, including deadline updates
-// signaled through writeEvent.
+// waitWriteGate handles the contended gate path. It does not take
+// writeEvent: that signal belongs to the gate holder waiting for send
+// backlog, and deadline changes already arrive through writeDeadline.Done.
 func (s *UDPSession) waitWriteGate() error {
 	for {
 		if s.isClosed() {
@@ -570,7 +571,6 @@ func (s *UDPSession) waitWriteGate() error {
 		case <-s.shutdown:
 		case <-s.writeErrorCh:
 		case <-s.writeDeadline.Done():
-		case <-s.writeEvent:
 		case <-s.writeGate:
 			return nil
 		}
