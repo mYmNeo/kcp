@@ -82,14 +82,24 @@ const (
 	// legacy block-cipher header size: nonce + CRC32
 	cryptHeaderSize = nonceSize + crcSize
 
-	// maximum packet size (IPv4)
-	maxPacketSize = 1472
-
-	// cmsg packet size
-	cmsgPacketSize = 64
+	// fecPacketHeaderSize is the size of the packet header with FEC.
+	fecPacketHeaderSize = fecHeaderSize + 2 // FEC header + 2B payload size field
 
 	// conversation ID field size (bytes)
 	convSize = 4
+
+	// oobHeaderSize is the size of the header for out-of-band (OOB) packets.
+	// Layout: FEC Packet Header | conv (4B) | OOB payload |
+	oobHeaderSize = fecPacketHeaderSize + convSize
+
+	// maximum packet size (IPv4)
+	maxPacketSize = 1472
+
+	// minimum plaintext size for a KCP packet
+	minPlaintext = min(IKCP_OVERHEAD, oobHeaderSize)
+
+	// cmsg packet size
+	cmsgPacketSize = 64
 
 	// accept backlog: max pending connections for Listener
 	acceptBacklog = 128
@@ -279,7 +289,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 	// calculate additional header size introduced by FEC
 	if sess.fecEncoder != nil {
-		sess.headerSize += fecHeaderSizePlus2
+		sess.headerSize += fecPacketHeaderSize
 	}
 
 	sess.kcp = NewKCP(conv, sess.output)
@@ -1128,7 +1138,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 
 	// Allocate buffer with reserved header space.
 	// s.headerSize includes the space needed by the FEC encoder.
-	buf := defaultBufferPool.Get()[:size+s.headerSize]
+	buf := defaultBufferPool.Get()[:s.headerSize+size]
 	// Encode conversation ID.
 	binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
 
@@ -1235,8 +1245,7 @@ func (s *UDPSession) dispatch(data []byte) {
 	}
 
 	// basic check for minimum packet size
-	// NOTE: OOB allows sender small packets and even empty packets.
-	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	if len(data) < minPlaintext {
 		DefaultSnmp.addKCPInErrors(1)
 		return
 	}
@@ -1264,7 +1273,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 
 	switch fecFlag {
 	case typeData, typeParity: // packet with FEC
-		if len(data) < fecHeaderSizePlus2 {
+		if len(data) < fecPacketHeaderSize {
 			DefaultSnmp.increaseInErrs()
 			return
 		}
@@ -1289,7 +1298,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 		// only data packets are fed into kcp directly
 		// parity packets are only used for recovery
 		if f.flag() == typeData {
-			if ret := s.kcp.Input(data[fecHeaderSizePlus2:], IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
+			if ret := s.kcp.Input(data[fecPacketHeaderSize:], IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
 				kcpInErrors++
 			}
 		}
@@ -1331,8 +1340,8 @@ func (s *UDPSession) kcpInput(data []byte) {
 		// If an OOB callback is registered, invoke it synchronously.
 		// The callback is responsible for ensuring non-blocking behavior.
 		if callback := s.callbackForOOB.Load(); callback != nil {
-			// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-			(*callback)(data[fecHeaderSizePlus2+convSize:])
+			// Data layout: | FEC header (fecPacketHeaderSize) | conv (4B) | OOB payload |
+			(*callback)(data[oobHeaderSize:])
 		}
 	default: // packet without FEC
 		s.mutex.Lock()
@@ -1499,8 +1508,7 @@ func (l *Listener) dispatch(data []byte, laddr libnetip.AddrInterface, localAddr
 	}
 
 	// basic check for minimum packet size
-	// NOTE: OOB allows sender small packets and even empty packets.
-	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	if len(data) < minPlaintext {
 		return
 	}
 
@@ -1513,20 +1521,20 @@ func (l *Listener) dispatch(data []byte, laddr libnetip.AddrInterface, localAddr
 	switch fecFlag {
 	case typeData:
 		// data packet of FEC, conversation id inside
-		if len(data) < fecHeaderSizePlus2+IKCP_OVERHEAD {
+		if len(data) < fecPacketHeaderSize+IKCP_OVERHEAD {
 			break
 		}
 
 		hasConv = true
-		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
-		sn = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:])
+		conv = binary.LittleEndian.Uint32(data[fecPacketHeaderSize:])
+		sn = binary.LittleEndian.Uint32(data[fecPacketHeaderSize+IKCP_SN_OFFSET:])
 	case typeParity:
 		// parity packet of FEC, conversation id inside
 	case typeOOB:
 		// OOB packets always carry the conversation ID immediately after the FEC header.
 		hasConv = true
-		// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+		// Data layout: | FEC header (fecPacketHeaderSize) | conv (4B) | OOB payload |
+		conv = binary.LittleEndian.Uint32(data[fecPacketHeaderSize:])
 	default:
 		// packet without FEC
 		if len(data) < IKCP_OVERHEAD { // basic check for minimum kcp packet size
